@@ -1,26 +1,184 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* ──────────────────────────────────────────────────────────────────────────
+   Dropship AI — control-plane theme
+   "Industrial-luxe mission control": deep slate base, blueprint grid, aurora
+   glow, signal-amber identity. Serif display (Fraunces) + mono data (Plex Mono).
+   ────────────────────────────────────────────────────────────────────────── */
+
+@theme {
+  --color-void: #07090c;
+  --color-base: #0b0e13;
+  --color-panel: #11151c;
+  --color-panel-2: #161b24;
+  --color-line: #1e2530;
+  --color-line-soft: #161c25;
+
+  --color-ink: #e8edf4;
+  --color-ink-dim: #9aa6b6;
+  --color-ink-faint: #5d6878;
+
+  --color-signal: #e8b04b;       /* brand amber / identity */
+  --color-signal-deep: #c9933a;
+  --color-live: #44d6a0;         /* active / healthy */
+  --color-pending: #f0a93b;      /* pending approval */
+  --color-danger: #ef6b6b;       /* killed / reject */
+  --color-cyan: #5cc6e8;         /* auto-tier / info */
+  --color-violet: #9b8cff;       /* provisioning */
+
+  --font-display: var(--font-fraunces);
+  --font-mono: var(--font-plex-mono);
+  --font-sans: var(--font-geist);
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  html {
+    height: 100%;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100%;
+    color: var(--color-ink);
+    font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+    background-color: var(--color-base);
+    /* layered atmosphere: two aurora pools + a faint blueprint grid */
+    background-image:
+      radial-gradient(900px 560px at 12% -8%, rgba(232, 176, 75, 0.10), transparent 60%),
+      radial-gradient(820px 620px at 96% 4%, rgba(92, 198, 232, 0.07), transparent 55%),
+      radial-gradient(1100px 900px at 50% 120%, rgba(68, 214, 160, 0.05), transparent 60%),
+      linear-gradient(to bottom, var(--color-void), var(--color-base) 38%);
+    background-attachment: fixed;
+  }
+
+  /* blueprint grid overlay — sits on the fixed body, ultra-subtle */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    background-image:
+      linear-gradient(rgba(120, 140, 170, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(120, 140, 170, 0.035) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse 100% 80% at 50% 0%, #000 30%, transparent 80%);
+  }
+
+  /* fine grain overlay for texture */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.4;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+  }
+
+  ::selection {
+    background: rgba(232, 176, 75, 0.28);
+    color: var(--color-ink);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+    border-radius: 999px;
+    border: 2px solid var(--color-base);
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer utilities {
+  .font-display {
+    font-family: var(--font-display), Georgia, serif;
+  }
+  .font-mono {
+    font-family: var(--font-mono), ui-monospace, monospace;
+  }
+
+  /* tracked-out mono label used for section eyebrows + data keys */
+  .label-eyebrow {
+    font-family: var(--font-mono), ui-monospace, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--color-ink-faint);
+  }
+
+  /* glass panel surface */
+  .panel {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.018), rgba(255, 255, 255, 0) 40%),
+      var(--color-panel);
+    border: 1px solid var(--color-line);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.03) inset,
+      0 20px 50px -28px rgba(0, 0, 0, 0.9);
+  }
+
+  /* live status pulse ring */
+  .pulse-ring::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    opacity: 0.6;
+    animation: pulse-ring 2.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  }
+
+  .animate-rise {
+    opacity: 0;
+    animation: rise 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  .shimmer {
+    background: linear-gradient(
+      100deg,
+      var(--color-panel) 30%,
+      var(--color-panel-2) 50%,
+      var(--color-panel) 70%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.7); opacity: 0.7; }
+  70%, 100% { transform: scale(2.2); opacity: 0; }
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse-ring::after,
+  .animate-rise,
+  .shimmer {
+    animation: none;
+  }
+  .animate-rise { opacity: 1; }
 }
