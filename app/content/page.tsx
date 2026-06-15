@@ -3,10 +3,10 @@
 import { useState } from "react";
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
-import { TopBar } from "../components/TopBar";
 import { CreativeCard, type ReviewCreative } from "../components/CreativeCard";
 import { EmptyState } from "../components/EmptyState";
 import { StatusDot } from "../components/StatusDot";
+import { PageContainer } from "../components/ui/PageContainer";
 
 function CardSkeleton() {
   return <div className="shimmer aspect-[9/16] rounded-2xl border border-line" />;
@@ -100,15 +100,11 @@ export default function CreativeStudioPage() {
   const creatives = (reviews ?? []) as ReviewCreative[];
   const isEmpty = !loading && creatives.length === 0;
   const sites = (portfolio?.sites ?? []).map((s) => ({ siteId: s.siteId, name: s.name }));
-  const pendingTotal = portfolio?.totalPendingActions ?? 0;
   const aiCount = creatives.filter((c) => c.aiLabelRequired).length;
 
   return (
-    <div className="relative z-10">
-      <TopBar pendingCount={pendingTotal} />
-
-      <main className="mx-auto max-w-[1240px] px-5 pb-24 pt-10 sm:px-8 sm:pt-14">
-        <section className="mb-10 sm:mb-12">
+    <PageContainer wide>
+      <section className="mb-10 sm:mb-12">
           <div className="mb-4 flex items-center gap-2">
             <span className="label-eyebrow text-signal">Creative studio</span>
             <span className="h-px w-12 bg-line" />
@@ -163,7 +159,6 @@ export default function CreativeStudioPage() {
             ))}
           </div>
         )}
-      </main>
-    </div>
+    </PageContainer>
   );
 }

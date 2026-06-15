@@ -3,9 +3,9 @@
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
-import { TopBar } from "../components/TopBar";
 import { EmptyState } from "../components/EmptyState";
 import { StatusDot } from "../components/StatusDot";
+import { PageContainer } from "../components/ui/PageContainer";
 
 type BoardPost = {
   _id: Id<"posts">;
@@ -167,19 +167,14 @@ function PostRow({ post, index }: { post: BoardPost; index: number }) {
 export default function DistributionBoardPage() {
   const board = useQuery(api.posts.listForBoard, {});
   const gate = useQuery(api.dashboard.contentFitGate, {});
-  const portfolio = useQuery(api.dashboard.portfolio);
 
   const loading = board === undefined;
   const posts = (board ?? []) as BoardPost[];
   const isEmpty = !loading && posts.length === 0;
-  const pendingTotal = portfolio?.totalPendingActions ?? 0;
 
   return (
-    <div className="relative z-10">
-      <TopBar pendingCount={pendingTotal} />
-
-      <main className="mx-auto max-w-[1100px] px-5 pb-24 pt-10 sm:px-8 sm:pt-14">
-        <section className="mb-10">
+    <PageContainer>
+      <section className="mb-10">
           <div className="mb-4 flex items-center gap-2">
             <span className="label-eyebrow text-signal">Distribution</span>
             <span className="h-px w-12 bg-line" />
@@ -228,7 +223,6 @@ export default function DistributionBoardPage() {
             </div>
           )}
         </section>
-      </main>
-    </div>
+    </PageContainer>
   );
 }

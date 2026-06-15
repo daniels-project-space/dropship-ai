@@ -174,6 +174,11 @@
   to { background-position: -200% 0; }
 }
 
+@keyframes drawer-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pulse-ring::after,
   .animate-rise,
@@ -181,4 +186,14 @@
     animation: none;
   }
   .animate-rise { opacity: 1; }
+}
+
+@layer utilities {
+  /* a slightly raised inner surface for nested cards inside .panel */
+  .panel-inset {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.015), rgba(255, 255, 255, 0) 45%),
+      var(--color-panel-2);
+    border: 1px solid var(--color-line-soft);
+  }
 }

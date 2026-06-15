@@ -26,3 +26,15 @@ export const listByDay = query({
       .collect();
   },
 });
+
+// Recent signals for a brand (newest day buckets first). Index-driven via by_site_day.
+export const listBySite = query({
+  args: { siteId: v.id("sites"), limit: v.optional(v.number()) },
+  handler: async (ctx, { siteId, limit }) => {
+    return ctx.db
+      .query("productSignals")
+      .withIndex("by_site_day", (q) => q.eq("siteId", siteId))
+      .order("desc")
+      .take(limit ?? 100);
+  },
+});

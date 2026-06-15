@@ -41,3 +41,33 @@ export const listBySite = query({
       .take(limit ?? 100);
   },
 });
+
+// Cross-site recent activity for the portfolio strip. Walks each site's ledger
+// via by_site_at (index-scoped), merges and returns the newest N with site names.
+export const listRecent = query({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, { limit }) => {
+    const cap = limit ?? 24;
+    const sites = await ctx.db.query("sites").take(200);
+    const out: Array<{
+      _id: string;
+      event: string;
+      detail: unknown;
+      at: number;
+      siteName: string;
+      siteId: string;
+    }> = [];
+    for (const s of sites) {
+      const rows = await ctx.db
+        .query("auditLog")
+        .withIndex("by_site_at", (q) => q.eq("siteId", s._id))
+        .order("desc")
+        .take(cap);
+      for (const r of rows) {
+        out.push({ _id: r._id, event: r.event, detail: r.detail, at: r.at, siteName: s.name, siteId: s._id });
+      }
+    }
+    out.sort((a, b) => b.at - a.at);
+    return out.slice(0, cap);
+  },
+});

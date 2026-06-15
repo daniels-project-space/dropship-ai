@@ -153,3 +153,21 @@ export const get = query({
   args: { actionId: v.id("actions") },
   handler: async (ctx, { actionId }) => ctx.db.get(actionId),
 });
+
+// Lightweight pending-approval count. Global (no siteId) or scoped to one brand.
+// Index-driven: by_status globally, by_site_status when scoped.
+export const pendingCount = query({
+  args: { siteId: v.optional(v.id("sites")) },
+  handler: async (ctx, { siteId }) => {
+    const rows = siteId
+      ? await ctx.db
+          .query("actions")
+          .withIndex("by_site_status", (q) => q.eq("siteId", siteId).eq("status", "pending_approval"))
+          .take(500)
+      : await ctx.db
+          .query("actions")
+          .withIndex("by_status", (q) => q.eq("status", "pending_approval"))
+          .take(500);
+    return rows.length;
+  },
+});

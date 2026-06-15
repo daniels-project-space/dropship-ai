@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Fraunces, IBM_Plex_Mono, Geist } from "next/font/google";
 import "./globals.css";
 import { Providers } from "./providers";
+import { AppShell } from "./components/shell/AppShell";
 
 const fraunces = Fraunces({
   variable: "--font-fraunces",
@@ -36,7 +37,9 @@ export default function RootLayout({
       className={`${fraunces.variable} ${plexMono.variable} ${geist.variable}`}
     >
       <body className="relative min-h-screen">
-        <Providers>{children}</Providers>
+        <Providers>
+          <AppShell>{children}</AppShell>
+        </Providers>
       </body>
     </html>
   );

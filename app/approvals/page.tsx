@@ -2,9 +2,9 @@
 
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
-import { TopBar } from "../components/TopBar";
 import { ActionCard, type PendingAction } from "../components/ActionCard";
 import { EmptyState } from "../components/EmptyState";
+import { PageContainer } from "../components/ui/PageContainer";
 
 function RowSkeleton() {
   return <div className="shimmer h-[180px] rounded-2xl border border-line" />;
@@ -25,11 +25,8 @@ export default function ApprovalsPage() {
   const gated = actions.filter((a) => a.riskTier === "human_gated").length;
 
   return (
-    <div className="relative z-10">
-      <TopBar pendingCount={actions.length} />
-
-      <main className="mx-auto max-w-[920px] px-5 pb-24 pt-10 sm:px-8 sm:pt-14">
-        <section className="mb-10 sm:mb-12">
+    <PageContainer>
+      <section className="mb-10 sm:mb-12">
           <div className="mb-4 flex items-center gap-2">
             <span className="label-eyebrow text-pending">Approval queue</span>
             <span className="h-px w-12 bg-line" />
@@ -85,7 +82,6 @@ export default function ApprovalsPage() {
             ))}
           </div>
         )}
-      </main>
-    </div>
+    </PageContainer>
   );
 }

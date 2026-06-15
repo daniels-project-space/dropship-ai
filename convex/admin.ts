@@ -64,3 +64,30 @@ export const deleteAction = mutation({
     return { deleted: true, type: a.type };
   },
 });
+
+/**
+ * Delete a single product by id, plus any audit entries that reference it in their detail.
+ * Used to tear down screenshot-seed products without disturbing the rest of the brand.
+ */
+export const deleteProduct = mutation({
+  args: { productId: v.id("products") },
+  handler: async (ctx, { productId }) => {
+    const p = await ctx.db.get(productId);
+    if (!p) return { deleted: false };
+    // remove product_created / product_updated audit rows that point at this productId
+    const audit = await ctx.db
+      .query("auditLog")
+      .withIndex("by_site_at", (q) => q.eq("siteId", p.siteId))
+      .collect();
+    let auditRemoved = 0;
+    for (const row of audit) {
+      const d = row.detail as { productId?: string } | null;
+      if (d && d.productId === productId) {
+        await ctx.db.delete(row._id);
+        auditRemoved++;
+      }
+    }
+    await ctx.db.delete(productId);
+    return { deleted: true, title: p.title, auditRemoved };
+  },
+});

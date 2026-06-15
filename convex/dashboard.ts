@@ -142,3 +142,42 @@ export const siteSummary = query({
     };
   },
 });
+
+// Per-brand KPI aggregate for the Overview tab. Every read is index-scoped to siteId.
+// Returns the site row + a bundle of counts the detail header/Overview needs in one round-trip.
+export const brandDetail = query({
+  args: { siteId: v.id("sites") },
+  handler: async (ctx, { siteId }) => {
+    const site = await ctx.db.get(siteId);
+    if (!site) return null;
+
+    const [allProducts, activeProducts, pendingActions, allPosts, publishedPosts, openOrders, allOrders, reviewCreatives] =
+      await Promise.all([
+        ctx.db.query("products").withIndex("by_site", (q) => q.eq("siteId", siteId)).take(500),
+        ctx.db.query("products").withIndex("by_site_status", (q) => q.eq("siteId", siteId).eq("status", "active")).take(500),
+        ctx.db.query("actions").withIndex("by_site_status", (q) => q.eq("siteId", siteId).eq("status", "pending_approval")).take(500),
+        ctx.db.query("posts").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).take(500),
+        ctx.db.query("posts").withIndex("by_site_status", (q) => q.eq("siteId", siteId).eq("status", "published")).take(500),
+        ctx.db.query("orders").withIndex("by_site_status", (q) => q.eq("siteId", siteId).eq("fulfillmentStatus", "received")).take(500),
+        ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", siteId)).take(500),
+        ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", siteId).eq("status", "review")).take(500),
+      ]);
+
+    const totalViews = publishedPosts.reduce((s, p) => s + (p.views ?? 0), 0);
+    const revenueUsd = allOrders.reduce((s, o) => s + (o.totalUsd ?? 0), 0);
+
+    return {
+      site,
+      productCount: allProducts.length,
+      activeProductCount: activeProducts.length,
+      pendingActionCount: pendingActions.length,
+      postCount: allPosts.length,
+      publishedPostCount: publishedPosts.length,
+      openOrderCount: openOrders.length,
+      orderCount: allOrders.length,
+      reviewCreativeCount: reviewCreatives.length,
+      totalViews,
+      revenueUsd,
+    };
+  },
+});

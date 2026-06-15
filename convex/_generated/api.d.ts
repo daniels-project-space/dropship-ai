@@ -13,6 +13,8 @@ import type * as admin from "../admin.js";
 import type * as audit from "../audit.js";
 import type * as creatives from "../creatives.js";
 import type * as dashboard from "../dashboard.js";
+import type * as experiments from "../experiments.js";
+import type * as metrics from "../metrics.js";
 import type * as orders from "../orders.js";
 import type * as posts from "../posts.js";
 import type * as products from "../products.js";
@@ -31,6 +33,8 @@ declare const fullApi: ApiFromModules<{
   audit: typeof audit;
   creatives: typeof creatives;
   dashboard: typeof dashboard;
+  experiments: typeof experiments;
+  metrics: typeof metrics;
   orders: typeof orders;
   posts: typeof posts;
   products: typeof products;

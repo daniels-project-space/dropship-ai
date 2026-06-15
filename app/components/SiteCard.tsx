@@ -63,14 +63,14 @@ export function SiteCard({ site, index = 0 }: { site: PortfolioSite; index?: num
       />
 
       <header className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h3 className="truncate font-display text-[19px] font-medium tracking-tight text-ink">
+        <Link href={`/sites/${site.siteId}`} className="min-w-0">
+          <h3 className="truncate font-display text-[19px] font-medium tracking-tight text-ink transition-colors group-hover:text-signal">
             {site.name}
           </h3>
           <p className="mt-1 truncate font-mono text-[11px] text-ink-faint">
             {domain}
           </p>
-        </div>
+        </Link>
         <div
           className={`flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium ${tone.ring}`}
         >
@@ -113,7 +113,12 @@ export function SiteCard({ site, index = 0 }: { site: PortfolioSite; index?: num
             Review {site.pendingActionCount} action{site.pendingActionCount > 1 ? "s" : ""} &rarr;
           </Link>
         ) : (
-          <span className="text-[13px] text-ink-faint">No pending actions</span>
+          <Link
+            href={`/sites/${site.siteId}`}
+            className="text-[13px] font-medium text-ink-dim transition-colors hover:text-signal"
+          >
+            Open brand &rarr;
+          </Link>
         )}
         {site.killDate && (
           <span className="font-mono text-[10px] text-ink-faint">
