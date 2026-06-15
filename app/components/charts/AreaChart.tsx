@@ -40,7 +40,7 @@ export function AreaChart({
   // a little left gutter holds the y-axis value ticks.
   const W = 720;
   const H = height;
-  const padL = 4;
+  const padL = 46; // left gutter reserved for the y-axis value ticks
   const padR = 10;
   const padT = 18;
   const padB = 24;
@@ -218,13 +218,14 @@ export function AreaChart({
           )}
         </svg>
 
-        {/* y-axis value ticks — HTML overlay, kept crisp (SVG is non-uniformly scaled) */}
+        {/* y-axis value ticks — HTML overlay in the reserved left gutter, right-
+            aligned against the plot so they never sit over the curve */}
         <div className="pointer-events-none absolute inset-0" style={{ opacity: progress }}>
           {ticks.map((t, i) => (
             <span
               key={i}
-              className="caption absolute -translate-y-1/2 pl-1 text-ink-faint/80"
-              style={{ top: yPx(t.y), left: 0 }}
+              className="num absolute -translate-y-1/2 pr-2 text-right text-[10px] text-ink-faint"
+              style={{ top: yPx(t.y), left: 0, width: `${xPct(padL)}%`, textShadow: "0 1px 2px rgba(7,9,12,0.85)" }}
             >
               {valuePrefix}
               {format(t.v)}
