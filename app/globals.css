@@ -15,8 +15,11 @@
   --color-line-soft: #161c25;
 
   --color-ink: #e8edf4;
-  --color-ink-dim: #9aa6b6;
-  --color-ink-faint: #5d6878;
+  --color-ink-dim: #a3afbf;
+  --color-ink-faint: #76828f;
+
+  --color-grid: #1e2530;         /* chart gridlines / axis hairlines */
+  --color-axis: #76828f;         /* chart axis tick labels */
 
   --color-signal: #e8b04b;       /* brand amber / identity */
   --color-signal-deep: #c9933a;
@@ -195,5 +198,32 @@
       linear-gradient(180deg, rgba(255, 255, 255, 0.015), rgba(255, 255, 255, 0) 45%),
       var(--color-panel-2);
     border: 1px solid var(--color-line-soft);
+  }
+
+  /* hero panel — same glass surface with a touch more lift + a brighter top edge,
+     for the primary chart so it reads as the focal moment */
+  .panel-hero {
+    background:
+      linear-gradient(180deg, rgba(232, 176, 75, 0.05), rgba(255, 255, 255, 0) 30%),
+      var(--color-panel);
+    border: 1px solid var(--color-line);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.045) inset,
+      0 30px 70px -34px rgba(0, 0, 0, 0.95);
+  }
+
+  /* mono tabular numerics — data readouts that must stay column-aligned */
+  .num {
+    font-family: var(--font-mono), ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /* tracked-out micro caption for axis/meta text — colour set by a text-* class */
+  .caption {
+    font-family: var(--font-mono), ui-monospace, monospace;
+    font-size: 0.625rem;
+    line-height: 1.1;
+    letter-spacing: 0.04em;
   }
 }

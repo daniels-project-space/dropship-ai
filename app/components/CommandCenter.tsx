@@ -15,7 +15,9 @@ import { Segmented } from "./ui/Segmented";
 import { InsightCard, type InsightData } from "./ui/InsightCard";
 import { ActivityFeed, type AuditEntry } from "./ui/ActivityFeed";
 import { DataTable, type Column } from "./ui/DataTable";
+import { MetricDelta } from "./ui/MetricDelta";
 import { AreaChart, LineChart, BarChart, Funnel, RadialGauge, Heatmap, MiniBars } from "./charts";
+import { StatusDot } from "./StatusDot";
 import { Icon } from "./Icons";
 import { fmtUsd, fmtCompact, PLATFORM, type Platform } from "./tokens";
 
@@ -86,10 +88,13 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
     {
       key: "title",
       header: "Product",
-      render: (r) => (
-        <div className="min-w-0">
-          <div className="truncate font-medium text-ink">{r.title}</div>
-          {scope === "all" && <div className="font-mono text-[10px] text-ink-faint">{r.siteName}</div>}
+      render: (r, i) => (
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="num w-4 shrink-0 text-right text-[11px] text-ink-faint">{i + 1}</span>
+          <div className="min-w-0">
+            <div className="truncate font-medium text-ink">{r.title}</div>
+            {scope === "all" && <div className="num text-[10px] text-ink-faint">{r.siteName}</div>}
+          </div>
         </div>
       ),
     },
@@ -105,7 +110,7 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
       align: "right",
       sortable: true,
       sortValue: (r) => r.views,
-      render: (r) => <span className="font-mono tabular-nums text-ink-dim">{fmtCompact(r.views)}</span>,
+      render: (r) => <span className="num text-[13px] text-ink">{fmtCompact(r.views)}</span>,
     },
     {
       key: "cvr",
@@ -114,7 +119,7 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
       sortable: true,
       sortValue: (r) => r.cvr,
       hideBelow: "sm",
-      render: (r) => <span className="font-mono tabular-nums text-ink-dim">{r.cvr.toFixed(1)}%</span>,
+      render: (r) => <span className="num text-ink-dim">{r.cvr.toFixed(1)}%</span>,
     },
     {
       key: "margin",
@@ -134,112 +139,152 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
   ];
 
   return (
-    <div className="flex flex-col gap-10">
+    <div className="flex flex-col gap-9">
       {/* ── controls bar ─────────────────────────────────────────────── */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-wrap items-center gap-2.5">
-          <Segmented<string>
-            options={[
-              { value: "7", label: "7d" },
-              { value: "30", label: "30d" },
-              { value: "90", label: "90d" },
-            ]}
-            value={String(tf)}
-            onChange={(v) => setTf(Number(v) as Timeframe)}
-          />
-          <Segmented<PlatformFilter>
-            size="sm"
-            options={[
-              { value: "all", label: "All" },
-              { value: "tiktok", label: "TT" },
-              { value: "instagram", label: "IG" },
-              { value: "youtube", label: "YT" },
-            ]}
-            value={pf}
-            onChange={setPf}
-          />
+      <div className="animate-rise flex flex-col gap-3 rounded-2xl border border-line-soft/70 bg-panel/30 px-3 py-2.5 backdrop-blur-sm sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2">
+            <span className="hidden caption uppercase tracking-wider text-ink-faint sm:inline">Window</span>
+            <Segmented<string>
+              options={[
+                { value: "7", label: "7d" },
+                { value: "30", label: "30d" },
+                { value: "90", label: "90d" },
+              ]}
+              value={String(tf)}
+              onChange={(v) => setTf(Number(v) as Timeframe)}
+            />
+          </div>
+          <span className="hidden h-5 w-px bg-line-soft sm:block" />
+          <div className="flex items-center gap-2">
+            <span className="hidden caption uppercase tracking-wider text-ink-faint sm:inline">Platform</span>
+            <Segmented<PlatformFilter>
+              size="sm"
+              options={[
+                { value: "all", label: "All" },
+                { value: "tiktok", label: "TT" },
+                { value: "instagram", label: "IG" },
+                { value: "youtube", label: "YT" },
+              ]}
+              value={pf}
+              onChange={setPf}
+            />
+          </div>
         </div>
         <div className="flex items-center gap-2">
-          <Link href="/content" className="inline-flex items-center gap-1.5 rounded-full bg-signal px-3.5 py-2 text-[12px] font-semibold text-void transition hover:bg-signal-deep">
+          <Link href="/content" className="inline-flex items-center gap-1.5 rounded-full bg-signal px-3.5 py-2 text-[12px] font-semibold text-void shadow-[0_6px_18px_-8px_rgba(232,176,75,0.8)] transition hover:bg-signal-deep">
             <Icon.spark size={13} /> Generate batch
           </Link>
           <Link
             href="/approvals"
             className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-[12px] font-medium transition ${
-              pendingTotal > 0 ? "border-pending/40 bg-pending/10 text-pending hover:bg-pending/15" : "border-line bg-panel/60 text-ink-dim hover:text-ink"
+              pendingTotal > 0
+                ? "border-pending/40 bg-pending/10 text-pending hover:bg-pending/15"
+                : "border-line bg-panel/60 text-ink-dim hover:text-ink"
             }`}
           >
-            <Icon.approvals size={13} /> Approvals{pendingTotal > 0 ? ` · ${pendingTotal}` : ""}
+            <Icon.approvals size={13} /> Approvals
+            {pendingTotal > 0 && (
+              <span className="ml-0.5 inline-flex h-[17px] min-w-[17px] items-center justify-center rounded-full bg-pending px-1 num text-[10px] font-semibold text-void">
+                {pendingTotal}
+              </span>
+            )}
           </Link>
         </div>
       </div>
 
       {/* ── hero KPI strip ───────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4 xl:grid-cols-5">
-        <KpiTile
-          label={`Net revenue · ${tfLabel}`}
-          numericValue={netRevenue}
-          format={(n) => fmtUsd(n, 0)}
-          delta={revenue?.deltaPct ?? null}
-          spark={spark(revenue)}
-          sparkColor={C.live}
-          dotHex={C.live}
-          accent="text-ink"
-          loading={revenue === undefined}
-          hint="take-home after platform fees"
-        />
-        <KpiTile
-          label="Contribution margin"
-          numericValue={blendedMargin}
-          format={(n) => `${Math.round(n)}%`}
-          accent={blendedMargin >= 70 ? "text-live" : "text-ink"}
-          sparkColor={C.signal}
-          loading={products === undefined}
-          hint="blended across top products"
-        />
-        <KpiTile
-          label={`Orders · ${tfLabel}`}
-          numericValue={orderCount}
-          delta={orders?.deltaPct ?? null}
-          spark={spark(orders)}
-          sparkColor={C.cyan}
-          loading={orders === undefined}
-        />
-        <KpiTile
-          label={`Organic views · ${tfLabel}`}
-          numericValue={viewTotal}
-          format={(n) => fmtCompact(Math.round(n))}
-          delta={views?.deltaPct ?? null}
-          spark={spark(views)}
-          sparkColor={C.violet}
-          loading={views === undefined}
-        />
-        <KpiTile
-          label="Content-fit gate"
-          value={gatePassed ? "Fit" : "Pending"}
-          accent={gatePassed ? "text-live" : "text-pending"}
-          dotHex={gatePassed ? C.live : C.pending}
-          pulse={gatePassed}
-          loading={gate === undefined}
-          hint={bestVideoViews > 0 ? `best ${fmtCompact(bestVideoViews)} / 10k` : "no breakout yet"}
-        />
+        {[
+          <KpiTile
+            key="rev"
+            label={`Net revenue · ${tfLabel}`}
+            numericValue={netRevenue}
+            format={(n) => fmtUsd(n, 0)}
+            delta={revenue?.deltaPct ?? null}
+            deltaLabel="vs prior"
+            spark={spark(revenue)}
+            sparkColor={C.live}
+            dotHex={C.live}
+            accent="text-ink"
+            loading={revenue === undefined}
+            hint="take-home after platform fees"
+          />,
+          <KpiTile
+            key="margin"
+            label="Contribution margin"
+            numericValue={blendedMargin}
+            format={(n) => `${Math.round(n)}%`}
+            accent={blendedMargin >= 70 ? "text-live" : "text-ink"}
+            sparkColor={C.signal}
+            loading={products === undefined}
+            hint="blended across top products"
+          />,
+          <KpiTile
+            key="orders"
+            label={`Orders · ${tfLabel}`}
+            numericValue={orderCount}
+            delta={orders?.deltaPct ?? null}
+            deltaLabel="vs prior"
+            spark={spark(orders)}
+            sparkColor={C.cyan}
+            loading={orders === undefined}
+          />,
+          <KpiTile
+            key="views"
+            label={`Organic views · ${tfLabel}`}
+            numericValue={viewTotal}
+            format={(n) => fmtCompact(Math.round(n))}
+            delta={views?.deltaPct ?? null}
+            deltaLabel="vs prior"
+            spark={spark(views)}
+            sparkColor={C.violet}
+            loading={views === undefined}
+          />,
+          <KpiTile
+            key="gate"
+            label="Content-fit gate"
+            value={gatePassed ? "Fit" : "Pending"}
+            accent={gatePassed ? "text-live" : "text-pending"}
+            dotHex={gatePassed ? C.live : C.pending}
+            pulse={gatePassed}
+            loading={gate === undefined}
+            hint={bestVideoViews > 0 ? `best ${fmtCompact(bestVideoViews)} / 10k` : "no breakout yet"}
+          />,
+        ].map((tile, i) => (
+          <div key={i} className="animate-rise" style={{ animationDelay: `${60 + i * 55}ms` }}>
+            {tile}
+          </div>
+        ))}
       </div>
 
       {/* ── primary chart ────────────────────────────────────────────── */}
-      <div className="panel rounded-2xl p-6 sm:p-7">
-        <div className="mb-5 flex items-start justify-between gap-4">
+      <div className="panel-hero animate-rise rounded-2xl p-6 sm:p-7" style={{ animationDelay: "120ms" }}>
+        <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
           <div>
-            <span className="label-eyebrow text-signal">Revenue & contribution</span>
-            <p className="mt-2 font-display text-[1.9rem] font-medium tabular-nums leading-none text-ink">
+            <span className="label-eyebrow text-signal">Revenue &amp; contribution</span>
+            <p className="mt-2.5 font-display text-[2rem] font-medium tabular-nums leading-none text-ink">
               {revenue === undefined ? "—" : fmtUsd(netRevenue, 0)}
             </p>
-            <p className="mt-1.5 font-mono text-[11px] text-ink-faint">trailing {tfLabel} · daily</p>
+            <p className="mt-2 num text-[11px] text-ink-faint">trailing {tfLabel} · daily net revenue</p>
+          </div>
+          <div className="flex items-center gap-2.5">
+            {revenue?.deltaPct != null && (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-line-soft bg-panel-2/60 px-2.5 py-1.5">
+                <MetricDelta value={revenue.deltaPct} />
+                <span className="caption text-ink-faint">vs prior {tfLabel}</span>
+              </span>
+            )}
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-live/25 bg-live/5 px-2.5 py-1.5">
+              <StatusDot className="bg-live" hex={C.live} live size={6} />
+              <span className="caption uppercase tracking-wider text-ink-dim">Live</span>
+            </span>
           </div>
         </div>
         <AreaChart
           data={(revenue?.points ?? []).map((p) => ({ label: p.day.slice(5), value: p.value }))}
           color={C.signal}
-          height={260}
+          height={272}
           valuePrefix="$"
           format={(n) => n.toLocaleString("en-US", { maximumFractionDigits: 0 })}
           emptyHint="Revenue populates once orders flow in this window."
@@ -248,7 +293,7 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
 
       {/* ── secondary row: reach trend · funnel · content-fit gauge ──── */}
       <div className="grid grid-cols-1 items-stretch gap-6 lg:grid-cols-3">
-        <div className="panel flex min-h-[320px] flex-col rounded-2xl p-6">
+        <div className="panel animate-rise flex min-h-[328px] flex-col rounded-2xl p-6" style={{ animationDelay: "160ms" }}>
           <SectionHeader eyebrow="Organic reach" accent="text-violet" meta={tfLabel} />
           <div className="flex flex-1 flex-col justify-center">
             <LineChart
@@ -257,13 +302,13 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
                 { name: "Views", color: C.violet, data: (views?.points ?? []).map((p) => p.value), format: (n) => fmtCompact(n) },
                 { name: "Engagement", color: C.cyan, data: (engagement?.points ?? []).map((p) => p.value), format: (n) => fmtCompact(n) },
               ]}
-              height={208}
+              height={216}
               emptyHint="No published-post reach yet."
             />
           </div>
         </div>
 
-        <div className="panel flex min-h-[320px] flex-col rounded-2xl p-6">
+        <div className="panel animate-rise flex min-h-[328px] flex-col rounded-2xl p-6" style={{ animationDelay: "200ms" }}>
           <SectionHeader eyebrow="Conversion funnel" accent="text-cyan" meta={tfLabel} />
           <div className="flex flex-1 flex-col justify-center">
             <Funnel
@@ -275,9 +320,9 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
           </div>
         </div>
 
-        <div className="panel flex min-h-[320px] flex-col rounded-2xl p-6">
+        <div className="panel animate-rise flex min-h-[328px] flex-col rounded-2xl p-6" style={{ animationDelay: "240ms" }}>
           <SectionHeader eyebrow="Content-fit milestone" accent="text-signal" className="w-full" />
-          <div className="flex flex-1 items-center justify-center">
+          <div className="flex flex-1 items-center justify-center py-2">
             <RadialGauge
               value={bestVideoViews}
               target={10000}
@@ -298,9 +343,11 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
         <div className="panel rounded-2xl p-6">
           <SectionHeader eyebrow="Platform performance" accent="text-cyan" meta={`views · ${tfLabel}`} />
           {platforms === undefined ? (
-            <div className="flex flex-col gap-3">{[0, 1, 2].map((i) => <div key={i} className="shimmer h-6 rounded-md" />)}</div>
+            <div className="flex flex-col gap-3.5">{[0, 1, 2].map((i) => <div key={i} className="shimmer h-7 rounded-md" />)}</div>
           ) : (
-            <BarChart data={platformBars} format={(n) => fmtCompact(n)} emptyHint="No published posts in window." />
+            <div className="pt-1">
+              <BarChart data={platformBars} format={(n) => fmtCompact(n)} emptyHint="No published posts in window." />
+            </div>
           )}
         </div>
 
@@ -309,7 +356,9 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
           {cadence === undefined ? (
             <div className="shimmer h-28 rounded-md" />
           ) : (
-            <Heatmap cells={cadence} color={C.signal} weeks={12} format={(n) => `${n} post${n > 1 ? "s" : ""}`} emptyHint="No posting activity yet." />
+            <div className="pt-1">
+              <Heatmap cells={cadence} color={C.signal} weeks={12} format={(n) => `${n} post${n > 1 ? "s" : ""}`} emptyHint="No posting activity yet." />
+            </div>
           )}
         </div>
       </div>

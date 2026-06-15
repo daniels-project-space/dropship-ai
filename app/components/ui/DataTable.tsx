@@ -11,7 +11,8 @@ export type Column<Row> = {
   sortable?: boolean;
   // value used for sorting (number/string). Falls back to no-sort if omitted.
   sortValue?: (row: Row) => number | string;
-  render: (row: Row) => ReactNode;
+  // `index` is the row's position in the currently-sorted list (0-based)
+  render: (row: Row, index: number) => ReactNode;
   className?: string; // applied to the cell
   hideBelow?: "sm" | "md" | "lg"; // responsive hide
 };
@@ -140,7 +141,7 @@ export function DataTable<Row>({
                         c.hideBelow ? HIDE[c.hideBelow] : ""
                       } ${c.className ?? ""}`}
                     >
-                      {c.render(row)}
+                      {c.render(row, i)}
                     </td>
                   );
                 })}

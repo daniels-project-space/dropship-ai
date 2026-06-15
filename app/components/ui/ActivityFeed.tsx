@@ -1,5 +1,4 @@
 import { timeAgo } from "../tokens";
-import { StatusDot } from "../StatusDot";
 
 export type AuditEntry = {
   _id: string;
@@ -55,7 +54,7 @@ export function ActivityFeed({
   return (
     <ol className="relative flex flex-col">
       {/* connecting spine */}
-      <span aria-hidden className="absolute left-[5px] top-2 bottom-2 w-px bg-line-soft" />
+      <span aria-hidden className="absolute left-[6px] top-3 bottom-3 w-px bg-gradient-to-b from-line-soft via-line-soft to-transparent" />
       {entries.map((e) => {
         const tone = eventTone(e.event);
         const sub = summarize(e.detail);
@@ -64,23 +63,27 @@ export function ActivityFeed({
           <li
             key={e._id}
             onClick={clickable ? () => onSelect!(e) : undefined}
-            className={`relative flex items-start gap-3.5 ${dense ? "py-2" : "py-2.5"} ${
+            className={`group relative flex items-start gap-3.5 ${dense ? "py-2" : "py-2.5"} ${
               clickable ? "-mx-2 cursor-pointer rounded-lg px-2 transition-colors hover:bg-white/[0.025]" : ""
             }`}
           >
-            <span className="relative z-10 mt-1 shrink-0">
-              <StatusDot className={tone.bg} hex={tone.hex} size={6} />
+            {/* status node — dot in a well so the connecting spine reads behind it */}
+            <span className="relative z-10 mt-[3px] grid h-[13px] w-[13px] shrink-0 place-items-center rounded-full bg-base ring-1 ring-line-soft">
+              <span className={`h-[6px] w-[6px] rounded-full ${tone.bg}`} style={{ boxShadow: `0 0 6px -1px ${tone.hex}` }} />
             </span>
             <div className="min-w-0 flex-1">
               <div className="flex items-baseline justify-between gap-3">
                 <span className="truncate text-[13px] capitalize text-ink">{prettyEvent(e.event)}</span>
-                <span className="shrink-0 font-mono text-[10px] text-ink-faint">{timeAgo(e.at)}</span>
+                <span className="shrink-0 num text-[10px] text-ink-faint">{timeAgo(e.at)}</span>
               </div>
               {(sub || (showSite && e.siteName)) && (
-                <p className="mt-0.5 truncate font-mono text-[11px] text-ink-faint">
-                  {showSite && e.siteName ? <span className="text-ink-dim">{e.siteName}</span> : null}
-                  {showSite && e.siteName && sub ? " · " : ""}
-                  {sub}
+                <p className="mt-1 flex items-center gap-1.5 truncate font-mono text-[11px] text-ink-faint">
+                  {showSite && e.siteName ? (
+                    <span className="inline-flex shrink-0 items-center rounded-full border border-line-soft bg-white/[0.02] px-1.5 py-px text-[10px] text-ink-dim">
+                      {e.siteName}
+                    </span>
+                  ) : null}
+                  {sub ? <span className="truncate">{sub}</span> : null}
                 </p>
               )}
             </div>

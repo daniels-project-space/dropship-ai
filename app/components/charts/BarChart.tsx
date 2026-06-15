@@ -1,7 +1,8 @@
 "use client";
 
 // Bespoke bar chart with three modes:
-//  • horizontal (default) — labelled rows with value at the end, grows on draw-in
+//  • horizontal (default) — labelled rows over a recessed track, value at the
+//    end, grows on draw-in; auto-sorted descending
 //  • vertical — columns with x labels
 //  • mini — tiny inline column strip (no labels), for table cells
 // Each bar can carry its own colour; rounded caps; staggered grow-in.
@@ -17,6 +18,7 @@ export function BarChart({
   color = "#e8b04b",
   format = (n: number) => n.toLocaleString("en-US"),
   emptyHint = "No data yet.",
+  sort = true,
 }: {
   data: Bar[];
   orientation?: "horizontal" | "vertical";
@@ -24,6 +26,8 @@ export function BarChart({
   color?: string;
   format?: (n: number) => string;
   emptyHint?: string;
+  /** sort horizontal bars descending by value (default true) */
+  sort?: boolean;
 }) {
   const { ref, inView } = useInView<HTMLDivElement>();
   const progress = useDrawIn(inView, 850);
@@ -45,7 +49,7 @@ export function BarChart({
           const h = (d.value / max) * (H - 28) * progress;
           return (
             <div key={d.label} className="flex flex-1 flex-col items-center justify-end gap-2">
-              <span className="font-mono text-[10px] tabular-nums text-ink-dim">{progress > 0.6 ? format(d.value) : ""}</span>
+              <span className="num text-[10px] text-ink-dim">{progress > 0.6 ? format(d.value) : ""}</span>
               <div
                 className="w-full rounded-t-md"
                 style={{
@@ -54,7 +58,7 @@ export function BarChart({
                   transitionDelay: `${i * 60}ms`,
                 }}
               />
-              <span className="font-mono text-[10px] uppercase tracking-wide text-ink-faint">{d.label}</span>
+              <span className="caption uppercase tracking-wide text-ink-faint">{d.label}</span>
             </div>
           );
         })}
@@ -62,31 +66,40 @@ export function BarChart({
     );
   }
 
-  // horizontal
+  // horizontal — sorted desc, recessed track, value pinned to the right
+  const rows = sort ? [...data].sort((a, b) => b.value - a.value) : data;
   return (
-    <div ref={ref} className="flex flex-col gap-3">
-      {data.map((d, i) => {
+    <div ref={ref} className="flex flex-col gap-3.5">
+      {rows.map((d, i) => {
         const w = (d.value / max) * 100 * progress;
         const c = d.color ?? color;
         return (
           <div key={d.label} className="flex items-center gap-3">
-            <span className="w-24 shrink-0 truncate font-mono text-[11px] text-ink-dim" title={d.label}>
-              {d.label}
+            <span className="flex w-24 shrink-0 items-center gap-2" title={d.label}>
+              <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: c, boxShadow: `0 0 6px -1px ${c}` }} />
+              <span className="truncate font-mono text-[11px] text-ink-dim">{d.label}</span>
             </span>
-            <div className="h-6 flex-1 overflow-hidden rounded-md bg-void/40 ring-1 ring-white/5">
+            <div className="relative h-7 flex-1 overflow-hidden rounded-md bg-void/50 ring-1 ring-inset ring-white/5">
+              {/* recessed baseline track tick marks */}
+              <div className="absolute inset-0 flex justify-between px-[15%]" aria-hidden>
+                {[0, 1, 2].map((t) => (
+                  <span key={t} className="w-px bg-white/[0.03]" />
+                ))}
+              </div>
               <div
-                className="flex h-full items-center justify-end rounded-md px-2"
+                className="relative flex h-full items-center rounded-md"
                 style={{
-                  width: `${Math.max(w, w > 0 ? 4 : 0)}%`,
-                  background: `linear-gradient(90deg, ${c}40, ${c})`,
-                  boxShadow: `0 0 16px -4px ${c}90`,
+                  width: `${Math.max(w, w > 0 ? 3 : 0)}%`,
+                  background: `linear-gradient(90deg, ${c}30, ${c}cc)`,
+                  boxShadow: `0 0 18px -6px ${c}, inset 0 1px 0 ${c}40`,
                   transitionDelay: `${i * 50}ms`,
                 }}
-              >
-                {progress > 0.7 && <span className="font-mono text-[10px] tabular-nums text-void/90 mix-blend-luminosity">{format(d.value)}</span>}
-              </div>
+              />
             </div>
-            {d.sublabel && <span className="w-14 shrink-0 text-right font-mono text-[10px] text-ink-faint">{d.sublabel}</span>}
+            <span className="w-16 shrink-0 text-right">
+              <span className="num text-[11px] text-ink">{format(d.value)}</span>
+              {d.sublabel && <span className="ml-1.5 caption text-ink-faint">{d.sublabel}</span>}
+            </span>
           </div>
         );
       })}
