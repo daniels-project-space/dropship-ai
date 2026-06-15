@@ -1,11 +1,16 @@
 "use client";
 
+import { Suspense, useState } from "react";
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { EmptyState } from "../components/EmptyState";
 import { StatusDot } from "../components/StatusDot";
 import { PageContainer } from "../components/ui/PageContainer";
+import { Drawer } from "../components/ui/Drawer";
+import { Badge } from "../components/ui/Badge";
+import { useBrand } from "../components/shell/useBrand";
+import { timeAgo } from "../components/tokens";
 
 type BoardPost = {
   _id: Id<"posts">;
@@ -129,11 +134,55 @@ function ContentFitGate({ gate }: { gate: GateData | undefined }) {
   );
 }
 
-function PostRow({ post, index }: { post: BoardPost; index: number }) {
+function statusRing(s: BoardPost["status"]) {
+  return STATUS_RING[s];
+}
+
+function PostDrawer({ post, onClose }: { post: BoardPost | null; onClose: () => void }) {
+  if (!post) return null;
+  const p = PLATFORM[post.platform];
+  return (
+    <Drawer open={!!post} onClose={onClose} eyebrow={`${p.label} post`} title={post.siteName}>
+      <div className="flex flex-col gap-5">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge dot={p.dot} hex={p.hex}>{p.label}</Badge>
+          <span className={`inline-flex shrink-0 items-center rounded-full px-2.5 py-1 text-[11px] font-medium capitalize ${statusRing(post.status)}`}>
+            {statusLabel(post.status)}
+          </span>
+          {post.aiGenerated && (
+            <Badge ring="bg-cyan/10 text-cyan ring-1 ring-cyan/25" dot="bg-cyan" hex="#5cc6e8">AI-labeled</Badge>
+          )}
+        </div>
+        <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line-soft bg-line-soft">
+          {[
+            ["Views", fmtViews(post.views ?? 0)],
+            ["Engagement", fmtViews(post.engagement ?? 0)],
+            ["Creative", (post.creativeKind ?? "creative").replace(/_/g, " ")],
+            ["Platform", p.label],
+            ["Scheduled", post.scheduledFor ? new Date(post.scheduledFor).toLocaleString() : "—"],
+            ["Published", post.publishedAt ? timeAgo(post.publishedAt) : "—"],
+          ].map(([k, val]) => (
+            <div key={k} className="bg-panel px-4 py-3">
+              <dt className="label-eyebrow text-[9px]">{k}</dt>
+              <dd className="mt-1 truncate font-mono text-[13px] tabular-nums text-ink">{val}</dd>
+            </div>
+          ))}
+        </dl>
+        <p className="text-[12px] leading-relaxed text-ink-faint">
+          Views on published posts feed the day-30 viability gate. Cold-start posts publish semi-manual
+          until Ayrshare is linked; after that the brain schedules automatically.
+        </p>
+      </div>
+    </Drawer>
+  );
+}
+
+function PostRow({ post, index, onClick }: { post: BoardPost; index: number; onClick: () => void }) {
   const p = PLATFORM[post.platform];
   return (
     <div
-      className="panel animate-rise flex items-center gap-4 rounded-xl px-5 py-4"
+      onClick={onClick}
+      className="panel animate-rise flex cursor-pointer items-center gap-4 rounded-xl px-5 py-4 transition-colors hover:bg-white/[0.025]"
       style={{ animationDelay: `${index * 45}ms` }}
     >
       <div className="flex w-32 shrink-0 items-center gap-2">
@@ -164,12 +213,15 @@ function PostRow({ post, index }: { post: BoardPost; index: number }) {
   );
 }
 
-export default function DistributionBoardPage() {
+function DistributionBoardInner() {
+  const { brand, isAll } = useBrand();
   const board = useQuery(api.posts.listForBoard, {});
-  const gate = useQuery(api.dashboard.contentFitGate, {});
+  const gate = useQuery(api.dashboard.contentFitGate, isAll ? {} : { siteId: brand as Id<"sites"> });
+  const [active, setActive] = useState<BoardPost | null>(null);
 
   const loading = board === undefined;
-  const posts = (board ?? []) as BoardPost[];
+  const allPosts = (board ?? []) as BoardPost[];
+  const posts = isAll ? allPosts : allPosts.filter((p) => p.siteId === (brand as string));
   const isEmpty = !loading && posts.length === 0;
 
   return (
@@ -194,7 +246,7 @@ export default function DistributionBoardPage() {
 
         <section className="mt-12">
           <div className="mb-5 flex items-center gap-2">
-            <span className="label-eyebrow">Post ledger</span>
+            <span className="label-eyebrow">{isAll ? "Post ledger" : "Post ledger · scoped"}</span>
             <span className="h-px flex-1 bg-line-soft" />
             {!loading && <span className="font-mono text-[11px] text-ink-faint">{posts.length} posts</span>}
           </div>
@@ -218,11 +270,21 @@ export default function DistributionBoardPage() {
           ) : (
             <div className="flex flex-col gap-3">
               {posts.map((post, i) => (
-                <PostRow key={post._id} post={post} index={i} />
+                <PostRow key={post._id} post={post} index={i} onClick={() => setActive(post)} />
               ))}
             </div>
           )}
         </section>
+
+        <PostDrawer post={active} onClose={() => setActive(null)} />
     </PageContainer>
+  );
+}
+
+export default function DistributionBoardPage() {
+  return (
+    <Suspense fallback={<PageContainer><div className="shimmer h-64 rounded-2xl" /></PageContainer>}>
+      <DistributionBoardInner />
+    </Suspense>
   );
 }

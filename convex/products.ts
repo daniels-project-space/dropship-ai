@@ -88,3 +88,32 @@ export const get = query({
   args: { productId: v.id("products") },
   handler: async (ctx, { productId }) => ctx.db.get(productId),
 });
+
+// Cross-brand candidate catalog for the global Research page. Optionally scoped to ONE
+// brand. Index-driven per site (by_site / by_site_status), merged + tagged with siteName.
+export const listAllAcrossBrands = query({
+  args: { siteId: v.optional(v.id("sites")), status: v.optional(productStatus), limit: v.optional(v.number()) },
+  handler: async (ctx, { siteId, status, limit }) => {
+    const cap = limit ?? 200;
+    const allSites = await ctx.db.query("sites").take(200);
+    const sites = siteId ? allSites.filter((s) => s._id === siteId) : allSites;
+
+    const out: Array<Record<string, unknown>> = [];
+    for (const s of sites) {
+      const rows = status
+        ? await ctx.db
+            .query("products")
+            .withIndex("by_site_status", (q) => q.eq("siteId", s._id).eq("status", status))
+            .order("desc")
+            .take(cap)
+        : await ctx.db
+            .query("products")
+            .withIndex("by_site", (q) => q.eq("siteId", s._id))
+            .order("desc")
+            .take(cap);
+      for (const r of rows) out.push({ ...r, siteName: s.name });
+    }
+    out.sort((a, b) => (b.createdAt as number) - (a.createdAt as number));
+    return out.slice(0, cap);
+  },
+});

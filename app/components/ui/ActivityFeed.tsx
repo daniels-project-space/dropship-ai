@@ -39,15 +39,18 @@ function summarize(detail: unknown): string | null {
 }
 
 // Vertical timeline of audit events with a connecting spine. Used on the
-// Portfolio recent-activity strip and the per-brand Activity tab.
+// Portfolio recent-activity strip and the per-brand Activity tab. Pass `onSelect`
+// to make each row clickable (opens a detail drawer on the global Activity page).
 export function ActivityFeed({
   entries,
   showSite = false,
   dense = false,
+  onSelect,
 }: {
   entries: AuditEntry[];
   showSite?: boolean;
   dense?: boolean;
+  onSelect?: (entry: AuditEntry) => void;
 }) {
   return (
     <ol className="relative flex flex-col">
@@ -56,8 +59,15 @@ export function ActivityFeed({
       {entries.map((e) => {
         const tone = eventTone(e.event);
         const sub = summarize(e.detail);
+        const clickable = !!onSelect;
         return (
-          <li key={e._id} className={`relative flex items-start gap-3.5 ${dense ? "py-2" : "py-2.5"}`}>
+          <li
+            key={e._id}
+            onClick={clickable ? () => onSelect!(e) : undefined}
+            className={`relative flex items-start gap-3.5 ${dense ? "py-2" : "py-2.5"} ${
+              clickable ? "-mx-2 cursor-pointer rounded-lg px-2 transition-colors hover:bg-white/[0.025]" : ""
+            }`}
+          >
             <span className="relative z-10 mt-1 shrink-0">
               <StatusDot className={tone.bg} hex={tone.hex} size={6} />
             </span>

@@ -71,3 +71,54 @@ export const listRecent = query({
     return out.slice(0, cap);
   },
 });
+
+// Cross-brand audit feed for the global Activity page. Index-driven (by_site_at per
+// site), optionally scoped to ONE brand and/or ONE event type. `limit` doubles as a
+// simple "load more" cursor (the page raises it) — there is no global by_at index, so
+// we over-fetch per site, merge, sort newest-first and slice. Returns the slice plus a
+// `hasMore` flag and the distinct event types present (for the filter dropdown).
+export const listAll = query({
+  args: {
+    limit: v.optional(v.number()),
+    siteId: v.optional(v.id("sites")),
+    event: v.optional(v.string()),
+  },
+  handler: async (ctx, { limit, siteId, event }) => {
+    const cap = Math.min(limit ?? 60, 500);
+    // Over-fetch one extra so we can report hasMore without a second pass.
+    const perSiteTake = cap + 1;
+
+    const allSites = await ctx.db.query("sites").take(200);
+    const sites = siteId ? allSites.filter((s) => s._id === siteId) : allSites;
+
+    const merged: Array<{
+      _id: string;
+      event: string;
+      detail: unknown;
+      at: number;
+      siteName: string;
+      siteId: string;
+    }> = [];
+    const eventTypes = new Set<string>();
+
+    for (const s of sites) {
+      const rows = await ctx.db
+        .query("auditLog")
+        .withIndex("by_site_at", (q) => q.eq("siteId", s._id))
+        .order("desc")
+        .take(perSiteTake);
+      for (const r of rows) {
+        eventTypes.add(r.event);
+        if (event && r.event !== event) continue;
+        merged.push({ _id: r._id, event: r.event, detail: r.detail, at: r.at, siteName: s.name, siteId: s._id });
+      }
+    }
+    merged.sort((a, b) => b.at - a.at);
+    const page = merged.slice(0, cap);
+    return {
+      entries: page,
+      hasMore: merged.length > cap,
+      eventTypes: Array.from(eventTypes).sort(),
+    };
+  },
+});

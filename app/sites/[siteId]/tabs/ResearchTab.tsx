@@ -16,6 +16,14 @@ type SignalRow = {
   day: string;
 };
 
+type ExperimentRow = {
+  _id: Id<"experiments">;
+  hypothesis: string;
+  status: "running" | "concluded";
+  winner?: string;
+  startedAt: number;
+};
+
 const SOURCE_LABEL: Record<string, string> = {
   google_trends: "Google Trends",
   meta_ad_library: "Meta Ad Library",
@@ -30,6 +38,58 @@ const RUBRIC = [
   { label: "Min kit price floor", note: "premium positioning", key: "price" },
   { label: "Sustained trend signal", note: "not a 2-week spike", key: "trend" },
 ];
+
+function ExperimentsSection({ siteId }: { siteId: Id<"sites"> }) {
+  const experiments = useQuery(api.experiments.listBySite, { siteId, limit: 50 });
+  const loading = experiments === undefined;
+  const rows = (experiments ?? []) as ExperimentRow[];
+
+  return (
+    <section className="mt-12">
+      <SectionHeader eyebrow="CRO experiments" accent="text-violet" meta={loading ? undefined : `${rows.length} total`} />
+      {loading ? (
+        <div className="panel rounded-2xl p-6">
+          <div className="flex flex-col gap-3">
+            {[0, 1].map((i) => <div key={i} className="shimmer h-9 rounded-lg" />)}
+          </div>
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="panel rounded-2xl px-6 py-10 text-center">
+          <div className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded-xl border border-violet/25 bg-violet/10 text-violet">
+            <Icon.spark size={18} />
+          </div>
+          <p className="font-display text-lg font-medium text-ink">No experiments running</p>
+          <p className="mx-auto mt-2 max-w-sm text-[13px] leading-relaxed text-ink-dim">
+            Once a product has traffic, the brain proposes A/B tests (price, hero, copy) to lift CVR. Each
+            running test and its winner will surface here.
+          </p>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2.5">
+          {rows.map((e) => {
+            const running = e.status === "running";
+            return (
+              <div key={e._id} className="panel flex items-start justify-between gap-4 rounded-xl px-5 py-4">
+                <div className="min-w-0">
+                  <p className="truncate text-[13.5px] text-ink">{e.hypothesis}</p>
+                  <p className="mt-0.5 font-mono text-[10px] text-ink-faint">
+                    {new Date(e.startedAt).toLocaleDateString()}
+                    {e.winner ? ` · winner: ${e.winner}` : ""}
+                  </p>
+                </div>
+                {running ? (
+                  <Badge ring="bg-violet/10 text-violet ring-1 ring-violet/25" dot="bg-violet" hex="#9b8cff" live>Running</Badge>
+                ) : (
+                  <Badge ring="bg-live/10 text-live ring-1 ring-live/25" dot="bg-live" hex="#44d6a0">Concluded</Badge>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
 
 export function ResearchTab({ siteId }: { siteId: Id<"sites"> }) {
   const signals = useQuery(api.signals.listBySite, { siteId, limit: 100 });
@@ -68,6 +128,7 @@ export function ResearchTab({ siteId }: { siteId: Id<"sites"> }) {
   ];
 
   return (
+    <>
     <div className="grid grid-cols-1 gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
       <div>
         <SectionHeader eyebrow="Trend signals" accent="text-cyan" meta={loading ? undefined : `${rows.length} points`} />
@@ -108,5 +169,7 @@ export function ResearchTab({ siteId }: { siteId: Id<"sites"> }) {
         </div>
       </aside>
     </div>
+    <ExperimentsSection siteId={siteId} />
+    </>
   );
 }
