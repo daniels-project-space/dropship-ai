@@ -2,8 +2,12 @@
 // Self-contained — uses only already-installed deps (@aws-sdk/client-s3, convex). No tsx needed.
 // Run: NEXT_PUBLIC_CONVEX_URL=... node scripts/test-gen.mjs <siteId>
 //
-// Mirrors the real adapters (src/lib/gen/fal.ts, tts.ts, assemble.ts) step-for-step so a green
-// run proves the production wire end-to-end: fal Flux → ElevenLabs → ffmpeg(+AI label) → R2 → Convex.
+// Mirrors the real adapters (src/lib/gen/higgsfield.ts, tts.ts, assemble.ts) step-for-step so a green
+// run proves the production wire end-to-end:
+//   Higgsfield z_image (CLI, ~0.15 credits) → ElevenLabs → ffmpeg(+AI label) → R2 → Convex.
+// NOTE (2026-06-15): fal is OUT OF CREDITS, so the hero still is generated via Daniel's Higgsfield
+// account through the authed `higgs` CLI (cheapest proven path). The fal adapter remains in the
+// codebase for when credits return; this script and src/lib/gen/higgsfield.ts use Higgs today.
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -54,20 +58,25 @@ const scene =
 const line = "The 3-minute lick mat that melts the zoomies away.";
 let cost = 0;
 
-// 1) fal Flux still
-console.log("[1/4] fal Flux product still…");
-const falKey = await vaultGet("fal", "FAL_KEY");
-const falRes = await fetch("https://fal.run/fal-ai/flux/schnell", {
-  method: "POST", headers: { Authorization: `Key ${falKey}`, "Content-Type": "application/json" },
-  body: JSON.stringify({ prompt: scene, image_size: "portrait_16_9", num_images: 1 }),
-});
-if (!falRes.ok) throw new Error("fal failed: " + falRes.status + " " + (await falRes.text()).slice(0, 200));
-const falJson = await falRes.json();
-const imgUrl = falJson.images?.[0]?.url;
+// 1) Higgsfield z_image product still (via authed `higgs` CLI — cheapest 9:16 model, ~0.15 credits)
+console.log("[1/4] Higgsfield z_image product still…");
+const HIGGS_BIN = process.env.HIGGS_BIN || "higgs";
+const gen = spawnSync(HIGGS_BIN, ["generate", "create", "z_image",
+  "--prompt", scene, "--aspect_ratio", "9:16",
+  "--wait", "--wait-timeout", "4m", "--wait-interval", "5s", "--json", "--no-color"],
+  { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+if (gen.status !== 0) throw new Error("higgs failed: " + (gen.stderr || gen.stdout || "").slice(-400));
+const gOut = gen.stdout || "";
+const gs = gOut.lastIndexOf("["), ge = gOut.lastIndexOf("]");
+if (gs === -1 || ge === -1) throw new Error("higgs: no JSON in output: " + gOut.slice(-300));
+const jobs = JSON.parse(gOut.slice(gs, ge + 1));
+const imgUrl = jobs.find((j) => j.result_url)?.result_url;
+if (!imgUrl) throw new Error("higgs: no result_url in jobs");
 const imgBuf = Buffer.from(await (await fetch(imgUrl)).arrayBuffer());
-await putR2(`${base}-still.jpg`, imgBuf, "image/jpeg");
-console.log("   ->", `${base}-still.jpg`, imgBuf.byteLength, "bytes");
-cost += 0.003;
+const stillExt = /\.png(\?|$)/i.test(imgUrl) ? "png" : "jpg";
+await putR2(`${base}-still.${stillExt}`, imgBuf, stillExt === "png" ? "image/png" : "image/jpeg");
+console.log("   ->", `${base}-still.${stillExt}`, imgBuf.byteLength, "bytes");
+cost += 0.003; // ~0.15 Higgsfield credits
 
 // 2) ElevenLabs VO
 console.log("[2/4] ElevenLabs voiceover…");
@@ -110,4 +119,4 @@ const res = await convex.mutation(api.creatives.requestGen, {
   siteId, kind: "product_demo", aiGenerated: true, hook: line, r2Key: `${base}-final.mp4`, status: "review",
 });
 console.log("   -> creativeId:", res.creativeId, "| aiLabelRequired:", res.aiLabelRequired);
-console.log(`\nDONE. Estimated cost ≈ $${cost.toFixed(4)} (1 flux img + ${line.length} TTS chars).`);
+console.log(`\nDONE. Estimated cost ≈ $${cost.toFixed(4)} (1 Higgsfield z_image still + ${line.length} TTS chars).`);
