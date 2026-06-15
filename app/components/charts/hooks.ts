@@ -16,19 +16,27 @@ function easeOutExpo(t: number): number {
   return t === 1 ? 1 : 1 - Math.pow(2, -10 * t);
 }
 
-/** Fires once when `enabled` flips true; returns a 0→1 progress that drives draw-in. */
+/**
+ * Returns a 0→1 progress that drives the chart draw-in. The animation begins the
+ * first time `enabled` becomes true and always settles at exactly 1.
+ *
+ * IMPORTANT: progress is a *presentation* signal only — it must never be the sole
+ * thing that makes a chart visible, because the draw-in can be cut short (tab
+ * blur, reduced-motion, async data arriving after the in-view gate fired). The
+ * `useEffect` below therefore force-sets progress to 1 on cleanup/teardown so a
+ * chart can never get stranded at 0 and render invisible.
+ */
 export function useDrawIn(enabled: boolean, duration = 900, delay = 0): number {
-  const [p, setP] = useState(enabled && prefersReducedMotion() ? 1 : 0);
+  const [p, setP] = useState(0);
   const started = useRef(false);
 
   useEffect(() => {
     if (!enabled || started.current) return;
+    started.current = true;
     if (prefersReducedMotion()) {
       setP(1);
-      started.current = true;
       return;
     }
-    started.current = true;
     let raf = 0;
     let start = 0;
     const tick = (now: number) => {
@@ -41,9 +49,16 @@ export function useDrawIn(enabled: boolean, duration = 900, delay = 0): number {
       const t = Math.min(1, elapsed / duration);
       setP(easeOutExpo(t));
       if (t < 1) raf = requestAnimationFrame(tick);
+      else setP(1);
     };
     raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    // Safety net: if rAF is throttled/cancelled before completing (background
+    // tab, fast unmount), guarantee the chart ends fully drawn rather than blank.
+    const settle = setTimeout(() => setP(1), duration + delay + 400);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(settle);
+    };
   }, [enabled, duration, delay]);
 
   return p;
