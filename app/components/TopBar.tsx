@@ -6,6 +6,8 @@ import { StatusDot } from "./StatusDot";
 
 const NAV = [
   { href: "/", label: "Portfolio" },
+  { href: "/content", label: "Studio" },
+  { href: "/posts", label: "Distribution" },
   { href: "/approvals", label: "Approvals" },
 ];
 

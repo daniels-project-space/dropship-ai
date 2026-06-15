@@ -1,0 +1,153 @@
+// Content factory — turns a brief into K=3 PRODUCT-FIRST creative variants, ready for review.
+//
+// PRODUCT-FIRST DOCTRINE (locked): each variant's hero is the PRODUCT (mat ASMR, freeze-mold
+// pour, hands-only demo, before/after). AI animal footage is NOT a hero — at most a brief
+// stylized supporting b-roll. Every variant is AI-touched (Flux still + synthetic voice), so
+// each creative is stored aiGenerated:true → aiLabelRequired:true, and the assembler burns the
+// on-screen "AI-generated" label. A creative whose label can't be burned is never emitted.
+//
+// Flow per variant: fal product still → fal image-to-video clip → ElevenLabs VO → assemble
+// (9:16 + captions + MANDATORY label) → creatives.requestGen(status:"review", r2Key).
+//
+// `scheduleApprovedCreative` runs on approval: it pulls the approved creative, passes the label
+// gate, and distributes (Ayrshare fan-out, or a semi-manual post row).
+import { task, logger } from "@trigger.dev/sdk/v3";
+import { convexClient, api } from "../lib/convexClient";
+import type { Id } from "../../convex/_generated/dataModel";
+import { falProductImage, falProductClip } from "../lib/gen/fal";
+import { tts } from "../lib/gen/tts";
+import { assemble } from "../lib/assemble";
+import { distribute, type CreativeForPublish } from "../lib/distribute";
+import { getSignedUrl } from "../lib/storage";
+
+type Brief = {
+  siteId: string;
+  productId?: string;
+  // product-first scene prompts (PRODUCT as subject, not a realistic dog)
+  hooks?: string[];          // optional caption/VO hooks; defaults supplied below
+  scenePrompt?: string;      // product still prompt; default = Calm Dog lick-mat scene
+  variants?: number;         // K, default 3
+};
+
+const DEFAULT_SCENE =
+  "close-up product photography of a textured silicone dog lick mat smeared with creamy peanut " +
+  "butter and yogurt, soft natural window light, calm muted palette, shallow depth of field, " +
+  "no animals in frame, premium pet-enrichment brand look, vertical 9:16";
+
+const DEFAULT_HOOKS = [
+  "The 3-minute trick that calms an anxious dog.",
+  "Watch this lick mat melt the zoomies away.",
+  "Vet-loved enrichment your dog actually slows down for.",
+];
+
+export const contentFactory = task({
+  id: "content-factory",
+  maxDuration: 600,
+  run: async (brief: Brief) => {
+    const convex = convexClient();
+    const siteId = brief.siteId as Id<"sites">;
+    const K = Math.max(1, Math.min(brief.variants ?? 3, 3));
+    const hooks = brief.hooks ?? DEFAULT_HOOKS;
+    const scene = brief.scenePrompt ?? DEFAULT_SCENE;
+    const stamp = Date.now();
+    const created: Array<{ creativeId: string; r2Key: string }> = [];
+
+    for (let i = 0; i < K; i++) {
+      const hook = hooks[i % hooks.length];
+      const base = `creatives/${siteId}/${stamp}-v${i}`;
+      try {
+        // 1) product-first hero still
+        const still = await falProductImage(`${scene}, variation ${i + 1}`, `${base}-still.jpg`);
+        // 2) image-to-video so motion stays anchored to a real product frame
+        const stillUrl = await getSignedUrl(still.r2Key, 600);
+        const clip = await falProductClip(stillUrl, "gentle slow push-in, subtle texture motion, calm", `${base}-clip.mp4`);
+        // 3) voiceover
+        const vo = await tts(hook, `${base}-vo.mp3`);
+        // 4) assemble with MANDATORY burned-in AI-disclosure label
+        const finished = await assemble({
+          productClipR2Key: clip.r2Key,
+          voiceoverR2Key: vo.r2Key,
+          captions: hook,
+          aiLabelRequired: true, // AI-touched → label is non-negotiable
+          outR2Key: `${base}-final.mp4`,
+        });
+        if (!finished.labelBurned) {
+          // assemble() throws rather than returning unlabeled, but guard anyway.
+          throw new Error("content-factory: assembled asset missing AI label — discarding variant");
+        }
+        // 5) persist as a reviewable creative (aiGenerated → aiLabelRequired enforced in convex)
+        const { creativeId } = await convex.mutation(api.creatives.requestGen, {
+          siteId,
+          productId: brief.productId as Id<"products"> | undefined,
+          kind: "product_demo",
+          aiGenerated: true,
+          hook,
+          r2Key: finished.r2Key,
+          status: "review",
+        });
+        created.push({ creativeId, r2Key: finished.r2Key });
+        logger.info("content-factory variant ready", { creativeId, variant: i });
+      } catch (err) {
+        logger.error("content-factory variant failed", { variant: i, error: String(err).slice(0, 300) });
+      }
+    }
+
+    return { siteId, requested: K, created: created.length, creatives: created };
+  },
+});
+
+// On approval → distribute. Caller (UI approve action or a webhook) triggers this with the id.
+export const scheduleApprovedCreative = task({
+  id: "schedule-approved-creative",
+  run: async (payload: { creativeId: string; caption?: string }) => {
+    const convex = convexClient();
+    const creativeId = payload.creativeId as Id<"creatives">;
+    const creative = await convex.query(api.creatives.get, { creativeId });
+    if (!creative) throw new Error(`creative ${creativeId} not found`);
+    if (creative.status !== "approved") {
+      logger.warn("schedule-approved-creative: not approved, skipping", { creativeId, status: creative.status });
+      return { skipped: true, reason: `status ${creative.status}` };
+    }
+
+    const mediaUrl = await getSignedUrl(creative.r2Key, 3600);
+    const forPublish: CreativeForPublish = {
+      aiGenerated: creative.aiGenerated,
+      aiLabelRequired: creative.aiLabelRequired,
+      labelBurned: Boolean(creative.r2Key), // asset exists ⇒ assembler burned the label
+      mediaUrl,
+      caption: payload.caption ?? creative.hook ?? "Calm Dog enrichment.",
+    };
+
+    // distribute() runs assertLabelGate() first — hard stop on any unlabeled AI asset.
+    const result = await distribute(forPublish);
+
+    if (result.mode === "ayrshare" && result.ok) {
+      for (const platform of result.platforms) {
+        await convex.mutation(api.posts.schedule, {
+          siteId: creative.siteId as Id<"sites">,
+          creativeId,
+          platform,
+          status: "published",
+          externalPostId: result.postIds[platform],
+        });
+      }
+      return { mode: "ayrshare", posts: result.platforms.length };
+    }
+
+    if (result.mode === "semi_manual") {
+      // cold-start: one awaiting_manual_publish row per platform for Daniel to tap.
+      for (const platform of ["tiktok", "instagram", "youtube"] as const) {
+        await convex.mutation(api.posts.schedule, {
+          siteId: creative.siteId as Id<"sites">,
+          creativeId,
+          platform,
+          status: "awaiting_manual_publish",
+        });
+      }
+      return { mode: "semi_manual", posts: 3, reason: result.reason };
+    }
+
+    logger.error("schedule-approved-creative: distribution blocked", { creativeId, result });
+    return { mode: "blocked", reason: result.ok ? "unknown" : result.reason };
+  },
+});

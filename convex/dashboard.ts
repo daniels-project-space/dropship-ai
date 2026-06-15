@@ -51,6 +51,74 @@ export const portfolio = query({
   },
 });
 
+// ── Content-fit gate (the day-30 viability signal) ───────────────────────────
+// "Has ANY post cleared 10k views in the trailing 30 days?" — the locked go/kill content
+// signal. Returns the boolean + the single best-performing video so the operator can see the
+// proof. Index-driven: walks each site's posts via by_site_status, no full-table scan.
+const VIEW_THRESHOLD = 10_000;
+const TRAILING_MS = 30 * 24 * 60 * 60 * 1000;
+
+export const contentFitGate = query({
+  args: { siteId: v.optional(v.id("sites")) },
+  handler: async (ctx, { siteId }) => {
+    const since = Date.now() - TRAILING_MS;
+    const sites = siteId
+      ? [await ctx.db.get(siteId)].filter((s): s is NonNullable<typeof s> => s !== null)
+      : await ctx.db.query("sites").take(200);
+
+    let best: {
+      postId: string;
+      siteId: string;
+      siteName: string;
+      platform: string;
+      views: number;
+      engagement: number;
+      creativeId: string;
+      r2Key: string | null;
+      publishedAt: number | null;
+    } | null = null;
+    let totalPublished = 0;
+
+    for (const s of sites) {
+      // published posts for this site (by_site_status, scoped)
+      const published = await ctx.db
+        .query("posts")
+        .withIndex("by_site_status", (q) => q.eq("siteId", s._id).eq("status", "published"))
+        .order("desc")
+        .take(500);
+      for (const p of published) {
+        const at = p.publishedAt ?? p._creationTime;
+        if (at < since) continue;
+        totalPublished++;
+        const views = p.views ?? 0;
+        if (!best || views > best.views) {
+          const creative = await ctx.db.get(p.creativeId);
+          best = {
+            postId: p._id,
+            siteId: s._id,
+            siteName: s.name,
+            platform: p.platform,
+            views,
+            engagement: p.engagement ?? 0,
+            creativeId: p.creativeId,
+            r2Key: creative?.r2Key ?? null,
+            publishedAt: p.publishedAt ?? null,
+          };
+        }
+      }
+    }
+
+    const passed = (best?.views ?? 0) >= VIEW_THRESHOLD;
+    return {
+      threshold: VIEW_THRESHOLD,
+      trailingDays: 30,
+      passed,
+      totalPublishedInWindow: totalPublished,
+      bestVideo: best, // null when nothing published in window
+    };
+  },
+});
+
 // Single-site detail counts (drill-down). Same index-driven discipline.
 export const siteSummary = query({
   args: { siteId: v.id("sites") },

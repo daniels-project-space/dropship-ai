@@ -10,8 +10,10 @@
 
 import type * as actions from "../actions.js";
 import type * as audit from "../audit.js";
+import type * as creatives from "../creatives.js";
 import type * as dashboard from "../dashboard.js";
 import type * as orders from "../orders.js";
+import type * as posts from "../posts.js";
 import type * as products from "../products.js";
 import type * as signals from "../signals.js";
 import type * as sites from "../sites.js";
@@ -25,8 +27,10 @@ import type {
 declare const fullApi: ApiFromModules<{
   actions: typeof actions;
   audit: typeof audit;
+  creatives: typeof creatives;
   dashboard: typeof dashboard;
   orders: typeof orders;
+  posts: typeof posts;
   products: typeof products;
   signals: typeof signals;
   sites: typeof sites;
