@@ -21,6 +21,7 @@ import type * as posts from "../posts.js";
 import type * as products from "../products.js";
 import type * as seed from "../seed.js";
 import type * as signals from "../signals.js";
+import type * as siteSecrets from "../siteSecrets.js";
 import type * as sites from "../sites.js";
 
 import type {
@@ -43,6 +44,7 @@ declare const fullApi: ApiFromModules<{
   products: typeof products;
   seed: typeof seed;
   signals: typeof signals;
+  siteSecrets: typeof siteSecrets;
   sites: typeof sites;
 }>;
 

@@ -55,6 +55,34 @@ export const get = query({
   },
 });
 
+// Resolve a site by its connected myshopify domain (used by the inbound Shopify webhook, which
+// carries the shop domain but not our siteId). Tenant set is small + bounded — take(500) is safe.
+export const getByDomain = query({
+  args: { shopifyDomain: v.string() },
+  handler: async (ctx, { shopifyDomain }) => {
+    const sites = await ctx.db.query("sites").take(500);
+    return sites.find((s) => s.shopifyDomain === shopifyDomain) ?? null;
+  },
+});
+
+// Connect a real Shopify store to a site: stamp the verified myshopify domain, flip status to
+// active, and clear the `sample` flag so the dashboard + SampleDataPill stop treating it as demo
+// data. Read-only connection (Phase 2a) — no fulfillment wiring. Idempotent.
+export const connectStore = mutation({
+  args: { siteId: v.id("sites"), shopifyDomain: v.string() },
+  handler: async (ctx, { siteId, shopifyDomain }) => {
+    const existing = await ctx.db.get(siteId);
+    if (!existing) throw new Error(`site ${siteId} not found`);
+    await ctx.db.patch(siteId, {
+      shopifyDomain,
+      status: "active",
+      sample: false,
+    });
+    await appendAudit(ctx, { siteId, event: "shopify_store_connected", detail: { shopifyDomain } });
+    return siteId;
+  },
+});
+
 export const update = mutation({
   args: {
     siteId: v.id("sites"),

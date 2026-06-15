@@ -38,6 +38,177 @@ export async function graphql<T = unknown>(
   return json.data as T;
 }
 
+// ── READ functions (Phase 2a — read-only store sync) ─────────────────────────
+
+const SHOP_QUERY = /* GraphQL */ `
+  query shop {
+    shop { name myshopifyDomain currencyCode }
+  }
+`;
+
+export interface ShopInfo {
+  name: string;
+  myshopifyDomain: string;
+  currencyCode: string;
+}
+
+/** Fetch the store identity. Doubles as a token VALIDATOR — a bad token throws here. */
+export async function getShop(cfg: ShopifyClientConfig): Promise<ShopInfo> {
+  const data = await graphql<{ shop: ShopInfo }>(cfg, SHOP_QUERY);
+  if (!data?.shop) throw new Error("shopify: shop query returned no data (token may lack read_products scope)");
+  return data.shop;
+}
+
+const PRODUCTS_QUERY = /* GraphQL */ `
+  query products($first: Int!, $after: String) {
+    products(first: $first, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        title
+        handle
+        status
+        featuredImage { url }
+        variants(first: 1) { nodes { price } }
+      }
+    }
+  }
+`;
+
+export interface ShopifyProduct {
+  id: string; // GraphQL gid, e.g. "gid://shopify/Product/123"
+  title: string;
+  handle: string;
+  status: "ACTIVE" | "ARCHIVED" | "DRAFT";
+  imageUrl: string | null;
+  priceUsd: number; // first variant price (0 when no variant/price)
+}
+
+/**
+ * List products with cursor pagination up to `limit` (hard-capped at 250 to stay polite).
+ * Pulls 50 per page. priceUsd is the first variant's price parsed to a number.
+ */
+export async function listProducts(
+  cfg: ShopifyClientConfig,
+  { limit = 250 }: { limit?: number } = {},
+): Promise<ShopifyProduct[]> {
+  const cap = Math.min(limit, 250);
+  const out: ShopifyProduct[] = [];
+  let after: string | null = null;
+  while (out.length < cap) {
+    const pageSize = Math.min(50, cap - out.length);
+    const data: {
+      products: {
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+        nodes: Array<{
+          id: string;
+          title: string;
+          handle: string;
+          status: "ACTIVE" | "ARCHIVED" | "DRAFT";
+          featuredImage: { url: string } | null;
+          variants: { nodes: Array<{ price: string }> };
+        }>;
+      };
+    } = await graphql(cfg, PRODUCTS_QUERY, { first: pageSize, after });
+    for (const n of data.products.nodes) {
+      out.push({
+        id: n.id,
+        title: n.title,
+        handle: n.handle,
+        status: n.status,
+        imageUrl: n.featuredImage?.url ?? null,
+        priceUsd: Number(n.variants.nodes[0]?.price ?? 0) || 0,
+      });
+    }
+    if (!data.products.pageInfo.hasNextPage) break;
+    after = data.products.pageInfo.endCursor;
+    if (!after) break;
+  }
+  return out.slice(0, cap);
+}
+
+const ORDERS_QUERY = /* GraphQL */ `
+  query orders($first: Int!, $after: String, $query: String) {
+    orders(first: $first, after: $after, query: $query) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        name
+        createdAt
+        displayFulfillmentStatus
+        totalPriceSet { shopMoney { amount } }
+        lineItems(first: 50) {
+          nodes { quantity product { id } }
+        }
+      }
+    }
+  }
+`;
+
+export interface ShopifyOrderLine {
+  productId: string | null;
+  quantity: number;
+}
+
+export interface ShopifyOrder {
+  id: string; // gid
+  name: string; // "#1001"
+  createdAt: number; // ms epoch
+  displayFulfillmentStatus: string; // FULFILLED | UNFULFILLED | PARTIALLY_FULFILLED | ...
+  totalUsd: number;
+  lineItems: ShopifyOrderLine[];
+}
+
+/**
+ * List orders created in the trailing `sinceDays` window (default 60). NOTE: the `read_orders`
+ * scope only exposes the **last 60 days** of orders by default — older history needs Shopify's
+ * `read_all_orders` protected scope (app approval). 60 days is the safe default. Cursor-paginated,
+ * 50 per page, capped at 250 orders.
+ */
+export async function listOrders(
+  cfg: ShopifyClientConfig,
+  { sinceDays = 60, limit = 250 }: { sinceDays?: number; limit?: number } = {},
+): Promise<ShopifyOrder[]> {
+  const cap = Math.min(limit, 250);
+  const sinceIso = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+  const queryFilter = `created_at:>=${sinceIso}`;
+  const out: ShopifyOrder[] = [];
+  let after: string | null = null;
+  while (out.length < cap) {
+    const pageSize = Math.min(50, cap - out.length);
+    const data: {
+      orders: {
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+        nodes: Array<{
+          id: string;
+          name: string;
+          createdAt: string;
+          displayFulfillmentStatus: string;
+          totalPriceSet: { shopMoney: { amount: string } };
+          lineItems: { nodes: Array<{ quantity: number; product: { id: string } | null }> };
+        }>;
+      };
+    } = await graphql(cfg, ORDERS_QUERY, { first: pageSize, after, query: queryFilter });
+    for (const n of data.orders.nodes) {
+      out.push({
+        id: n.id,
+        name: n.name,
+        createdAt: Date.parse(n.createdAt),
+        displayFulfillmentStatus: n.displayFulfillmentStatus,
+        totalUsd: Number(n.totalPriceSet?.shopMoney?.amount ?? 0) || 0,
+        lineItems: n.lineItems.nodes.map((li) => ({
+          productId: li.product?.id ?? null,
+          quantity: li.quantity,
+        })),
+      });
+    }
+    if (!data.orders.pageInfo.hasNextPage) break;
+    after = data.orders.pageInfo.endCursor;
+    if (!after) break;
+  }
+  return out.slice(0, cap);
+}
+
 const PRODUCT_CREATE = /* GraphQL */ `
   mutation productCreate($input: ProductInput!) {
     productCreate(input: $input) {

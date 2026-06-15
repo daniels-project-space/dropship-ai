@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { SectionHeader } from "../../../components/ui/SectionHeader";
@@ -12,6 +12,170 @@ import type { BrandDetail } from "./types";
 const FIELD =
   "w-full rounded-lg border border-line bg-void/60 px-3.5 py-2.5 text-[14px] text-ink placeholder:text-ink-faint outline-none transition focus:border-signal/50 focus:ring-2 focus:ring-signal/15";
 const LABEL = "label-eyebrow mb-2 block text-[10px]";
+
+// ── Connect Shopify card ─────────────────────────────────────────────────────
+// Not connected → domain + admin token form → POST /api/shopify/connect.
+// Connected     → domain, live product/order counts, "Sync now" → POST /api/shopify/sync.
+function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
+  const detail = useQuery(api.dashboard.brandDetail, { siteId: site._id as Id<"sites"> });
+  const connected = !!site.shopifyDomain;
+
+  const [domain, setDomain] = useState(site.shopifyDomain ?? "");
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<
+    | { kind: "ok"; shopName: string; products: number; orders: number; currency?: string }
+    | { kind: "err"; text: string }
+    | null
+  >(null);
+
+  async function connect(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setResult(null);
+    try {
+      const res = await fetch("/api/shopify/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ siteId: site._id, shopifyDomain: domain.trim(), accessToken: token.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok && res.status !== 207) {
+        setResult({ kind: "err", text: data.error ?? `Connect failed (HTTP ${res.status})` });
+      } else if (data.syncError) {
+        setResult({ kind: "err", text: `Connected, but initial sync failed: ${data.syncError}. Try “Sync now”.` });
+      } else {
+        setResult({
+          kind: "ok",
+          shopName: data.shop?.name ?? domain,
+          products: data.productCount ?? 0,
+          orders: data.orderCount ?? 0,
+          currency: data.currency,
+        });
+        setToken("");
+      }
+    } catch (err) {
+      setResult({ kind: "err", text: err instanceof Error ? err.message : "Connect failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function syncNow() {
+    setBusy(true);
+    setResult(null);
+    try {
+      const res = await fetch("/api/shopify/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ siteId: site._id }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setResult({ kind: "err", text: data.error ?? `Sync failed (HTTP ${res.status})` });
+      } else {
+        setResult({ kind: "ok", shopName: site.shopifyDomain ?? "", products: data.productCount ?? 0, orders: data.orderCount ?? 0 });
+      }
+    } catch (err) {
+      setResult({ kind: "err", text: err instanceof Error ? err.message : "Sync failed" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="panel rounded-2xl p-5">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Icon.store size={15} className="text-cyan" />
+          <span className="text-[13px] font-medium text-ink">Shopify store</span>
+        </div>
+        {connected ? (
+          <Badge ring="bg-live/10 text-live ring-1 ring-live/25" dot="bg-live" hex="#44d6a0" live>
+            Connected
+          </Badge>
+        ) : (
+          <Badge>Not connected</Badge>
+        )}
+      </div>
+
+      {connected ? (
+        <div className="flex flex-col gap-3">
+          <p className="font-mono text-[11px] text-ink-dim">{site.shopifyDomain}</p>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="rounded-lg border border-line-soft bg-void/30 px-3 py-2.5">
+              <span className="label-eyebrow text-[9px]">Products</span>
+              <p className="mt-0.5 font-mono text-[15px] tabular-nums text-ink">{detail?.productCount ?? "—"}</p>
+            </div>
+            <div className="rounded-lg border border-line-soft bg-void/30 px-3 py-2.5">
+              <span className="label-eyebrow text-[9px]">Orders</span>
+              <p className="mt-0.5 font-mono text-[15px] tabular-nums text-ink">{detail?.orderCount ?? "—"}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={syncNow}
+            disabled={busy}
+            className="inline-flex items-center justify-center gap-2 rounded-lg border border-line bg-void/40 px-4 py-2.5 text-[13px] font-medium text-ink-dim transition hover:border-signal/40 hover:text-ink disabled:opacity-50"
+          >
+            <Icon.refresh size={14} /> {busy ? "Syncing…" : "Sync now"}
+          </button>
+          {result?.kind === "ok" && (
+            <p className="font-mono text-[10px] text-live">
+              Synced {result.products} product{result.products === 1 ? "" : "s"} · {result.orders} order{result.orders === 1 ? "" : "s"}
+            </p>
+          )}
+          {result?.kind === "err" && <p className="font-mono text-[10px] text-danger">{result.text}</p>}
+          <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-ink-faint">
+            <Icon.lock size={12} className="mt-0.5 shrink-0" />
+            Read-only — fulfillment wires up with CJ later.
+          </p>
+        </div>
+      ) : (
+        <form onSubmit={connect} className="flex flex-col gap-3">
+          <div>
+            <label className={LABEL}>*.myshopify.com domain</label>
+            <input
+              value={domain}
+              onChange={(e) => setDomain(e.target.value)}
+              placeholder="calm-collar.myshopify.com"
+              className={FIELD}
+              autoComplete="off"
+            />
+          </div>
+          <div>
+            <label className={LABEL}>Admin API access token</label>
+            <input
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="shpat_…"
+              type="password"
+              className={FIELD}
+              autoComplete="off"
+            />
+            <p className="mt-1.5 font-mono text-[9.5px] text-ink-faint">
+              Needs scopes read_products, read_orders. Used once to connect; store it in the vault for recurring sync.
+            </p>
+          </div>
+          <button
+            type="submit"
+            disabled={busy || !domain.trim() || !token.trim()}
+            className="rounded-lg bg-signal px-5 py-2.5 text-[14px] font-semibold text-void transition hover:bg-signal-deep disabled:opacity-50"
+          >
+            {busy ? "Connecting…" : "Connect store"}
+          </button>
+          {result?.kind === "ok" && (
+            <p className="font-mono text-[10px] text-live">
+              {result.shopName} connected · {result.products} products · {result.orders} orders
+              {result.currency ? ` · ${result.currency}` : ""}
+            </p>
+          )}
+          {result?.kind === "err" && <p className="font-mono text-[10px] text-danger">{result.text}</p>}
+        </form>
+      )}
+    </div>
+  );
+}
 
 type Site = BrandDetail["site"];
 
@@ -123,15 +287,15 @@ export function SettingsTab({ site }: { site: Site }) {
       {/* connected accounts */}
       <aside>
         <SectionHeader eyebrow="Connected accounts" accent="text-cyan" />
-        <div className="flex flex-col gap-2.5">
-          <ConnRow label="Shopify store" hint={site.shopifyDomain ?? "*.myshopify.com"} connected={!!site.shopifyDomain} />
+        <ConnectShopifyCard site={site} />
+        <div className="mt-2.5 flex flex-col gap-2.5">
           <ConnRow label="CJ Dropshipping" hint="fulfillment + tracking" connected={false} />
           <ConnRow label="Ayrshare" hint="automated publishing" connected={false} />
           <ConnRow label="Custom domain" hint={site.customDomain ?? "not set"} connected={!!site.customDomain} />
         </div>
         <p className="mt-4 flex items-start gap-2 text-[12px] leading-relaxed text-ink-faint">
           <Icon.settings size={14} className="mt-0.5 shrink-0" />
-          Connection wiring lands in a later pass. Until a store is connected, distribution stays semi-manual.
+          CJ fulfillment + automated publishing wire up in a later pass. Until then, distribution stays semi-manual.
         </p>
       </aside>
     </div>

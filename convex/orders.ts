@@ -11,6 +11,86 @@ const fulfillmentStatus = v.union(
   v.literal("error"),
 );
 
+// Map a Shopify displayFulfillmentStatus → our fulfillment enum. We DON'T touch sent_to_cj here
+// (that's set by the CJ loop in Phase 2b) — a Shopify-side FULFILLED maps straight to "shipped".
+type ShopFulfillment = "received" | "sent_to_cj" | "shipped" | "delivered" | "error";
+export function mapShopifyFulfillment(displayStatus: string | null | undefined): ShopFulfillment {
+  switch ((displayStatus ?? "").toUpperCase()) {
+    case "FULFILLED":
+      return "shipped";
+    case "PARTIALLY_FULFILLED":
+    case "IN_PROGRESS":
+    case "PENDING_FULFILLMENT":
+    case "OPEN":
+    case "SCHEDULED":
+    case "ON_HOLD":
+    case "UNFULFILLED":
+    case "RESTOCKED":
+    default:
+      return "received";
+  }
+}
+
+// Bulk idempotent upsert of REAL Shopify orders (keyed on shopifyOrderId). Used by the initial
+// sync + manual "Sync now". Writes sample:false. Does NOT trigger any CJ/fulfillment action — it
+// only mirrors Shopify state. fulfillmentStatus is mapped from Shopify's displayFulfillmentStatus
+// but an existing order already advanced past Shopify's view (e.g. sent_to_cj/delivered) is NOT
+// downgraded.
+const ADVANCED_ORDER: Record<ShopFulfillment, number> = {
+  received: 0,
+  sent_to_cj: 1,
+  shipped: 2,
+  delivered: 3,
+  error: 0,
+};
+export const upsertFromShopify = mutation({
+  args: {
+    siteId: v.id("sites"),
+    orders: v.array(
+      v.object({
+        shopifyOrderId: v.string(),
+        totalUsd: v.number(),
+        fulfillmentStatus: fulfillmentStatus,
+        createdAt: v.number(),
+      }),
+    ),
+  },
+  handler: async (ctx, { siteId, orders }) => {
+    let inserted = 0;
+    let updated = 0;
+    for (const o of orders) {
+      const existing = await ctx.db
+        .query("orders")
+        .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", o.shopifyOrderId))
+        .first();
+      if (existing) {
+        // never downgrade an order the fulfillment loop has already advanced
+        const nextStatus =
+          ADVANCED_ORDER[o.fulfillmentStatus] > ADVANCED_ORDER[existing.fulfillmentStatus]
+            ? o.fulfillmentStatus
+            : existing.fulfillmentStatus;
+        await ctx.db.patch(existing._id, {
+          totalUsd: o.totalUsd,
+          fulfillmentStatus: nextStatus,
+          sample: false,
+        });
+        updated++;
+      } else {
+        await ctx.db.insert("orders", {
+          siteId,
+          shopifyOrderId: o.shopifyOrderId,
+          fulfillmentStatus: o.fulfillmentStatus,
+          totalUsd: o.totalUsd,
+          createdAt: o.createdAt,
+          sample: false,
+        });
+        inserted++;
+      }
+    }
+    return { inserted, updated, total: orders.length };
+  },
+});
+
 // Record a freshly received Shopify order (idempotent on shopifyOrderId).
 export const record = mutation({
   args: {

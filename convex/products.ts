@@ -51,6 +51,60 @@ export const upsert = mutation({
   },
 });
 
+// Bulk idempotent upsert of REAL Shopify products (keyed on siteId + shopifyProductId).
+// cogsUsd/shippingUsd stay 0 (unknown until CJ sourcing) and contributionMarginPct is left
+// undefined; the dashboard derives a price-only margin when those are absent. Every row is
+// written sample:false so it replaces — and is never confused with — seeded demo data.
+export const upsertFromShopify = mutation({
+  args: {
+    siteId: v.id("sites"),
+    products: v.array(
+      v.object({
+        shopifyProductId: v.string(),
+        title: v.string(),
+        priceUsd: v.number(),
+        status: productStatus,
+        imageUrl: v.optional(v.string()), // accepted for parity; schema has no image column (ignored)
+      }),
+    ),
+  },
+  handler: async (ctx, { siteId, products }) => {
+    let inserted = 0;
+    let updated = 0;
+    for (const p of products) {
+      const existing = await ctx.db
+        .query("products")
+        .withIndex("by_site", (q) => q.eq("siteId", siteId))
+        .filter((q) => q.eq(q.field("shopifyProductId"), p.shopifyProductId))
+        .first();
+      if (existing) {
+        await ctx.db.patch(existing._id, {
+          title: p.title,
+          priceUsd: p.priceUsd,
+          status: p.status,
+          sample: false,
+        });
+        updated++;
+      } else {
+        await ctx.db.insert("products", {
+          siteId,
+          title: p.title,
+          shopifyProductId: p.shopifyProductId,
+          cjFromUsWarehouse: false,
+          cogsUsd: 0,
+          shippingUsd: 0,
+          priceUsd: p.priceUsd,
+          status: p.status,
+          createdAt: Date.now(),
+          sample: false,
+        });
+        inserted++;
+      }
+    }
+    return { inserted, updated, total: products.length };
+  },
+});
+
 export const listBySite = query({
   args: {
     siteId: v.id("sites"),

@@ -119,6 +119,26 @@ export const Icon = {
         <path d="M19 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h6" />
       </>
     )),
+  store: ({ size = 18, className = "" }: IconProps) =>
+    base(size, className, (
+      <>
+        <path d="M3 9 4.5 4h15L21 9M3 9v1a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0V9M5 13v7h14v-7" />
+      </>
+    )),
+  refresh: ({ size = 18, className = "" }: IconProps) =>
+    base(size, className, (
+      <>
+        <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+        <path d="M21 3v5h-5" />
+      </>
+    )),
+  lock: ({ size = 18, className = "" }: IconProps) =>
+    base(size, className, (
+      <>
+        <rect x="4.5" y="10.5" width="15" height="10" rx="2" />
+        <path d="M8 10.5V7a4 4 0 0 1 8 0v3.5" />
+      </>
+    )),
 };
 
 export type IconKey = keyof typeof Icon;
