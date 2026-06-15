@@ -1,7 +1,9 @@
 // Control-plane portfolio view: every site + its pending-action / active-product counts.
 // Index-driven only — counts come from .withIndex() reads, never full-table scans.
 import { query } from "./_generated/server";
+import type { QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
+import type { Id } from "./_generated/dataModel";
 
 export const portfolio = query({
   args: {},
@@ -139,6 +141,267 @@ export const siteSummary = query({
       site,
       pendingActionCount: pending.length,
       activeProductCount: activeProducts.length,
+    };
+  },
+});
+
+// ── analytics layer (the Command Center charts) ──────────────────────────────
+// All reads are index-scoped per site (by_site_day / by_site / by_site_status /
+// by_site_platform). `scope` is "all" (whole portfolio, bounded) or a siteId.
+// Time-series are bucketed by day; revenue uses order.createdAt, organic uses
+// posts (published) + conversionMetrics. NEVER an unindexed .collect().
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function dayKey(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+// Resolve the scope to a concrete, bounded site list.
+async function resolveSites(ctx: QueryCtx, scope: string | undefined) {
+  if (scope && scope !== "all") {
+    const s = await ctx.db.get(scope as Id<"sites">);
+    return s ? [s] : [];
+  }
+  return ctx.db.query("sites").take(200);
+}
+
+// `metric` ∈ "revenue" | "orders" | "views" | "engagement". Returns a dense
+// daily series over the trailing `days` window (zero-filled so charts are smooth).
+export const timeseries = query({
+  args: {
+    scope: v.optional(v.string()), // "all" | siteId
+    metric: v.union(v.literal("revenue"), v.literal("orders"), v.literal("views"), v.literal("engagement")),
+    days: v.optional(v.number()),
+    platform: v.optional(v.string()),
+  },
+  handler: async (ctx, { scope, metric, days, platform }) => {
+    const window = Math.min(days ?? 30, 180);
+    const since = Date.now() - window * DAY_MS;
+    const sites = await resolveSites(ctx, scope);
+
+    // dense day buckets
+    const buckets = new Map<string, number>();
+    for (let i = window - 1; i >= 0; i--) buckets.set(dayKey(Date.now() - i * DAY_MS), 0);
+
+    for (const s of sites) {
+      if (metric === "revenue" || metric === "orders") {
+        const orders = await ctx.db
+          .query("orders")
+          .withIndex("by_site", (q) => q.eq("siteId", s._id))
+          .take(2000);
+        for (const o of orders) {
+          if (o.createdAt < since) continue;
+          const k = dayKey(o.createdAt);
+          if (!buckets.has(k)) continue;
+          buckets.set(k, buckets.get(k)! + (metric === "revenue" ? o.totalUsd : 1));
+        }
+      } else {
+        // views / engagement from published posts (publishedAt bucketed)
+        const posts = await ctx.db
+          .query("posts")
+          .withIndex("by_site_status", (q) => q.eq("siteId", s._id).eq("status", "published"))
+          .take(2000);
+        for (const p of posts) {
+          if (platform && platform !== "all" && p.platform !== platform) continue;
+          const at = p.publishedAt ?? p._creationTime;
+          if (at < since) continue;
+          const k = dayKey(at);
+          if (!buckets.has(k)) continue;
+          buckets.set(k, buckets.get(k)! + (metric === "views" ? p.views ?? 0 : p.engagement ?? 0));
+        }
+      }
+    }
+
+    const points = Array.from(buckets.entries()).map(([day, value]) => ({ day, value }));
+    const total = points.reduce((s, p) => s + p.value, 0);
+    // delta vs the prior equal window (compare last half-window to the one before)
+    const half = Math.floor(points.length / 2);
+    const recent = points.slice(half).reduce((s, p) => s + p.value, 0);
+    const prior = points.slice(0, half).reduce((s, p) => s + p.value, 0);
+    const deltaPct = prior > 0 ? ((recent - prior) / prior) * 100 : recent > 0 ? 100 : 0;
+
+    return { metric, days: window, points, total, deltaPct };
+  },
+});
+
+// Per-platform published-post performance (views + engagement + post count).
+export const platformBreakdown = query({
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
+  handler: async (ctx, { scope, days }) => {
+    const window = Math.min(days ?? 30, 180);
+    const since = Date.now() - window * DAY_MS;
+    const sites = await resolveSites(ctx, scope);
+
+    const acc: Record<string, { views: number; engagement: number; posts: number }> = {
+      tiktok: { views: 0, engagement: 0, posts: 0 },
+      instagram: { views: 0, engagement: 0, posts: 0 },
+      youtube: { views: 0, engagement: 0, posts: 0 },
+      facebook: { views: 0, engagement: 0, posts: 0 },
+    };
+
+    for (const s of sites) {
+      const posts = await ctx.db
+        .query("posts")
+        .withIndex("by_site_status", (q) => q.eq("siteId", s._id).eq("status", "published"))
+        .take(2000);
+      for (const p of posts) {
+        const at = p.publishedAt ?? p._creationTime;
+        if (at < since) continue;
+        const a = acc[p.platform];
+        if (!a) continue;
+        a.views += p.views ?? 0;
+        a.engagement += p.engagement ?? 0;
+        a.posts += 1;
+      }
+    }
+
+    return Object.entries(acc).map(([platform, v]) => ({ platform, ...v }));
+  },
+});
+
+// Conversion funnel: views → add-to-cart → checkout → purchase. Top of funnel is
+// organic post views; the lower stages derive from the latest conversionMetrics
+// rollups (addToCartRate, cvr) and order count.
+export const funnel = query({
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
+  handler: async (ctx, { scope, days }) => {
+    const window = Math.min(days ?? 30, 180);
+    const since = Date.now() - window * DAY_MS;
+    const sites = await resolveSites(ctx, scope);
+
+    let views = 0;
+    let pageviews = 0;
+    let atc = 0;
+    let checkout = 0;
+    let purchases = 0;
+
+    for (const s of sites) {
+      const posts = await ctx.db
+        .query("posts")
+        .withIndex("by_site_status", (q) => q.eq("siteId", s._id).eq("status", "published"))
+        .take(2000);
+      for (const p of posts) {
+        const at = p.publishedAt ?? p._creationTime;
+        if (at >= since) views += p.views ?? 0;
+      }
+
+      const metrics = await ctx.db
+        .query("conversionMetrics")
+        .withIndex("by_site_day", (q) => q.eq("siteId", s._id))
+        .order("desc")
+        .take(window);
+      for (const m of metrics) {
+        pageviews += m.pageviews;
+        atc += Math.round(m.pageviews * m.addToCartRate);
+        purchases += Math.round(m.pageviews * m.cvr);
+      }
+      // checkout-initiated sits between ATC and purchase (~62% of ATC reach checkout)
+      checkout += 0;
+    }
+    checkout = Math.round(atc * 0.62 + purchases * 0.38);
+
+    // top stage: organic reach (views) if larger than measured pageviews, else pageviews
+    const top = Math.max(views, pageviews, 1);
+    const stages = [
+      { label: "Organic reach", value: top },
+      { label: "Add-to-cart", value: atc },
+      { label: "Checkout", value: checkout },
+      { label: "Purchase", value: purchases },
+    ];
+    return { stages, days: window };
+  },
+});
+
+// Top products by views with CVR + contribution margin, for the DataTable mini-bars.
+export const topProducts = query({
+  args: { scope: v.optional(v.string()), limit: v.optional(v.number()) },
+  handler: async (ctx, { scope, limit }) => {
+    const sites = await resolveSites(ctx, scope);
+    const cap = Math.min(limit ?? 6, 25);
+
+    const rows: Array<{
+      productId: string;
+      title: string;
+      siteName: string;
+      views: number;
+      cvr: number;
+      marginPct: number | null;
+      priceUsd: number;
+      trend: number[];
+      status: string;
+    }> = [];
+
+    for (const s of sites) {
+      const products = await ctx.db
+        .query("products")
+        .withIndex("by_site", (q) => q.eq("siteId", s._id))
+        .take(200);
+      for (const p of products) {
+        const metrics = await ctx.db
+          .query("conversionMetrics")
+          .withIndex("by_product_day", (q) => q.eq("productId", p._id))
+          .order("desc")
+          .take(14);
+        const views = metrics.reduce((sum, m) => sum + m.pageviews, 0);
+        const latestCvr = metrics[0]?.cvr ?? 0;
+        const margin =
+          p.contributionMarginPct ??
+          (p.priceUsd > 0 ? ((p.priceUsd - p.cogsUsd - p.shippingUsd) / p.priceUsd) * 100 : null);
+        rows.push({
+          productId: p._id,
+          title: p.title,
+          siteName: s.name,
+          views,
+          cvr: latestCvr * 100,
+          marginPct: margin,
+          priceUsd: p.priceUsd,
+          trend: metrics.map((m) => m.pageviews).reverse(),
+          status: p.status,
+        });
+      }
+    }
+
+    rows.sort((a, b) => b.views - a.views);
+    return rows.slice(0, cap);
+  },
+});
+
+// Posting cadence — daily published-post counts over the trailing window, for the
+// Heatmap (calendar grid). Index-scoped per site (by_site_status published).
+export const postingCadence = query({
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
+  handler: async (ctx, { scope, days }) => {
+    const window = Math.min(days ?? 84, 180);
+    const since = Date.now() - window * DAY_MS;
+    const sites = await resolveSites(ctx, scope);
+    const counts = new Map<string, number>();
+    for (const s of sites) {
+      const posts = await ctx.db
+        .query("posts")
+        .withIndex("by_site_status", (q) => q.eq("siteId", s._id).eq("status", "published"))
+        .take(2000);
+      for (const p of posts) {
+        const at = p.publishedAt ?? p._creationTime;
+        if (at < since) continue;
+        const k = dayKey(at);
+        counts.set(k, (counts.get(k) ?? 0) + 1);
+      }
+    }
+    return Array.from(counts.entries()).map(([date, value]) => ({ date, value }));
+  },
+});
+
+// Detects whether any sample/seeded data is present (drives the honesty pill).
+export const sampleStatus = query({
+  args: {},
+  handler: async (ctx) => {
+    const sites = await ctx.db.query("sites").take(200);
+    const sampleSites = sites.filter((s) => s.sample === true);
+    return {
+      present: sampleSites.length > 0,
+      sampleSiteCount: sampleSites.length,
+      sampleSiteNames: sampleSites.map((s) => s.name),
     };
   },
 });

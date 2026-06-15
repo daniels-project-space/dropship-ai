@@ -48,7 +48,8 @@ export default defineSchema({
     distributionMode: v.union(v.literal("semi_manual"), v.literal("automated")), // §8.1 cold-start = semi_manual
     killDate: v.optional(v.number()),             // pre-committed kill date (ms)
     createdAt: v.number(),
-  }).index("by_status", ["status"]),
+    sample: v.optional(v.boolean()),              // seeded demo brand (cleared by seed.clearSampleData)
+  }).index("by_status", ["status"]).index("by_sample", ["sample"]),
 
   // per-site credential REFERENCES (actual secrets live in env/vault; this maps which keys a site uses)
   siteSecrets: defineTable({
@@ -70,6 +71,7 @@ export default defineSchema({
     contributionMarginPct: v.optional(v.number()),// computed: after COGS+ship+duty+fees+refund+content
     status: v.union(v.literal("draft"), v.literal("active"), v.literal("archived"), v.literal("killed")),
     createdAt: v.number(),
+    sample: v.optional(v.boolean()),
   }).index("by_site", ["siteId"]).index("by_site_status", ["siteId", "status"]),
 
   // ── signals (rolled-up, never raw-event spam) ─────────────────────────────
@@ -91,6 +93,7 @@ export default defineSchema({
     cvr: v.number(),
     aovUsd: v.number(),
     refundRate: v.number(),
+    sample: v.optional(v.boolean()),
   }).index("by_site_day", ["siteId", "day"]).index("by_product_day", ["productId", "day"]),
 
   // ── content factory ───────────────────────────────────────────────────────
@@ -104,6 +107,7 @@ export default defineSchema({
     hook: v.optional(v.string()),
     status: v.union(v.literal("generating"), v.literal("review"), v.literal("approved"), v.literal("rejected")),
     createdAt: v.number(),
+    sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]),
 
   posts: defineTable({
@@ -116,6 +120,7 @@ export default defineSchema({
     externalPostId: v.optional(v.string()),
     views: v.optional(v.number()),
     engagement: v.optional(v.number()),
+    sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]).index("by_site_platform", ["siteId", "platform"]),
 
   // ── orders + CJ fulfillment loop ──────────────────────────────────────────
@@ -130,6 +135,7 @@ export default defineSchema({
     trackingUrl: v.optional(v.string()),
     totalUsd: v.number(),
     createdAt: v.number(),
+    sample: v.optional(v.boolean()),
   }).index("by_site", ["siteId"]).index("by_shopify_order", ["shopifyOrderId"]).index("by_site_status", ["siteId", "fulfillmentStatus"]),
 
   // ── the brain: proposed actions + risk-tiered approval ────────────────────
@@ -144,6 +150,7 @@ export default defineSchema({
     waitpointToken: v.optional(v.string()),       // Trigger waitpoint for human_gated (§8.4 long timeout + re-arm)
     proposedAt: v.number(),
     resolvedAt: v.optional(v.number()),
+    sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]).index("by_status", ["status"]),
 
   // append-only audit ledger (no deletes — every proposed + executed action)
@@ -153,6 +160,7 @@ export default defineSchema({
     event: v.string(),
     detail: v.any(),
     at: v.number(),
+    sample: v.optional(v.boolean()),
   }).index("by_site_at", ["siteId", "at"]),
 
   // ── experiments (CRO) ─────────────────────────────────────────────────────
@@ -165,5 +173,6 @@ export default defineSchema({
     status: v.union(v.literal("running"), v.literal("concluded")),
     winner: v.optional(v.string()),
     startedAt: v.number(),
+    sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]),
 });

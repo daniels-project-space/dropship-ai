@@ -4,6 +4,7 @@ import { useState } from "react";
 import { StatusDot } from "../StatusDot";
 import { Icon } from "../Icons";
 import { Breadcrumb, type Crumb } from "../ui/Breadcrumb";
+import { SampleDataPill } from "../ui/SampleDataPill";
 
 // Top status bar: mobile menu trigger + breadcrumb (left), and the system rail
 // (right): content-fit gate chip, brain heartbeat, alerts bell.
@@ -37,6 +38,11 @@ export function TopStatusBar({
 
         {/* right: system rail */}
         <div className="flex shrink-0 items-center gap-2 sm:gap-2.5">
+          {/* sample-data honesty marker (auto-hides when no seeded data) */}
+          <span className="hidden sm:inline-flex">
+            <SampleDataPill compact />
+          </span>
+
           {/* content-fit gate */}
           <div
             className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 sm:flex ${

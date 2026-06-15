@@ -14,10 +14,12 @@ import type * as audit from "../audit.js";
 import type * as creatives from "../creatives.js";
 import type * as dashboard from "../dashboard.js";
 import type * as experiments from "../experiments.js";
+import type * as insights from "../insights.js";
 import type * as metrics from "../metrics.js";
 import type * as orders from "../orders.js";
 import type * as posts from "../posts.js";
 import type * as products from "../products.js";
+import type * as seed from "../seed.js";
 import type * as signals from "../signals.js";
 import type * as sites from "../sites.js";
 
@@ -34,10 +36,12 @@ declare const fullApi: ApiFromModules<{
   creatives: typeof creatives;
   dashboard: typeof dashboard;
   experiments: typeof experiments;
+  insights: typeof insights;
   metrics: typeof metrics;
   orders: typeof orders;
   posts: typeof posts;
   products: typeof products;
+  seed: typeof seed;
   signals: typeof signals;
   sites: typeof sites;
 }>;
