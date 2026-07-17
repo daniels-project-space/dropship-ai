@@ -3,11 +3,10 @@
 // accounts are actually linked. The client receives only connection state + the
 // exact next-step text — secret values never cross this boundary.
 import { NextResponse } from "next/server";
+import { getKey, getService } from "@/src/lib/vault";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const VAULT_QUERY = "https://fantastic-roadrunner-485.convex.cloud/api/query";
 
 type ReadyState = "ready" | "action_needed" | "warn";
 
@@ -23,18 +22,7 @@ type CheckItem = {
 // Pull a single secret VALUE server-side (used only to probe a live API; never returned).
 async function vaultGetValue(service: string, keyName: string): Promise<string | null> {
   try {
-    const res = await fetch(VAULT_QUERY, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: "secrets:getOne", args: { service, keyName }, format: "json" }),
-      cache: "no-store",
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const v = data?.value;
-    if (typeof v === "string") return v || null;
-    if (v && typeof v === "object" && typeof v.value === "string") return v.value || null;
-    return null;
+    return await getKey(service, keyName);
   } catch {
     return null;
   }
@@ -52,17 +40,7 @@ async function vaultHasService(service: string, keyNames: string[]): Promise<boo
 // List the keyNames a service holds (names only, never values).
 async function vaultKeyNames(service: string): Promise<string[]> {
   try {
-    const res = await fetch(VAULT_QUERY, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: "secrets:listByService", args: { service }, format: "json" }),
-      cache: "no-store",
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const v = data?.value;
-    if (Array.isArray(v)) return v.map((i: { keyName?: string }) => i?.keyName ?? "").filter(Boolean);
-    return [];
+    return Object.keys(await getService(service));
   } catch {
     return [];
   }

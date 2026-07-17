@@ -1,5 +1,5 @@
 // Server-only secrets vault reader. Reads the project-hub Convex `secrets` table via its
-// public query API. NEVER import this into client components — it returns plaintext secrets.
+// authenticated query API. NEVER import this into client components — it returns plaintext secrets.
 //
 // Pattern (per ops runbook):
 //   listByService -> { value: [{ keyName, value }, ...] }
@@ -15,10 +15,12 @@ type ListResponse = { value?: Array<{ keyName: string; value: string }> };
 type OneResponse = { value?: { value: string } | null };
 
 async function vaultQuery<T>(path: string, args: Record<string, unknown>): Promise<T> {
+  const vaultToken = process.env.VAULT_ACCESS_TOKEN;
+  if (!vaultToken) throw new Error("VAULT_ACCESS_TOKEN is not configured");
   const res = await fetch(vaultUrl(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, args, format: "json" }),
+    body: JSON.stringify({ path, args: { ...args, vaultToken }, format: "json" }),
     // Secrets must never be cached by Next's fetch layer.
     cache: "no-store",
   });
