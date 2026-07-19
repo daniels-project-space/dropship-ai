@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import { Fraunces, IBM_Plex_Mono, Geist } from "next/font/google";
 import "./globals.css";
 import { Providers } from "./providers";
@@ -40,6 +41,11 @@ export default function RootLayout({
         <Providers>
           <AppShell>{children}</AppShell>
         </Providers>
+        <Script
+          src="https://jarvis-orcin-six.vercel.app/jarvis-embed.js?v=universal-controls-20260719-1"
+          strategy="afterInteractive"
+          data-jarvis-app="dropship-ai"
+        />
       </body>
     </html>
   );
