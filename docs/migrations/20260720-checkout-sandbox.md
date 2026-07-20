@@ -43,3 +43,22 @@ CJ request was contacted or created by this checkout.
 - `NEXT_PUBLIC_CONVEX_URL=https://tangible-goose-318.convex.cloud npm run build` — pass.
 - An ungated build is expected to fail in this checkout because the existing browser provider
   requires `NEXT_PUBLIC_CONVEX_URL`; the scoped build did not contact Convex.
+
+## Independent session-5 verification — 2026-07-20
+
+- `c617599` is the checked-out (shallow) commit on
+  `jarvis/goal-make-daniels-project-space-dro-618awssh`; the checkout, webhook, and fulfillment
+  source listed above is present in that tree. The worktree was clean before this verification.
+- Reinstalled the lockfile-resolved dependencies with `npm ci`, then passed `npm run typecheck`,
+  `npm test` (16/16), and
+  `NEXT_PUBLIC_CONVEX_URL=https://peaceful-panda-894.convex.cloud npm run build`.
+- The session test's fixed suffix could coincidentally equal the valid HMAC suffix. The test now
+  deterministically flips that character, so the signed-session fail-closed assertion is real.
+- Read-only `GET https://dropship-ai-cyan.vercel.app/api/status` returned 200 without an operator
+  session and disclosed readiness metadata. The current source requires `requireOperator` for
+  this route, so production is drifted from this checkout (or its deployed configuration differs).
+  Its own reported state is `goLive:false`: no Shopify token, no linked social accounts, and
+  unverified fal credits. No provider state was changed.
+- A genuine zero-charge provider trace has **not** been executed: this worker has no scoped
+  Shopify sandbox authorization, and even a $0 draft creation is an external provider mutation.
+  The local trace is covered by the mocked adapter test only.

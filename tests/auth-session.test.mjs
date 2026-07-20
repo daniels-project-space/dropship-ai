@@ -29,7 +29,10 @@ test("a valid operator session verifies and expires", async () => {
 test("a modified session is denied", async () => {
   const session = await createOperatorSession(secret);
   const [payload, signature] = session.split(".");
-  assert.equal(await verifyOperatorSession(`${payload}.${signature.slice(0, -1)}x`, secret), false);
+  // Flip the final base64url character rather than assigning a fixed value: a valid HMAC can
+  // itself end in "x", which made this security test intermittently leave the session unchanged.
+  const alteredFinalCharacter = signature.endsWith("x") ? "y" : "x";
+  assert.equal(await verifyOperatorSession(`${payload}.${signature.slice(0, -1)}${alteredFinalCharacter}`, secret), false);
   assert.equal(await verifyOperatorSession(session, `${secret}changed`), false);
 });
 
