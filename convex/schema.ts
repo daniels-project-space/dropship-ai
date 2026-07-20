@@ -64,9 +64,17 @@ export default defineSchema({
     title: v.string(),
     shopifyProductId: v.optional(v.string()),
     cjProductId: v.optional(v.string()),
+    cjVariantId: v.optional(v.string()),          // exact sellable variant used for the verified quote
     cjFromUsWarehouse: v.boolean(),               // §8.2 prefer US-warehouse (duty-paid bulk) only
     cogsUsd: v.number(),
     shippingUsd: v.number(),
+    dutyUsd: v.optional(v.number()),
+    paymentFeeUsd: v.optional(v.number()),
+    refundReserveUsd: v.optional(v.number()),
+    contentCostUsd: v.optional(v.number()),
+    landedCostUsd: v.optional(v.number()),        // COGS + shipping + duty, computed by sourced-draft gate
+    sourceVerifiedAt: v.optional(v.number()),     // CJ facts refreshed at this timestamp
+    sourceUrl: v.optional(v.string()),            // read-only source evidence; never an affiliate click target
     priceUsd: v.number(),
     contributionMarginPct: v.optional(v.number()),// computed: after COGS+ship+duty+fees+refund+content
     status: v.union(v.literal("draft"), v.literal("active"), v.literal("archived"), v.literal("killed")),

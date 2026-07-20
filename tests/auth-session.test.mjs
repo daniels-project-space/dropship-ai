@@ -11,6 +11,8 @@ import { POST as postGenerate } from "../app/api/generate/route.ts";
 import { POST as postSchedule } from "../app/api/schedule/route.ts";
 import { POST as postShopifyConnect } from "../app/api/shopify/connect/route.ts";
 import { POST as postShopifySync } from "../app/api/shopify/sync/route.ts";
+import { POST as postCjRefresh } from "../app/api/cj/refresh/route.ts";
+import { POST as postDiscover } from "../app/api/research/discover/route.ts";
 import { GET as getOperatorToken } from "../app/api/auth/token/route.ts";
 import { POST as postLogout } from "../app/api/auth/logout/route.ts";
 
@@ -74,6 +76,8 @@ test("every operator route independently rejects a forged session", async () => 
       postSchedule(post()),
       postShopifyConnect(post()),
       postShopifySync(post()),
+      postCjRefresh(post()),
+      postDiscover(post()),
       postLogout(post()),
     ]);
     for (const response of responses) {

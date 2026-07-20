@@ -2,6 +2,7 @@
 import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
+import { evaluateSourcedDraftGate } from "../src/lib/economics";
 
 const productStatus = v.union(
   v.literal("draft"),
@@ -25,6 +26,12 @@ export const upsert = mutation({
     status: v.optional(productStatus),
   },
   handler: async (ctx, args) => {
+    // A CJ-linked draft must go through createSourcedDraft(), which verifies inventory and
+    // computes the full contribution margin server-side. This generic mutation remains for
+    // Shopify mirrors and non-supplier catalog maintenance only.
+    if (args.cjProductId && (args.status ?? "draft") === "draft") {
+      throw new Error("CJ-sourced drafts must use products.createSourcedDraft");
+    }
     const { status, cjProductId, ...rest } = args;
     // Dedup by cjProductId within the site if one was supplied.
     if (cjProductId) {
@@ -48,6 +55,105 @@ export const upsert = mutation({
     });
     await appendAudit(ctx, { siteId: args.siteId, event: "product_created", detail: { productId, title: args.title } });
     return productId;
+  },
+});
+
+/**
+ * The sole local-write boundary for a CJ-sourced product candidate. It only ever creates/updates
+ * a local `draft`; it does not create a Shopify product, request CJ sourcing, or pay/order
+ * anything. Unsafe candidates are deliberately denied with an auditable result rather than
+ * becoming catalog rows.
+ */
+export const createSourcedDraft = mutation({
+  args: {
+    siteId: v.id("sites"),
+    title: v.string(),
+    cjProductId: v.string(),
+    cjVariantId: v.string(),
+    sourceUrl: v.optional(v.string()),
+    sourceVerifiedAt: v.number(),
+    inventoryQty: v.number(),
+    cjFromUsWarehouse: v.boolean(),
+    priceUsd: v.number(),
+    cogsUsd: v.number(),
+    shippingUsd: v.number(),
+    dutyUsd: v.number(),
+    paymentFeeUsd: v.number(),
+    refundReserveUsd: v.number(),
+    contentCostUsd: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const site = await ctx.db.get(args.siteId);
+    if (!site) throw new Error(`site ${args.siteId} not found`);
+    const denied = async (reason: string, detail: Record<string, unknown> = {}) => {
+      await appendAudit(ctx, {
+        siteId: args.siteId,
+        event: "product_sourced_draft_denied",
+        detail: { cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, reason, ...detail },
+      });
+      return { status: "denied" as const, reason };
+    };
+    if (!args.title.trim()) return denied("title is required");
+    if (args.sourceUrl !== undefined && !/^https:\/\/.+/i.test(args.sourceUrl)) return denied("sourceUrl must be an HTTPS URL");
+    const gate = evaluateSourcedDraftGate({
+      priceUsd: args.priceUsd,
+      cogsUsd: args.cogsUsd,
+      shippingUsd: args.shippingUsd,
+      dutyUsd: args.dutyUsd,
+      paymentFeeUsd: args.paymentFeeUsd,
+      refundReserveUsd: args.refundReserveUsd,
+      contentCostUsd: args.contentCostUsd,
+      minimumPriceUsd: site.minKitPriceUsd,
+      minimumMarginPct: site.minBlendedMarginPct,
+      inventoryQty: args.inventoryQty,
+      fromUsWarehouse: args.cjFromUsWarehouse,
+      sourceVerifiedAt: args.sourceVerifiedAt,
+    });
+    if (!gate.eligible) return denied(gate.reason, gate.economics ? { contributionMarginPct: gate.economics.contributionMarginPct, minimumMarginPct: site.minBlendedMarginPct } : {});
+    const economics = gate.economics;
+
+    const existing = await ctx.db
+      .query("products")
+      .withIndex("by_site", (q) => q.eq("siteId", args.siteId))
+      .filter((q) => q.eq(q.field("cjProductId"), args.cjProductId))
+      .filter((q) => q.eq(q.field("cjVariantId"), args.cjVariantId))
+      .first();
+    if (existing && existing.status !== "draft") return denied("source is already catalogued", { productId: existing._id, status: existing.status });
+
+    const record = {
+      title: args.title.trim(),
+      cjProductId: args.cjProductId,
+      cjVariantId: args.cjVariantId,
+      cjFromUsWarehouse: true,
+      ...(args.sourceUrl ? { sourceUrl: args.sourceUrl } : {}),
+      sourceVerifiedAt: args.sourceVerifiedAt,
+      cogsUsd: args.cogsUsd,
+      shippingUsd: args.shippingUsd,
+      dutyUsd: args.dutyUsd,
+      paymentFeeUsd: args.paymentFeeUsd,
+      refundReserveUsd: args.refundReserveUsd,
+      contentCostUsd: args.contentCostUsd,
+      landedCostUsd: economics.landedCostUsd,
+      priceUsd: args.priceUsd,
+      contributionMarginPct: economics.contributionMarginPct,
+      status: "draft" as const,
+      sample: false,
+    };
+    const productId = existing
+      ? (await ctx.db.patch(existing._id, record), existing._id)
+      : await ctx.db.insert("products", { siteId: args.siteId, ...record, createdAt: Date.now() });
+    await appendAudit(ctx, {
+      siteId: args.siteId,
+      event: existing ? "product_sourced_draft_refreshed" : "product_sourced_draft_created",
+      detail: {
+        productId,
+        cjProductId: args.cjProductId,
+        cjVariantId: args.cjVariantId,
+        contributionMarginPct: economics.contributionMarginPct,
+        landedCostUsd: economics.landedCostUsd,
+      },
+    });
+    return { status: "created" as const, productId, contributionMarginPct: economics.contributionMarginPct, landedCostUsd: economics.landedCostUsd };
   },
 });
 
