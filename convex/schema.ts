@@ -63,8 +63,11 @@ export default defineSchema({
     siteId: v.id("sites"),
     title: v.string(),
     shopifyProductId: v.optional(v.string()),
+    shopifyDraftImportStatus: v.optional(v.union(v.literal("creating"), v.literal("created"), v.literal("ambiguous"))),
+    shopifyDraftImportTraceId: v.optional(v.string()),
     cjProductId: v.optional(v.string()),
     cjVariantId: v.optional(v.string()),          // exact sellable variant used for the verified quote
+    cjEvidenceId: v.optional(v.id("cjEvidence")), // immutable parsed CJ read used to derive costs
     cjFromUsWarehouse: v.boolean(),               // §8.2 prefer US-warehouse (duty-paid bulk) only
     cogsUsd: v.number(),
     shippingUsd: v.number(),
@@ -81,6 +84,24 @@ export default defineSchema({
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
   }).index("by_site", ["siteId"]).index("by_site_status", ["siteId", "status"]),
+
+  // Parsed, server-read CJ evidence. Optional costs mean "unknown", never zero; candidates
+  // using them fail closed. This row is the lineage anchor for a sourced product and its trace.
+  cjEvidence: defineTable({
+    siteId: v.id("sites"),
+    cjProductId: v.string(),
+    cjVariantId: v.string(),
+    title: v.string(),
+    cogsUsd: v.optional(v.number()),
+    shippingUsd: v.optional(v.number()),
+    inventoryQty: v.number(),
+    fromUsWarehouse: v.boolean(),
+    inventoryVerified: v.boolean(),
+    sourceUrl: v.string(),
+    traceId: v.string(),
+    readAt: v.number(),
+  }).index("by_site_read_at", ["siteId", "readAt"])
+    .index("by_site_product_variant", ["siteId", "cjProductId", "cjVariantId"]),
 
   // ── signals (rolled-up, never raw-event spam) ─────────────────────────────
   productSignals: defineTable({

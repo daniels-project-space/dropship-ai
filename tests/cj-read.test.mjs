@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { getProduct, getVariants, refreshAccessToken } from "../src/lib/cj.ts";
+import { parseCjEvidence } from "../src/lib/cjEvidence.ts";
+import { deriveCjEconomics } from "../src/lib/sourcingPolicy.ts";
 
 test("CJ product reads use GET, access-token authentication, and no cache", async () => {
   const originalFetch = globalThis.fetch;
@@ -37,4 +39,32 @@ test("CJ refresh exchanges only the refresh token and returns rotated credential
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("CJ evidence is parsed from a verified US variant and unknown shipping never becomes zero", () => {
+  const evidence = parseCjEvidence({
+    productId: "product-1",
+    variantId: "variant-1",
+    product: { productNameEn: "Verified widget", isFreeShipping: true },
+    variants: [{ vid: "variant-1", variantSellPrice: "12.50" }],
+    inventory: [],
+    variant: { vid: "variant-1", variantSellPrice: "12.50" },
+    variantInventory: [{ countryCode: "US", totalInventoryNum: 7, verifiedWarehouse: 1 }],
+  });
+  assert.deepEqual(evidence, {
+    cjProductId: "product-1",
+    cjVariantId: "variant-1",
+    title: "Verified widget",
+    cogsUsd: 12.5,
+    shippingUsd: 0,
+    inventoryQty: 7,
+    fromUsWarehouse: true,
+    inventoryVerified: true,
+    sourceUrl: "https://developers.cjdropshipping.com/api2.0/v1/product/query?pid=product-1",
+  });
+  const unknownShipping = parseCjEvidence({
+    productId: "product-2", variantId: "variant-2", product: { productNameEn: "No shipping quote" }, variants: [], inventory: [], variant: { variantSellPrice: 2 }, variantInventory: [{ countryCode: "US", totalInventoryNum: 1, verifiedWarehouse: 1 }],
+  });
+  assert.equal(unknownShipping.shippingUsd, undefined);
+  assert.throws(() => deriveCjEconomics(unknownShipping, 50), /unknown COGS or shipping cost/);
 });

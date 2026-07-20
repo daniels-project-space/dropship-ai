@@ -211,8 +211,8 @@ export async function listOrders(
 }
 
 const PRODUCT_CREATE = /* GraphQL */ `
-  mutation productCreate($input: ProductInput!) {
-    productCreate(input: $input) {
+  mutation productCreate($product: ProductCreateInput!) {
+    productCreate(product: $product) {
       product { id title handle }
       userErrors { field message }
     }
@@ -223,7 +223,6 @@ export interface ProductCreateInput {
   title: string;
   descriptionHtml?: string;
   vendor?: string;
-  status?: "ACTIVE" | "DRAFT";
 }
 
 export async function productCreate(
@@ -232,7 +231,7 @@ export async function productCreate(
 ): Promise<{ id: string; title: string; handle: string }> {
   const data = await graphql<{
     productCreate: { product: { id: string; title: string; handle: string } | null; userErrors: Array<{ message: string }> };
-  }>(cfg, PRODUCT_CREATE, { input });
+  }>(cfg, PRODUCT_CREATE, { product: { ...input, status: "DRAFT" } });
   const { product, userErrors } = data.productCreate;
   if (userErrors.length || !product) {
     throw new Error(`productCreate failed: ${userErrors.map((e) => e.message).join("; ") || "no product"}`);
