@@ -1,12 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { OPERATOR_SESSION_COOKIE } from "@/src/lib/auth/session";
+import { OPERATOR_SESSION_COOKIE, verifyOperatorSession } from "@/src/lib/auth/session";
 
 const PUBLIC_API_PREFIXES = ["/api/auth/login", "/api/auth/jwks", "/api/auth/token", "/api/webhooks/"];
 
-export function proxy(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const { pathname, search } = request.nextUrl;
   if (pathname === "/login" || PUBLIC_API_PREFIXES.some((prefix) => pathname.startsWith(prefix))) return NextResponse.next();
-  if (request.cookies.has(OPERATOR_SESSION_COOKIE)) return NextResponse.next();
+  const secret = process.env.DROPSHIP_AI_SESSION_SECRET;
+  const session = request.cookies.get(OPERATOR_SESSION_COOKIE)?.value;
+  if (secret && await verifyOperatorSession(session, secret)) return NextResponse.next();
   if (pathname.startsWith("/api/")) return NextResponse.json({ error: "authentication required" }, { status: 401 });
   const url = new URL("/login", request.url);
   url.searchParams.set("next", `${pathname}${search}`);
