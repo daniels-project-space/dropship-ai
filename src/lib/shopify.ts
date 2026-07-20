@@ -1,6 +1,7 @@
 // Shopify Admin GraphQL client (API 2026-01). Thin typed wrapper — calls are stubbed/minimal
 // but compile-clean. Token: vault per-site "SHOPIFY_ADMIN_TOKEN" or process.env fallback.
 // NOTE: as of 2026-06-14 no "shopify" vault service exists — pass the token explicitly or set env.
+import { assertLiveEffectsEnabled, sandboxShopAllowed } from "./effects";
 const API_VERSION = "2026-01";
 
 export interface ShopifyClientConfig {
@@ -267,6 +268,91 @@ export async function pageCreate(
   return created;
 }
 
+// ── Zero-charge sandbox checkout ────────────────────────────────────────────
+// A draft is intentionally NOT completed and its invoice is never sent. It exercises the
+// merchant's Draft Orders scope/checkout configuration without creating a payable order,
+// reserving inventory, notifying a customer, or invoking fulfillment.
+const DRAFT_ORDER_CREATE = /* GraphQL */ `
+  mutation draftOrderCreate($input: DraftOrderInput!) {
+    draftOrderCreate(input: $input) {
+      draftOrder { id name invoiceUrl status totalPriceSet { shopMoney { amount currencyCode } } }
+      userErrors { field message }
+    }
+  }
+`;
+
+export interface ZeroChargeDraftCheckoutInput {
+  /** Stable caller-generated trace id. It is stored on the draft for manual reconciliation. */
+  traceId: string;
+}
+
+export interface ZeroChargeDraftCheckout {
+  id: string;
+  name: string;
+  invoiceUrl: string | null;
+  totalAmount: string;
+  currencyCode: string;
+}
+
+/**
+ * Create a $0, non-shippable custom line item for a development-store checkout trace.
+ * Never call draftOrderInvoiceSend or draftOrderComplete from this control plane: either action
+ * turns this isolated trace into a customer/order side effect.
+ */
+export async function createZeroChargeDraftCheckout(
+  cfg: ShopifyClientConfig,
+  input: ZeroChargeDraftCheckoutInput,
+): Promise<ZeroChargeDraftCheckout> {
+  if (!input.traceId.trim()) throw new Error("shopify sandbox checkout: traceId is required");
+  if (!sandboxShopAllowed(cfg.shop)) {
+    throw new Error("shopify sandbox checkout is disabled or this shop is not allowlisted");
+  }
+  const data = await graphql<{
+    draftOrderCreate: {
+      draftOrder: {
+        id: string;
+        name: string;
+        invoiceUrl: string | null;
+        status: string;
+        totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+      } | null;
+      userErrors: Array<{ message: string }>;
+    };
+  }>(cfg, DRAFT_ORDER_CREATE, {
+    input: {
+      // A custom $0 line avoids inventory reservation and makes the no-charge property explicit.
+      lineItems: [{
+        title: "JARVIS sandbox checkout verification — no fulfillment",
+        quantity: 1,
+        originalUnitPrice: "0.00",
+        requiresShipping: false,
+        taxable: false,
+      }],
+      customAttributes: [
+        { key: "jarvis_mode", value: "sandbox" },
+        { key: "jarvis_trace_id", value: input.traceId },
+        { key: "fulfillment", value: "disabled" },
+      ],
+      note: `JARVIS zero-charge sandbox trace ${input.traceId}. Do not invoice or complete.`,
+      tags: ["jarvis-sandbox", "zero-charge", "do-not-complete"],
+    },
+  });
+  const { draftOrder, userErrors } = data.draftOrderCreate;
+  if (userErrors.length || !draftOrder) {
+    throw new Error(`draftOrderCreate failed: ${userErrors.map((e) => e.message).join("; ") || "no draft order"}`);
+  }
+  if (Number(draftOrder.totalPriceSet.shopMoney.amount) !== 0) {
+    throw new Error("sandbox checkout invariant failed: draft order total is not zero");
+  }
+  return {
+    id: draftOrder.id,
+    name: draftOrder.name,
+    invoiceUrl: draftOrder.invoiceUrl,
+    totalAmount: draftOrder.totalPriceSet.shopMoney.amount,
+    currencyCode: draftOrder.totalPriceSet.shopMoney.currencyCode,
+  };
+}
+
 const FULFILLMENT_TRACKING_UPDATE = /* GraphQL */ `
   mutation fulfillmentTrackingInfoUpdate($fulfillmentId: ID!, $trackingInfoInput: FulfillmentTrackingInput!, $notifyCustomer: Boolean) {
     fulfillmentTrackingInfoUpdate(
@@ -292,6 +378,8 @@ export async function fulfillmentTrackingInfoUpdate(
   tracking: TrackingInfo,
   notifyCustomer = true,
 ): Promise<{ id: string; status: string }> {
+  // Keep this provider mutation closed even if a future caller bypasses the webhook worker.
+  assertLiveEffectsEnabled("live");
   const data = await graphql<{
     fulfillmentTrackingInfoUpdate: { fulfillment: { id: string; status: string } | null; userErrors: Array<{ message: string }> };
   }>(cfg, FULFILLMENT_TRACKING_UPDATE, {

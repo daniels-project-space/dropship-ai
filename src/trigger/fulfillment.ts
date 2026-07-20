@@ -6,6 +6,7 @@ import { task, logger } from "@trigger.dev/sdk/v3";
 import { convexClient, api } from "../lib/convexClient";
 import { createOrder, parseOrderWebhook, type CreateOrderInput } from "../lib/cj";
 import { fulfillmentTrackingInfoUpdate, type ShopifyClientConfig } from "../lib/shopify";
+import { assertLiveEffectsEnabled, type EffectMode } from "../lib/effects";
 import type { Id } from "../../convex/_generated/dataModel";
 
 export interface FulfillOrderPayload {
@@ -14,6 +15,8 @@ export interface FulfillOrderPayload {
   totalUsd: number;
   cjInput: CreateOrderInput;
   cjAccessToken?: string; // optional override; else cj.ts resolves from vault/env
+  /** Defaults to sandbox. Live supplier creation requires the deployment-time effects gate. */
+  mode?: EffectMode;
 }
 
 export const fulfillOrder = task({
@@ -21,15 +24,16 @@ export const fulfillOrder = task({
   run: async (payload: FulfillOrderPayload) => {
     const convex = convexClient();
     const siteId = payload.siteId as Id<"sites">;
-    const idempotencyKey = `cj:create:${payload.siteId}:${payload.shopifyOrderId}`;
+    const mode = payload.mode ?? "sandbox";
+    const idempotencyKey = `cj:${mode}:create:${payload.siteId}:${payload.shopifyOrderId}`;
     const target = `fulfillment:${payload.siteId}:${payload.shopifyOrderId}`;
     const traceId = idempotencyKey;
 
     // Persist intent before crossing the CJ boundary. This survives Trigger retries and leaves
     // an operator-visible trace even when the supplier is unavailable.
     const queued = await convex.mutation(api.ops.enqueue, {
-      siteId, kind: "cj.create_order", target, idempotencyKey, traceId,
-      payload: { shopifyOrderId: payload.shopifyOrderId },
+      siteId, kind: `cj.${mode}.create_order`, target, idempotencyKey, traceId,
+      payload: { shopifyOrderId: payload.shopifyOrderId, mode },
     });
     if (queued.duplicate && queued.status === "delivered") {
       return { skipped: true, reason: "already delivered", shopifyOrderId: payload.shopifyOrderId };
@@ -47,15 +51,21 @@ export const fulfillOrder = task({
         return { orderId, cjOrderId: existing.cjOrderId, shopifyOrderId: payload.shopifyOrderId, reused: true };
       }
 
-      // 2. Create-only CJ order; payload.orderNumber is the stable supplier-side idempotency key.
+      // 2. The source order number is the stable supplier-side idempotency key. Sandbox mode
+      // never performs a CJ request: it produces a deterministic local supplier reference.
       if (payload.cjInput.orderNumber !== payload.shopifyOrderId) throw new Error("CJ orderNumber must equal the Shopify order id");
-      const cjResult = await createOrder(payload.cjInput, payload.cjAccessToken);
-      logger.info("cj order created", { shopifyOrderId: payload.shopifyOrderId, cjOrderId: cjResult.orderId, traceId });
+      const cjResult = mode === "sandbox"
+        ? { orderId: `sandbox-cj:${payload.siteId}:${payload.shopifyOrderId}`, orderNumber: payload.shopifyOrderId }
+        : await (async () => {
+          assertLiveEffectsEnabled(mode);
+          return createOrder(payload.cjInput, payload.cjAccessToken);
+        })();
+      logger.info("cj order created", { mode, shopifyOrderId: payload.shopifyOrderId, cjOrderId: cjResult.orderId, traceId });
 
       // 3. Stamp the CJ order id + status onto the Convex order.
       await convex.mutation(api.orders.markSentToCj, { orderId, cjOrderId: cjResult.orderId });
-      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { cjOrderId: cjResult.orderId } });
-      return { orderId, cjOrderId: cjResult.orderId, shopifyOrderId: payload.shopifyOrderId, traceId };
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { cjOrderId: cjResult.orderId, mode, zeroCharge: mode === "sandbox" } });
+      return { orderId, cjOrderId: cjResult.orderId, shopifyOrderId: payload.shopifyOrderId, traceId, mode, zeroCharge: mode === "sandbox" };
     } catch (error) {
       await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: String(error).slice(0, 500) });
       throw error;
@@ -69,6 +79,7 @@ export interface CjWebhookHandlerArgs {
   payload: unknown;
   // Shopify creds + fulfillmentId required to push tracking back to the storefront.
   shopify?: { cfg: ShopifyClientConfig; fulfillmentId: string };
+  mode?: EffectMode;
 }
 
 /**
@@ -91,11 +102,12 @@ export async function handleCjTrackingWebhook(args: CjWebhookHandlerArgs) {
   });
 
   if (args.shopify && tracking.trackNumber) {
+    assertLiveEffectsEnabled(args.mode ?? "sandbox");
     await fulfillmentTrackingInfoUpdate(args.shopify.cfg, args.shopify.fulfillmentId, {
       number: tracking.trackNumber,
       url: tracking.trackingUrl,
       company: tracking.logisticName,
-    });
+    }, false);
   }
 
   return { applied: true, orderNumber: tracking.orderNumber, trackNumber: tracking.trackNumber };

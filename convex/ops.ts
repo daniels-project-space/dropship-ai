@@ -10,7 +10,9 @@ export const claimTarget = mutation({
   handler: async (ctx, { target, owner, leaseMs }) => {
     const now = Date.now();
     const existing = await ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", target)).first();
-    if (existing && existing.expiresAt > now && existing.owner !== owner) return { acquired: false, owner: existing.owner, expiresAt: existing.expiresAt };
+    // A duplicate Trigger delivery has the same owner. It must not replace its own live lease,
+    // otherwise two retrying runs can both cross the same provider boundary.
+    if (existing && existing.expiresAt > now) return { acquired: false, owner: existing.owner, expiresAt: existing.expiresAt };
     if (existing) await ctx.db.delete(existing._id);
     const expiresAt = now + Math.min(Math.max(leaseMs ?? 5 * 60_000, 1_000), 15 * 60_000);
     await ctx.db.insert("targetLocks", { target, owner, expiresAt, createdAt: now });

@@ -13,7 +13,11 @@ export default defineConfig({
       // Server-to-Convex calls are authenticated too. Keep this scoped service JWT in the
       // Trigger project; it is never a browser credential and is not written to source.
       syncEnvVars(() => {
-        const names = ["VAULT_ACCESS_TOKEN", "NEXT_PUBLIC_CONVEX_URL", "CONVEX_URL", "DROPSHIP_AI_SERVICE_TOKEN"] as const;
+        const names = [
+          "VAULT_ACCESS_TOKEN", "NEXT_PUBLIC_CONVEX_URL", "CONVEX_URL", "DROPSHIP_AI_SERVICE_TOKEN",
+          // Non-secret dual-control flag required before a Trigger worker can issue any live write.
+          "DROPSHIP_AI_LIVE_EFFECTS", "DROPSHIP_AI_LIVE_EFFECTS_CONFIRM",
+        ] as const;
         const values = Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []));
         return Object.keys(values).length ? values : undefined;
       }),

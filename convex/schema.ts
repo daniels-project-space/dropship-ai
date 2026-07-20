@@ -207,6 +207,18 @@ export default defineSchema({
     finishedAt: v.optional(v.number()),
   }).index("by_trace_id", ["traceId"]).index("by_site_started_at", ["siteId", "startedAt"]),
 
+  // Provider delivery de-duplication. Store only a digest, never a webhook body: order and
+  // address payloads can contain customer data and are not needed for replay protection.
+  webhookReceipts: defineTable({
+    provider: v.string(),
+    deliveryId: v.string(),
+    topic: v.string(),
+    siteId: v.id("sites"),
+    payloadHash: v.string(),
+    outcome: v.union(v.literal("applied"), v.literal("ignored")),
+    receivedAt: v.number(),
+  }).index("by_provider_site_delivery", ["provider", "siteId", "deliveryId"]).index("by_site_received_at", ["siteId", "receivedAt"]),
+
   // ── experiments (CRO) ─────────────────────────────────────────────────────
   experiments: defineTable({
     siteId: v.id("sites"),

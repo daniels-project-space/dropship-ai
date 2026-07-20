@@ -24,6 +24,7 @@ import type * as seed from "../seed.js";
 import type * as signals from "../signals.js";
 import type * as siteSecrets from "../siteSecrets.js";
 import type * as sites from "../sites.js";
+import type * as webhooks from "../webhooks.js";
 
 import type {
   ApiFromModules,
@@ -48,6 +49,7 @@ declare const fullApi: ApiFromModules<{
   signals: typeof signals;
   siteSecrets: typeof siteSecrets;
   sites: typeof sites;
+  webhooks: typeof webhooks;
 }>;
 
 /**
