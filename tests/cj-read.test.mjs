@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { getProduct, getVariants, refreshAccessToken } from "../src/lib/cj.ts";
 import { parseCjEvidence } from "../src/lib/cjEvidence.ts";
-import { deriveCjEconomics } from "../src/lib/sourcingPolicy.ts";
+import { deriveCjEconomics, evaluatePersistedCjEvidence } from "../src/lib/sourcingPolicy.ts";
 
 test("CJ product reads use GET, access-token authentication, and no cache", async () => {
   const originalFetch = globalThis.fetch;
@@ -67,4 +67,28 @@ test("CJ evidence is parsed from a verified US variant and unknown shipping neve
   });
   assert.equal(unknownShipping.shippingUsd, undefined);
   assert.throws(() => deriveCjEconomics(unknownShipping, 50), /unknown COGS or shipping cost/);
+});
+
+test("persisted CJ evidence is rechecked when a draft is activated or imported", () => {
+  const evidence = {
+    cogsUsd: 12.5,
+    shippingUsd: 0,
+    inventoryQty: 7,
+    fromUsWarehouse: true,
+    inventoryVerified: true,
+    readAt: 1_000,
+  };
+  const policy = { priceUsd: 100, minimumPriceUsd: 50, minimumMarginPct: 60, now: 1_100 };
+  assert.equal(evaluatePersistedCjEvidence(evidence, policy).eligible, true);
+  assert.match(
+    evaluatePersistedCjEvidence(evidence, { ...policy, now: 24 * 60 * 60 * 1000 + 1_001 }).reason,
+    /less than 24 hours/,
+  );
+  assert.match(
+    evaluatePersistedCjEvidence({ ...evidence, shippingUsd: undefined }, policy).reason,
+    /unknown COGS or shipping cost/,
+  );
+  const belowMargin = evaluatePersistedCjEvidence({ ...evidence, cogsUsd: 90 }, policy);
+  assert.equal(belowMargin.eligible, false);
+  assert.equal(belowMargin.reason, "contribution margin is below the site's floor");
 });

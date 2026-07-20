@@ -2,8 +2,7 @@
 import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
-import { evaluateSourcedDraftGate } from "../src/lib/economics";
-import { deriveCjEconomics } from "../src/lib/sourcingPolicy";
+import { evaluatePersistedCjEvidence } from "../src/lib/sourcingPolicy";
 
 const productStatus = v.union(
   v.literal("draft"),
@@ -91,27 +90,13 @@ export const createSourcedDraft = mutation({
       });
       return { status: "denied" as const, reason };
     };
-    let economics;
-    try {
-      economics = deriveCjEconomics(evidence, args.priceUsd);
-    } catch (error) {
-      return denied(error instanceof Error ? error.message : "invalid CJ cost evidence");
-    }
-    const gate = evaluateSourcedDraftGate({
+    const gate = evaluatePersistedCjEvidence(evidence, {
       priceUsd: args.priceUsd,
-      cogsUsd: economics.cogsUsd,
-      shippingUsd: economics.shippingUsd,
-      dutyUsd: economics.dutyUsd,
-      paymentFeeUsd: economics.paymentFeeUsd,
-      refundReserveUsd: economics.refundReserveUsd,
-      contentCostUsd: economics.contentCostUsd,
       minimumPriceUsd: site.minKitPriceUsd,
       minimumMarginPct: site.minBlendedMarginPct,
-      inventoryQty: evidence.inventoryQty,
-      fromUsWarehouse: evidence.fromUsWarehouse && evidence.inventoryVerified,
-      sourceVerifiedAt: evidence.readAt,
     });
     if (!gate.eligible) return denied(gate.reason, gate.economics ? { contributionMarginPct: gate.economics.contributionMarginPct, minimumMarginPct: site.minBlendedMarginPct } : {});
+    const economics = gate.economics;
     const existing = await ctx.db
       .query("products")
       .withIndex("by_site", (q) => q.eq("siteId", args.siteId))
@@ -225,6 +210,19 @@ export const reserveApprovedShopifyDraftImport = mutation({
     if (!product || product.siteId !== args.siteId) throw new Error("product was not found for this site");
     if (!action || !actionMatchesApprovedDraftImport(action, product)) throw new Error("a human-approved import action bound to this product evidence is required");
     if (product.status !== "draft") throw new Error("only local drafts can be imported to Shopify");
+    if (!product.cjEvidenceId || !product.cjProductId || !product.cjVariantId) throw new Error("Shopify draft import requires persisted CJ evidence");
+    const evidence = await ctx.db.get(product.cjEvidenceId);
+    if (!evidence || evidence.siteId !== args.siteId || evidence.cjProductId !== product.cjProductId || evidence.cjVariantId !== product.cjVariantId) {
+      throw new Error("Shopify draft import CJ evidence lineage is invalid");
+    }
+    const site = await ctx.db.get(args.siteId);
+    if (!site) throw new Error(`site ${args.siteId} not found`);
+    const gate = evaluatePersistedCjEvidence(evidence, {
+      priceUsd: product.priceUsd,
+      minimumPriceUsd: site.minKitPriceUsd,
+      minimumMarginPct: site.minBlendedMarginPct,
+    });
+    if (!gate.eligible) throw new Error(`Shopify draft import denied: ${gate.reason}`);
     if (product.shopifyProductId || product.shopifyDraftImportStatus === "created") return { status: "already_created" as const, shopifyProductId: product.shopifyProductId };
     if (product.shopifyDraftImportStatus) throw new Error(`Shopify draft import is ${product.shopifyDraftImportStatus}; reconcile before retrying`);
     await ctx.db.patch(args.productId, { shopifyDraftImportStatus: "creating", shopifyDraftImportTraceId: args.traceId });
@@ -375,27 +373,13 @@ export const setStatus = mutation({
       }
       const site = await ctx.db.get(product.siteId);
       if (!site) throw new Error(`site ${product.siteId} not found`);
-      let economics;
-      try {
-        economics = deriveCjEconomics(evidence, product.priceUsd);
-      } catch (error) {
-        throw new Error(error instanceof Error ? error.message : "activation has invalid CJ costs");
-      }
-      const gate = evaluateSourcedDraftGate({
+      const gate = evaluatePersistedCjEvidence(evidence, {
         priceUsd: product.priceUsd,
-        cogsUsd: economics.cogsUsd,
-        shippingUsd: economics.shippingUsd,
-        dutyUsd: economics.dutyUsd,
-        paymentFeeUsd: economics.paymentFeeUsd,
-        refundReserveUsd: economics.refundReserveUsd,
-        contentCostUsd: economics.contentCostUsd,
         minimumPriceUsd: site.minKitPriceUsd,
         minimumMarginPct: site.minBlendedMarginPct,
-        inventoryQty: evidence.inventoryQty,
-        fromUsWarehouse: evidence.fromUsWarehouse && evidence.inventoryVerified,
-        sourceVerifiedAt: evidence.readAt,
       });
       if (!gate.eligible) throw new Error(`activation denied: ${gate.reason}`);
+      const economics = gate.economics;
       // Re-stamp only values derived from the lineage record, preventing stale UI values from
       // becoming the activation basis.
       await ctx.db.patch(productId, {

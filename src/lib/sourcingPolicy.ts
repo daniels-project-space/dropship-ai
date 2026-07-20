@@ -1,4 +1,4 @@
-import { calculateLandedEconomics, type LandedEconomics } from "./economics";
+import { calculateLandedEconomics, evaluateSourcedDraftGate, type LandedEconomics, type SourcedDraftGateResult } from "./economics";
 
 /** Server-owned commercial assumptions. Browser/API callers cannot substitute cost values. */
 export const SOURCING_POLICY = {
@@ -13,6 +13,19 @@ export interface VerifiedCjCostEvidence {
   shippingUsd?: number;
   fromUsWarehouse: boolean;
   inventoryVerified: boolean;
+}
+
+/** The immutable CJ read fields required whenever a candidate can move state. */
+export interface PersistedCjEvidence extends VerifiedCjCostEvidence {
+  inventoryQty: number;
+  readAt: number;
+}
+
+export interface SourcedDraftPolicy {
+  priceUsd: number;
+  minimumPriceUsd: number;
+  minimumMarginPct: number;
+  now?: number;
 }
 
 export function deriveCjEconomics(evidence: VerifiedCjCostEvidence, priceUsd: number): LandedEconomics {
@@ -30,5 +43,37 @@ export function deriveCjEconomics(evidence: VerifiedCjCostEvidence, priceUsd: nu
     paymentFeeUsd: (priceUsd * SOURCING_POLICY.paymentFeeRate) + SOURCING_POLICY.paymentFixedFeeUsd,
     refundReserveUsd: priceUsd * SOURCING_POLICY.refundReserveRate,
     contentCostUsd: SOURCING_POLICY.contentCostUsd,
+  });
+}
+
+/**
+ * Replay the exact source/economics decision from the persisted CJ read. This is deliberately
+ * used at draft creation, activation, and Shopify import so an approval cannot outlive a stale
+ * quote or use browser-supplied costs.
+ */
+export function evaluatePersistedCjEvidence(
+  evidence: PersistedCjEvidence,
+  policy: SourcedDraftPolicy,
+): SourcedDraftGateResult {
+  let economics: LandedEconomics;
+  try {
+    economics = deriveCjEconomics(evidence, policy.priceUsd);
+  } catch (error) {
+    return { eligible: false, reason: error instanceof Error ? error.message : "invalid CJ cost evidence" };
+  }
+  return evaluateSourcedDraftGate({
+    priceUsd: policy.priceUsd,
+    cogsUsd: economics.cogsUsd,
+    shippingUsd: economics.shippingUsd,
+    dutyUsd: economics.dutyUsd,
+    paymentFeeUsd: economics.paymentFeeUsd,
+    refundReserveUsd: economics.refundReserveUsd,
+    contentCostUsd: economics.contentCostUsd,
+    minimumPriceUsd: policy.minimumPriceUsd,
+    minimumMarginPct: policy.minimumMarginPct,
+    inventoryQty: evidence.inventoryQty,
+    fromUsWarehouse: evidence.fromUsWarehouse && evidence.inventoryVerified,
+    sourceVerifiedAt: evidence.readAt,
+    now: policy.now,
   });
 }
