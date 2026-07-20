@@ -116,7 +116,7 @@ console.log("   ->", `${base}-final.mp4`, outBuf.byteLength, "bytes | labelBurne
 console.log("[4/4] create creative row (status review)…");
 const convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL);
 const res = await convex.mutation(api.creatives.requestGen, {
-  siteId, kind: "product_demo", aiGenerated: true, hook: line, r2Key: `${base}-final.mp4`, status: "review",
+  siteId, kind: "product_demo", aiGenerated: true, hook: line, r2Key: `${base}-final.mp4`, labelBurned: true, status: "review",
 });
 console.log("   -> creativeId:", res.creativeId, "| aiLabelRequired:", res.aiLabelRequired);
 console.log(`\nDONE. Estimated cost ≈ $${cost.toFixed(4)} (1 Higgsfield z_image still + ${line.length} TTS chars).`);

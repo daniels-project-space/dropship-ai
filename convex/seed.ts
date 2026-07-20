@@ -127,6 +127,7 @@ async function seedBrand(
       r2Key: `sample/${spec.name}/creative-${i}.mp4`,
       aiGenerated: true,
       aiLabelRequired: true,
+      labelBurned: true,
       hook: hooks[i % hooks.length],
       status: "approved",
       createdAt: publishedAt,

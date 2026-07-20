@@ -4,12 +4,13 @@ import { query } from "./authz";
 import type { QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
+import { matchesDataMode, type DataMode } from "./sampleScope";
 
 export const portfolio = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { dataMode }) => {
     // Tenant set is small and bounded; cap defensively.
-    const sites = await ctx.db.query("sites").order("desc").take(500);
+    const sites = (await ctx.db.query("sites").order("desc").take(500)).filter((site) => matchesDataMode(site, dataMode));
 
     const rows = await Promise.all(
       sites.map(async (site) => {
@@ -61,12 +62,13 @@ const VIEW_THRESHOLD = 10_000;
 const TRAILING_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const contentFitGate = query({
-  args: { siteId: v.optional(v.id("sites")) },
-  handler: async (ctx, { siteId }) => {
+  args: { siteId: v.optional(v.id("sites")), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { siteId, dataMode }) => {
     const since = Date.now() - TRAILING_MS;
-    const sites = siteId
+    const candidates = siteId
       ? [await ctx.db.get(siteId)].filter((s): s is NonNullable<typeof s> => s !== null)
       : await ctx.db.query("sites").take(200);
+    const sites = candidates.filter((site) => matchesDataMode(site, dataMode));
 
     let best: {
       postId: string;
@@ -158,12 +160,12 @@ function dayKey(ms: number): string {
 }
 
 // Resolve the scope to a concrete, bounded site list.
-async function resolveSites(ctx: QueryCtx, scope: string | undefined) {
+async function resolveSites(ctx: QueryCtx, scope: string | undefined, dataMode: DataMode = "live") {
   if (scope && scope !== "all") {
     const s = await ctx.db.get(scope as Id<"sites">);
-    return s ? [s] : [];
+    return s && matchesDataMode(s, dataMode) ? [s] : [];
   }
-  return ctx.db.query("sites").take(200);
+  return (await ctx.db.query("sites").take(200)).filter((site) => matchesDataMode(site, dataMode));
 }
 
 // `metric` ∈ "revenue" | "orders" | "views" | "engagement". Returns a dense
@@ -174,11 +176,12 @@ export const timeseries = query({
     metric: v.union(v.literal("revenue"), v.literal("orders"), v.literal("views"), v.literal("engagement")),
     days: v.optional(v.number()),
     platform: v.optional(v.string()),
+    dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))),
   },
-  handler: async (ctx, { scope, metric, days, platform }) => {
+  handler: async (ctx, { scope, metric, days, platform, dataMode }) => {
     const window = Math.min(days ?? 30, 180);
     const since = Date.now() - window * DAY_MS;
-    const sites = await resolveSites(ctx, scope);
+    const sites = await resolveSites(ctx, scope, dataMode);
 
     // dense day buckets
     const buckets = new Map<string, number>();
@@ -227,11 +230,11 @@ export const timeseries = query({
 
 // Per-platform published-post performance (views + engagement + post count).
 export const platformBreakdown = query({
-  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
-  handler: async (ctx, { scope, days }) => {
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { scope, days, dataMode }) => {
     const window = Math.min(days ?? 30, 180);
     const since = Date.now() - window * DAY_MS;
-    const sites = await resolveSites(ctx, scope);
+    const sites = await resolveSites(ctx, scope, dataMode);
 
     const acc: Record<string, { views: number; engagement: number; posts: number }> = {
       tiktok: { views: 0, engagement: 0, posts: 0 },
@@ -264,11 +267,11 @@ export const platformBreakdown = query({
 // organic post views; the lower stages derive from the latest conversionMetrics
 // rollups (addToCartRate, cvr) and order count.
 export const funnel = query({
-  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
-  handler: async (ctx, { scope, days }) => {
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { scope, days, dataMode }) => {
     const window = Math.min(days ?? 30, 180);
     const since = Date.now() - window * DAY_MS;
-    const sites = await resolveSites(ctx, scope);
+    const sites = await resolveSites(ctx, scope, dataMode);
 
     let views = 0;
     let pageviews = 0;
@@ -315,9 +318,9 @@ export const funnel = query({
 
 // Top products by views with CVR + contribution margin, for the DataTable mini-bars.
 export const topProducts = query({
-  args: { scope: v.optional(v.string()), limit: v.optional(v.number()) },
-  handler: async (ctx, { scope, limit }) => {
-    const sites = await resolveSites(ctx, scope);
+  args: { scope: v.optional(v.string()), limit: v.optional(v.number()), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { scope, limit, dataMode }) => {
+    const sites = await resolveSites(ctx, scope, dataMode);
     const cap = Math.min(limit ?? 6, 25);
 
     const rows: Array<{
@@ -370,11 +373,11 @@ export const topProducts = query({
 // Posting cadence — daily published-post counts over the trailing window, for the
 // Heatmap (calendar grid). Index-scoped per site (by_site_status published).
 export const postingCadence = query({
-  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
-  handler: async (ctx, { scope, days }) => {
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { scope, days, dataMode }) => {
     const window = Math.min(days ?? 84, 180);
     const since = Date.now() - window * DAY_MS;
-    const sites = await resolveSites(ctx, scope);
+    const sites = await resolveSites(ctx, scope, dataMode);
     const counts = new Map<string, number>();
     for (const s of sites) {
       const posts = await ctx.db
@@ -412,7 +415,7 @@ export const brandDetail = query({
   args: { siteId: v.id("sites") },
   handler: async (ctx, { siteId }) => {
     const site = await ctx.db.get(siteId);
-    if (!site) return null;
+    if (!site || site.sample === true) return null;
 
     const [allProducts, activeProducts, pendingActions, allPosts, publishedPosts, openOrders, allOrders, reviewCreatives] =
       await Promise.all([

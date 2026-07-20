@@ -48,7 +48,7 @@ export const listRecent = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
     const cap = limit ?? 24;
-    const sites = await ctx.db.query("sites").take(200);
+    const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
     const out: Array<{
       _id: string;
       event: string;
@@ -88,7 +88,7 @@ export const listAll = query({
     // Over-fetch one extra so we can report hasMore without a second pass.
     const perSiteTake = cap + 1;
 
-    const allSites = await ctx.db.query("sites").take(200);
+    const allSites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
     const sites = siteId ? allSites.filter((s) => s._id === siteId) : allSites;
 
     const merged: Array<{

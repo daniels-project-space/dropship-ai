@@ -17,7 +17,7 @@ function CardSkeleton() {
 }
 
 function PortfolioInner() {
-  const data = useQuery(api.dashboard.portfolio);
+  const data = useQuery(api.dashboard.portfolio, {});
   const [dialogOpen, setDialogOpen] = useState(false);
   const { brand, isAll } = useBrand();
 

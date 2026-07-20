@@ -7,6 +7,7 @@
 import { query } from "./authz";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
+import { matchesDataMode } from "./sampleScope";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -20,14 +21,15 @@ type Insight = {
 };
 
 export const list = query({
-  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
-  handler: async (ctx, { scope, days }) => {
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { scope, days, dataMode }) => {
     const window = Math.min(days ?? 30, 180);
     const since = Date.now() - window * DAY_MS;
-    const sites =
+    const candidates =
       scope && scope !== "all"
         ? [await ctx.db.get(scope as Id<"sites">)].filter((s): s is NonNullable<typeof s> => !!s)
         : await ctx.db.query("sites").take(200);
+    const sites = candidates.filter((site) => matchesDataMode(site, dataMode));
 
     const insights: Insight[] = [];
 

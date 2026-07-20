@@ -109,11 +109,12 @@ export const markExecuted = mutation({
 export const listPending = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
-    return ctx.db
+    const rows = await ctx.db
       .query("actions")
       .withIndex("by_status", (q) => q.eq("status", "pending_approval"))
       .order("desc")
       .take(limit ?? 100);
+    return rows.filter((action) => action.sample !== true);
   },
 });
 

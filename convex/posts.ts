@@ -1,4 +1,4 @@
-// Distribution post lifecycle: schedule → (publish/awaiting_manual) → recordEngagement.
+// Distribution post lifecycle: schedule/awaiting_manual → provider-confirmed publish → observed metrics.
 // Index-driven reads only (by_site_status / by_site_platform).
 //
 // The label gate is enforced in src/lib/distribute.ts BEFORE a post is published; `schedule`
@@ -27,29 +27,32 @@ export const schedule = mutation({
     siteId: v.id("sites"),
     creativeId: v.id("creatives"),
     platform,
-    status: v.optional(postStatus),     // distributor passes awaiting_manual_publish or published
+    status: v.optional(v.union(v.literal("scheduled"), v.literal("awaiting_manual_publish"))),
     scheduledFor: v.optional(v.number()),
-    externalPostId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const creative = await ctx.db.get(args.creativeId);
     if (!creative) throw new Error(`creative ${args.creativeId} not found`);
+    if (creative.siteId !== args.siteId) throw new Error("creative does not belong to this site");
     if (creative.status !== "approved") {
       throw new Error(`creative ${args.creativeId} is ${creative.status}, only approved creatives can post`);
     }
     // Data-layer label gate: AI creative must have an asset (label is burned into that asset).
-    if (creative.aiLabelRequired && !creative.r2Key) {
-      throw new Error(`creative ${args.creativeId} requires AI-labeled asset before scheduling`);
+    if (creative.aiLabelRequired && (creative.labelBurned !== true || !creative.r2Key)) {
+      throw new Error(`creative ${args.creativeId} requires verified AI-labeled asset before scheduling`);
     }
     const status = args.status ?? ("scheduled" as const);
+    const duplicate = await ctx.db
+      .query("posts")
+      .withIndex("by_creative_platform", (q) => q.eq("creativeId", args.creativeId).eq("platform", args.platform))
+      .first();
+    if (duplicate) return { postId: duplicate._id, status: duplicate.status, duplicate: true };
     const postId = await ctx.db.insert("posts", {
       siteId: args.siteId,
       creativeId: args.creativeId,
       platform: args.platform,
       status,
       scheduledFor: args.scheduledFor,
-      publishedAt: status === "published" ? Date.now() : undefined,
-      externalPostId: args.externalPostId,
       views: 0,
       engagement: 0,
     });
@@ -58,15 +61,19 @@ export const schedule = mutation({
       event: "post_scheduled",
       detail: { postId, platform: args.platform, status, creativeId: args.creativeId },
     });
-    return { postId, status };
+    return { postId, status, duplicate: false };
   },
 });
 
 export const markPublished = mutation({
-  args: { postId: v.id("posts"), externalPostId: v.optional(v.string()) },
+  args: { postId: v.id("posts"), externalPostId: v.string() },
   handler: async (ctx, { postId, externalPostId }) => {
     const p = await ctx.db.get(postId);
     if (!p) throw new Error(`post ${postId} not found`);
+    if (p.status !== "scheduled" && p.status !== "awaiting_manual_publish") {
+      throw new Error(`post ${postId} is ${p.status}, not awaiting provider publication`);
+    }
+    if (!externalPostId.trim()) throw new Error("provider post id is required before marking published");
     await ctx.db.patch(postId, { status: "published", publishedAt: Date.now(), externalPostId });
     await appendAudit(ctx, { siteId: p.siteId, event: "post_published", detail: { postId, externalPostId } });
     return postId;
@@ -74,11 +81,17 @@ export const markPublished = mutation({
 });
 
 export const recordEngagement = mutation({
-  args: { postId: v.id("posts"), views: v.number(), engagement: v.number() },
-  handler: async (ctx, { postId, views, engagement }) => {
+  args: { postId: v.id("posts"), views: v.number(), engagement: v.number(), observedAt: v.number() },
+  handler: async (ctx, { postId, views, engagement, observedAt }) => {
     const p = await ctx.db.get(postId);
     if (!p) throw new Error(`post ${postId} not found`);
-    await ctx.db.patch(postId, { views, engagement });
+    if (p.status !== "published" || !p.externalPostId) {
+      throw new Error(`post ${postId} has no provider-confirmed publication`);
+    }
+    if (!Number.isFinite(views) || !Number.isFinite(engagement) || views < 0 || engagement < 0 || !Number.isFinite(observedAt)) {
+      throw new Error("provider metrics must be finite non-negative observations");
+    }
+    await ctx.db.patch(postId, { views, engagement, metricsObservedAt: observedAt });
     return postId;
   },
 });
@@ -117,7 +130,7 @@ export const listBySite = query({
 export const listForBoard = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
-    const sites = await ctx.db.query("sites").take(200);
+    const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
     const out = [];
     for (const s of sites) {
       const rows = await ctx.db

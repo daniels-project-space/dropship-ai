@@ -20,7 +20,7 @@ const creativeStatus = v.union(
   v.literal("rejected"),
 );
 
-// Create a creative row in "generating" (or "review" if r2Key already supplied by the factory).
+// Create a creative row in "generating" (or "review" if the factory supplied a verified asset).
 export const requestGen = mutation({
   args: {
     siteId: v.id("sites"),
@@ -29,12 +29,20 @@ export const requestGen = mutation({
     aiGenerated: v.boolean(),
     hook: v.optional(v.string()),
     r2Key: v.optional(v.string()),      // present when the factory has already assembled the asset
+    labelBurned: v.optional(v.boolean()), // factory proof: disclosure was rendered into the asset
     status: v.optional(creativeStatus), // factory passes "review" once the asset exists
   },
   handler: async (ctx, args) => {
     // INVARIANT: any AI-generated asset requires the disclosure label, full stop.
     const aiLabelRequired = args.aiGenerated === true;
+    const labelBurned = args.labelBurned === true;
     const status = args.status ?? (args.r2Key ? ("review" as const) : ("generating" as const));
+    if (status === "review" && !args.r2Key) {
+      throw new Error("creative cannot enter review without an assembled asset");
+    }
+    if (aiLabelRequired && status === "review" && !labelBurned) {
+      throw new Error("AI creative cannot enter review without verified burned-in disclosure");
+    }
     const creativeId = await ctx.db.insert("creatives", {
       siteId: args.siteId,
       productId: args.productId,
@@ -42,6 +50,7 @@ export const requestGen = mutation({
       r2Key: args.r2Key ?? "", // empty until the factory uploads + patches via setAsset
       aiGenerated: args.aiGenerated,
       aiLabelRequired,
+      labelBurned,
       hook: args.hook,
       status,
       createdAt: Date.now(),
@@ -49,7 +58,7 @@ export const requestGen = mutation({
     await appendAudit(ctx, {
       siteId: args.siteId,
       event: "creative_requested",
-      detail: { creativeId, kind: args.kind, aiGenerated: args.aiGenerated, aiLabelRequired, status },
+      detail: { creativeId, kind: args.kind, aiGenerated: args.aiGenerated, aiLabelRequired, labelBurned, status },
     });
     return { creativeId, aiLabelRequired, status };
   },
@@ -57,12 +66,15 @@ export const requestGen = mutation({
 
 // Factory callback: attach the finished R2 asset and flip to "review".
 export const setAsset = mutation({
-  args: { creativeId: v.id("creatives"), r2Key: v.string() },
-  handler: async (ctx, { creativeId, r2Key }) => {
+  args: { creativeId: v.id("creatives"), r2Key: v.string(), labelBurned: v.boolean() },
+  handler: async (ctx, { creativeId, r2Key, labelBurned }) => {
     const c = await ctx.db.get(creativeId);
     if (!c) throw new Error(`creative ${creativeId} not found`);
-    await ctx.db.patch(creativeId, { r2Key, status: "review" });
-    await appendAudit(ctx, { siteId: c.siteId, event: "creative_asset_ready", detail: { creativeId, r2Key } });
+    if (c.aiLabelRequired && !labelBurned) {
+      throw new Error(`creative ${creativeId} requires verified burned-in AI disclosure`);
+    }
+    await ctx.db.patch(creativeId, { r2Key, labelBurned, status: "review" });
+    await appendAudit(ctx, { siteId: c.siteId, event: "creative_asset_ready", detail: { creativeId, r2Key, labelBurned } });
     return creativeId;
   },
 });
@@ -73,9 +85,12 @@ export const approve = mutation({
     const c = await ctx.db.get(creativeId);
     if (!c) throw new Error(`creative ${creativeId} not found`);
     if (c.status !== "review") throw new Error(`creative ${creativeId} is ${c.status}, not review`);
-    // Belt-and-braces: an AI creative without a real asset cannot be approved.
-    if (c.aiLabelRequired && !c.r2Key) {
-      throw new Error(`creative ${creativeId} requires AI label + asset before approval`);
+    if (!c.r2Key) {
+      throw new Error(`creative ${creativeId} requires an assembled asset before approval`);
+    }
+    // Legacy rows without labelBurned intentionally fail closed here.
+    if (c.aiLabelRequired && c.labelBurned !== true) {
+      throw new Error(`creative ${creativeId} requires verified burned-in AI disclosure before approval`);
     }
     await ctx.db.patch(creativeId, { status: "approved" });
     await appendAudit(ctx, {
@@ -119,7 +134,7 @@ export const listByStatus = query({
 export const listForReview = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
-    const sites = await ctx.db.query("sites").take(200);
+    const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
     const out = [];
     for (const s of sites) {
       const rows = await ctx.db

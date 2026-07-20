@@ -53,7 +53,7 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
   const insights = useQuery(api.insights.list, { scope, days: tf });
   const cadence = useQuery(api.dashboard.postingCadence, { scope, days: 84 });
   const gate = useQuery(api.dashboard.contentFitGate, scope === "all" ? {} : { siteId: scope as never });
-  const portfolio = useQuery(api.dashboard.portfolio);
+  const portfolio = useQuery(api.dashboard.portfolio, {});
   const recent = useQuery(
     scope === "all" ? api.audit.listRecent : api.audit.listBySite,
     scope === "all" ? { limit: 8 } : ({ siteId: scope as never, limit: 8 } as never),

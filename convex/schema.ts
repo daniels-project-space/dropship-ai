@@ -112,6 +112,9 @@ export default defineSchema({
     r2Key: v.string(),                            // asset in R2
     aiGenerated: v.boolean(),
     aiLabelRequired: v.boolean(),                 // §8.3 enforced before any publish
+    // Set only by the assembler/factory after the disclosure is actually burned into the asset.
+    // Optional for the migration so legacy rows fail closed at approval time.
+    labelBurned: v.optional(v.boolean()),
     hook: v.optional(v.string()),
     status: v.union(v.literal("generating"), v.literal("review"), v.literal("approved"), v.literal("rejected")),
     createdAt: v.number(),
@@ -128,8 +131,10 @@ export default defineSchema({
     externalPostId: v.optional(v.string()),
     views: v.optional(v.number()),
     engagement: v.optional(v.number()),
+    metricsObservedAt: v.optional(v.number()),    // provider observation time, never a UI estimate
     sample: v.optional(v.boolean()),
-  }).index("by_site_status", ["siteId", "status"]).index("by_site_platform", ["siteId", "platform"]),
+  }).index("by_site_status", ["siteId", "status"]).index("by_site_platform", ["siteId", "platform"])
+    .index("by_creative_platform", ["creativeId", "platform"]),
 
   // ── orders + CJ fulfillment loop ──────────────────────────────────────────
   orders: defineTable({

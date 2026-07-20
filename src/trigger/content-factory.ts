@@ -83,6 +83,7 @@ export const contentFactory = task({
           aiGenerated: true,
           hook,
           r2Key: finished.r2Key,
+          labelBurned: finished.labelBurned,
           status: "review",
         });
         created.push({ creativeId, r2Key: finished.r2Key });
@@ -108,6 +109,13 @@ export const scheduleApprovedCreative = task({
       logger.warn("schedule-approved-creative: not approved, skipping", { creativeId, status: creative.status });
       return { skipped: true, reason: `status ${creative.status}` };
     }
+    if (creative.aiLabelRequired && creative.labelBurned !== true) {
+      return { skipped: true, reason: "AI disclosure burn was not verified", creativeId };
+    }
+    const site = await convex.query(api.sites.get, { siteId: creative.siteId as Id<"sites"> });
+    if (!site || site.sample === true) {
+      return { skipped: true, reason: "sample or missing site cannot distribute", creativeId };
+    }
 
     const idempotencyKey = `distribution:${creativeId}`;
     const target = `creative-distribution:${creativeId}`;
@@ -125,19 +133,20 @@ export const scheduleApprovedCreative = task({
       const forPublish: CreativeForPublish = {
         aiGenerated: creative.aiGenerated,
         aiLabelRequired: creative.aiLabelRequired,
-        labelBurned: Boolean(creative.r2Key), // asset exists ⇒ assembler burned the label
+        labelBurned: creative.labelBurned === true,
         mediaUrl,
         caption: payload.caption ?? creative.hook ?? "Calm Dog enrichment.",
       };
 
       // distribute() runs assertLabelGate() first — hard stop on any unlabeled AI asset.
-      const result = await distribute(forPublish);
+      const result = await distribute(forPublish, { distributionMode: site.distributionMode });
 
       if (result.mode === "ayrshare" && result.ok) {
         for (const platform of result.platforms) {
-          await convex.mutation(api.posts.schedule, {
-            siteId: creative.siteId as Id<"sites">, creativeId, platform, status: "published", externalPostId: result.postIds[platform],
+          const post = await convex.mutation(api.posts.schedule, {
+            siteId: creative.siteId as Id<"sites">, creativeId, platform, status: "scheduled",
           });
+          await convex.mutation(api.posts.markPublished, { postId: post.postId, externalPostId: result.postIds[platform] });
         }
         await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { mode: "ayrshare", platforms: result.platforms } });
         return { mode: "ayrshare", posts: result.platforms.length };

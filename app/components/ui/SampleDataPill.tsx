@@ -5,7 +5,8 @@ import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 
 // Honesty marker — a small amber "SAMPLE DATA" pill shown whenever seeded demo
-// data is present (dashboard.sampleStatus.present). "Clear" calls
+// data is present (dashboard.sampleStatus.present). It is excluded from every live portfolio
+// and analytics query. "Clear" calls
 // clearSampleData, which removes ONLY sample-flagged sites + their children.
 // Disappears automatically once real data replaces the sample set.
 export function SampleDataPill({ compact = false }: { compact?: boolean }) {
@@ -28,7 +29,7 @@ export function SampleDataPill({ compact = false }: { compact?: boolean }) {
   return (
     <span
       className="inline-flex items-center gap-2 rounded-full border border-signal/30 bg-signal/10 px-2.5 py-1"
-      title={`Seeded demo data present: ${status.sampleSiteNames.join(", ")}`}
+      title={`Seeded demo data is excluded from live analytics: ${status.sampleSiteNames.join(", ")}`}
     >
       <span className="h-1.5 w-1.5 rounded-full bg-signal" />
       <span className="font-mono text-[9.5px] uppercase tracking-[0.18em] text-signal">

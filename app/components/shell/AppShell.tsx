@@ -63,7 +63,7 @@ function AppShellInner({
   // close the mobile drawer on route change
   useEffect(() => setMobileOpen(false), [pathname]);
 
-  const portfolio = useQuery(api.dashboard.portfolio);
+  const portfolio = useQuery(api.dashboard.portfolio, {});
   const gate = useQuery(api.dashboard.contentFitGate, {});
 
   const pending = portfolio?.totalPendingActions ?? 0;

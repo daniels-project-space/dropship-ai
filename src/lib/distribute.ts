@@ -10,6 +10,7 @@
 //   with status "awaiting_manual_publish" (Daniel taps publish). This module returns a
 //   directive telling the caller to take Path B; it does NOT touch Convex itself.
 import { getKey } from "./vault";
+import { assertLiveEffectsEnabled } from "./effects";
 
 const AYRSHARE_BASE = "https://api.ayrshare.com/api";
 export const PLATFORMS = ["tiktok", "instagram", "youtube"] as const;
@@ -51,8 +52,18 @@ export async function ayrshareAvailable(): Promise<boolean> {
  * a semi_manual directive (caller writes an "awaiting_manual_publish" post row). Always passes the
  * label gate first.
  */
-export async function distribute(c: CreativeForPublish): Promise<DistributeResult> {
+export async function distribute(
+  c: CreativeForPublish,
+  options: { distributionMode: "semi_manual" | "automated" },
+): Promise<DistributeResult> {
   assertLabelGate(c); // throws on any unlabeled AI asset — hard stop
+
+  // An approved creative is not itself permission to publish unless the brand explicitly opted
+  // into automated distribution and the deployment has the two-key live-effects acknowledgement.
+  if (options.distributionMode !== "automated") {
+    return { mode: "semi_manual", ok: true, reason: "brand is in semi-manual distribution mode; operator must publish externally." };
+  }
+  assertLiveEffectsEnabled("live");
 
   const key = await getKey("ayrshare", "AYRSHARE_API_KEY");
   if (!key) {

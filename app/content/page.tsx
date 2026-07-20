@@ -94,7 +94,7 @@ function GenerateBar({
 
 export default function CreativeStudioPage() {
   const reviews = useQuery(api.creatives.listForReview, {});
-  const portfolio = useQuery(api.dashboard.portfolio);
+  const portfolio = useQuery(api.dashboard.portfolio, {});
 
   const loading = reviews === undefined;
   const creatives = (reviews ?? []) as ReviewCreative[];

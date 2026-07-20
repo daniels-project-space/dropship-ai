@@ -14,6 +14,7 @@ export type ReviewCreative = {
   r2Key: string;
   aiGenerated: boolean;
   aiLabelRequired: boolean;
+  labelBurned?: boolean;
   hook?: string;
   status: "generating" | "review" | "approved" | "rejected";
   createdAt: number;
@@ -49,6 +50,7 @@ export function CreativeCard({
   const reject = useMutation(api.creatives.reject);
   const [busy, setBusy] = useState<null | "approve" | "reject">(null);
   const [error, setError] = useState<string | null>(null);
+  const disclosureVerified = !creative.aiLabelRequired || creative.labelBurned === true;
 
   async function run(kind: "approve" | "reject") {
     setError(null);
@@ -113,7 +115,7 @@ export function CreativeCard({
         <div className="mt-auto flex items-center gap-2.5">
           <button
             onClick={() => run("approve")}
-            disabled={busy !== null}
+            disabled={busy !== null || !disclosureVerified}
             className="flex-1 rounded-lg bg-live/15 px-4 py-2.5 text-[13px] font-semibold text-live ring-1 ring-live/30 transition hover:bg-live/25 disabled:opacity-50"
           >
             {busy === "approve" ? "Scheduling…" : "Approve"}
@@ -126,6 +128,12 @@ export function CreativeCard({
             {busy === "reject" ? "Rejecting…" : "Reject"}
           </button>
         </div>
+
+        {!disclosureVerified && (
+          <p className="rounded-lg border border-pending/30 bg-pending/10 px-3 py-2 text-[12px] leading-relaxed text-pending">
+            Approval blocked: this legacy AI asset has no verified burned-in disclosure. Reassemble it before review.
+          </p>
+        )}
 
         {error && (
           <p className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
