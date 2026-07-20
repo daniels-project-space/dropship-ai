@@ -138,7 +138,7 @@ export function OrdersTab({ siteId }: { siteId: Id<"sites"> }) {
         empty={{
           glyph: <Icon.truck size={26} />,
           title: "No orders yet",
-          body: "Orders flow in once a Shopify store is connected. Each order auto-dispatches to CJ for fulfillment, and tracking lands here via the CJ webhook — nothing to do until then.",
+          body: "Orders are mirrored here once a Shopify store is connected. CJ dispatch requires an explicit approved workflow; tracking lands here through the CJ webhook after dispatch.",
         }}
       />
       <OrderDrawer row={active} onClose={() => setActive(null)} />
