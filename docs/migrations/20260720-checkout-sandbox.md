@@ -62,3 +62,30 @@ CJ request was contacted or created by this checkout.
 - A genuine zero-charge provider trace has **not** been executed: this worker has no scoped
   Shopify sandbox authorization, and even a $0 draft creation is an external provider mutation.
   The local trace is covered by the mocked adapter test only.
+
+## Authorized provider-trace handoff — 2026-07-20
+
+Daniel has authorized exactly one non-billable development-store trace within the existing
+boundaries. This controller still has no attached `SHOPIFY_*`, sandbox-allowlist, or
+operator-session capability, and the read-only production readiness response reports that no
+Shopify token is configured. Consequently no Shopify draft was attempted from this controller:
+there is no scoped development shop or token to target safely.
+
+The deployed Vercel project is also not serving the checked-out checkout implementation:
+
+- `GET /api/status` still returns a readiness payload without an operator session, although this
+  source requires `requireOperator`.
+- An unauthenticated `POST /api/shopify/test-checkout` with a syntactically valid sandbox body
+  returned `404` before the route could execute. It could not create a draft, invoice, customer,
+  CJ request, tracking update, or fulfillment.
+
+Release-proof controller handoff: deploy the verified commit, attach only a development-store
+`write_draft_orders` token and its exact `SHOPIFY_SANDBOX_SHOPS` entry with
+`DROPSHIP_AI_SANDBOX_EFFECTS=enabled`, mint an operator session, and invoke the route once with a
+new trace ID. Preserve the response fields (`draft.id`, `name`, `totalAmount: "0.00"`, currency,
+`invoiceCreated: false`, `fulfillment: "disabled"`). Do not open/send an invoice, complete the
+draft, configure live flags, call CJ, reserve inventory, update tracking, or notify a customer.
+
+Current re-verification in this checkout: `npm run typecheck` passed; `npm test` passed 16/16;
+`NEXT_PUBLIC_CONVEX_URL=https://peaceful-panda-894.convex.cloud npm run build` completed
+successfully after lockfile-resolved `npm ci`.
