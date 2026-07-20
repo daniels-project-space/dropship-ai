@@ -2,7 +2,7 @@
 // auto         → inserted as "approved" (executes without a human)
 // human_gated  → inserted as "pending_approval" (Trigger waitpoint + Daniel taps approve/reject)
 // Every state transition appends to the audit ledger.
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 

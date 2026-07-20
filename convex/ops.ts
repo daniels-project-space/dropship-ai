@@ -1,0 +1,63 @@
+// Durable execution primitives for all external side effects. Convex mutations are serializable,
+// so the read/claim/write sequence below is atomic even when Trigger retries concurrently.
+import { mutation, query } from "./authz";
+import { v } from "convex/values";
+
+const outboxStatus = v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed"));
+
+export const claimTarget = mutation({
+  args: { target: v.string(), owner: v.string(), leaseMs: v.optional(v.number()) },
+  handler: async (ctx, { target, owner, leaseMs }) => {
+    const now = Date.now();
+    const existing = await ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", target)).first();
+    if (existing && existing.expiresAt > now && existing.owner !== owner) return { acquired: false, owner: existing.owner, expiresAt: existing.expiresAt };
+    if (existing) await ctx.db.delete(existing._id);
+    const expiresAt = now + Math.min(Math.max(leaseMs ?? 5 * 60_000, 1_000), 15 * 60_000);
+    await ctx.db.insert("targetLocks", { target, owner, expiresAt, createdAt: now });
+    return { acquired: true, expiresAt };
+  },
+});
+
+export const releaseTarget = mutation({
+  args: { target: v.string(), owner: v.string() },
+  handler: async (ctx, { target, owner }) => {
+    const existing = await ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", target)).first();
+    if (!existing || existing.owner !== owner) return { released: false };
+    await ctx.db.delete(existing._id);
+    return { released: true };
+  },
+});
+
+export const enqueue = mutation({
+  args: {
+    siteId: v.id("sites"), kind: v.string(), target: v.string(), idempotencyKey: v.string(), traceId: v.string(), payload: v.any(),
+  },
+  handler: async (ctx, args) => {
+    const existing = await ctx.db.query("outbox").withIndex("by_idempotency_key", (q) => q.eq("idempotencyKey", args.idempotencyKey)).first();
+    if (existing) return { outboxId: existing._id, duplicate: true, status: existing.status };
+    const now = Date.now();
+    const outboxId = await ctx.db.insert("outbox", { ...args, status: "pending", attempts: 0, availableAt: now, createdAt: now });
+    await ctx.db.insert("traces", { traceId: args.traceId, siteId: args.siteId, operation: args.kind, target: args.target, idempotencyKey: args.idempotencyKey, status: "started", detail: {}, startedAt: now });
+    return { outboxId, duplicate: false, status: "pending" as const };
+  },
+});
+
+export const markOutbox = mutation({
+  args: { outboxId: v.id("outbox"), status: outboxStatus, detail: v.optional(v.any()), error: v.optional(v.string()), retryAt: v.optional(v.number()) },
+  handler: async (ctx, { outboxId, status, detail, error, retryAt }) => {
+    const row = await ctx.db.get(outboxId);
+    if (!row) throw new Error(`outbox ${outboxId} not found`);
+    const now = Date.now();
+    await ctx.db.patch(outboxId, { status, attempts: row.attempts + (status === "processing" ? 1 : 0), availableAt: retryAt ?? row.availableAt, deliveredAt: status === "delivered" ? now : row.deliveredAt, lastError: error });
+    const trace = await ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", row.traceId)).first();
+    if (trace && (status === "delivered" || status === "failed")) {
+      await ctx.db.patch(trace._id, { status: status === "delivered" ? "succeeded" : "failed", detail: detail ?? (error ? { error } : {}), finishedAt: now });
+    }
+    return outboxId;
+  },
+});
+
+export const getOutboxByKey = query({
+  args: { idempotencyKey: v.string() },
+  handler: async (ctx, { idempotencyKey }) => ctx.db.query("outbox").withIndex("by_idempotency_key", (q) => q.eq("idempotencyKey", idempotencyKey)).first(),
+});

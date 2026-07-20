@@ -15,6 +15,7 @@ import { resolveShopifyConfig, vaultRefForDomain, SHOPIFY_TOKEN_KEY } from "@/sr
 import { syncShopify } from "@/src/lib/shopifySync";
 import { convexClient, api } from "@/src/lib/convexClient";
 import type { Id } from "@/convex/_generated/dataModel";
+import { requireOperator } from "@/src/lib/auth/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,6 +27,8 @@ function normalizeDomain(raw: string): string {
 }
 
 export async function POST(req: Request) {
+  const guard = await requireOperator(req);
+  if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
   let body: { siteId?: string; shopifyDomain?: string; accessToken?: string };
   try {
     body = await req.json();

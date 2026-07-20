@@ -21,23 +21,47 @@ export const fulfillOrder = task({
   run: async (payload: FulfillOrderPayload) => {
     const convex = convexClient();
     const siteId = payload.siteId as Id<"sites">;
+    const idempotencyKey = `cj:create:${payload.siteId}:${payload.shopifyOrderId}`;
+    const target = `fulfillment:${payload.siteId}:${payload.shopifyOrderId}`;
+    const traceId = idempotencyKey;
 
-    // 1. Record the received order first (idempotent) so we never lose it on a CJ failure.
-    const orderId = await convex.mutation(api.orders.record, {
-      siteId,
-      shopifyOrderId: payload.shopifyOrderId,
-      totalUsd: payload.totalUsd,
+    // Persist intent before crossing the CJ boundary. This survives Trigger retries and leaves
+    // an operator-visible trace even when the supplier is unavailable.
+    const queued = await convex.mutation(api.ops.enqueue, {
+      siteId, kind: "cj.create_order", target, idempotencyKey, traceId,
+      payload: { shopifyOrderId: payload.shopifyOrderId },
     });
+    if (queued.duplicate && queued.status === "delivered") {
+      return { skipped: true, reason: "already delivered", shopifyOrderId: payload.shopifyOrderId };
+    }
+    const lock = await convex.mutation(api.ops.claimTarget, { target, owner: idempotencyKey, leaseMs: 10 * 60_000 });
+    if (!lock.acquired) return { skipped: true, reason: "target locked", shopifyOrderId: payload.shopifyOrderId };
 
-    // 2. Create the order in CJ (no payment — payType:3).
-    const cjResult = await createOrder(payload.cjInput, payload.cjAccessToken);
-    logger.info("cj order created", { shopifyOrderId: payload.shopifyOrderId, cjOrderId: cjResult.orderId });
+    try {
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "processing" });
+      // 1. Record the received order first (idempotent) so we never lose it on a CJ failure.
+      const orderId = await convex.mutation(api.orders.record, { siteId, shopifyOrderId: payload.shopifyOrderId, totalUsd: payload.totalUsd });
+      const existing = await convex.query(api.orders.getByShopifyOrder, { shopifyOrderId: payload.shopifyOrderId });
+      if (existing?.cjOrderId) {
+        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { cjOrderId: existing.cjOrderId, reused: true } });
+        return { orderId, cjOrderId: existing.cjOrderId, shopifyOrderId: payload.shopifyOrderId, reused: true };
+      }
 
-    // 3. Stamp the CJ order id + status onto the Convex order.
-    await convex.mutation(api.orders.markSentToCj, { orderId, cjOrderId: cjResult.orderId });
+      // 2. Create-only CJ order; payload.orderNumber is the stable supplier-side idempotency key.
+      if (payload.cjInput.orderNumber !== payload.shopifyOrderId) throw new Error("CJ orderNumber must equal the Shopify order id");
+      const cjResult = await createOrder(payload.cjInput, payload.cjAccessToken);
+      logger.info("cj order created", { shopifyOrderId: payload.shopifyOrderId, cjOrderId: cjResult.orderId, traceId });
 
-    // Tracking is NOT in the create response — it arrives later via the CJ ORDER webhook.
-    return { orderId, cjOrderId: cjResult.orderId, shopifyOrderId: payload.shopifyOrderId };
+      // 3. Stamp the CJ order id + status onto the Convex order.
+      await convex.mutation(api.orders.markSentToCj, { orderId, cjOrderId: cjResult.orderId });
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { cjOrderId: cjResult.orderId } });
+      return { orderId, cjOrderId: cjResult.orderId, shopifyOrderId: payload.shopifyOrderId, traceId };
+    } catch (error) {
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: String(error).slice(0, 500) });
+      throw error;
+    } finally {
+      await convex.mutation(api.ops.releaseTarget, { target, owner: idempotencyKey });
+    }
   },
 });
 

@@ -108,7 +108,7 @@ export default defineSchema({
     status: v.union(v.literal("generating"), v.literal("review"), v.literal("approved"), v.literal("rejected")),
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
-  }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]),
+  }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]).index("by_r2_key", ["r2Key"]),
 
   posts: defineTable({
     siteId: v.id("sites"),
@@ -162,6 +162,42 @@ export default defineSchema({
     at: v.number(),
     sample: v.optional(v.boolean()),
   }).index("by_site_at", ["siteId", "at"]),
+
+  // Durable coordination records. A target lock prevents two workers from issuing the
+  // same external side effect, while outbox + traces preserve intent and retry evidence.
+  targetLocks: defineTable({
+    target: v.string(),
+    owner: v.string(),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+  }).index("by_target", ["target"]),
+
+  outbox: defineTable({
+    siteId: v.id("sites"),
+    kind: v.string(),
+    target: v.string(),
+    idempotencyKey: v.string(),
+    traceId: v.string(),
+    payload: v.any(),
+    status: v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed")),
+    attempts: v.number(),
+    availableAt: v.number(),
+    deliveredAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+    createdAt: v.number(),
+  }).index("by_idempotency_key", ["idempotencyKey"]).index("by_status_available_at", ["status", "availableAt"]).index("by_site_created_at", ["siteId", "createdAt"]),
+
+  traces: defineTable({
+    traceId: v.string(),
+    siteId: v.id("sites"),
+    operation: v.string(),
+    target: v.string(),
+    idempotencyKey: v.string(),
+    status: v.union(v.literal("started"), v.literal("succeeded"), v.literal("failed"), v.literal("skipped")),
+    detail: v.any(),
+    startedAt: v.number(),
+    finishedAt: v.optional(v.number()),
+  }).index("by_trace_id", ["traceId"]).index("by_site_started_at", ["siteId", "startedAt"]),
 
   // ── experiments (CRO) ─────────────────────────────────────────────────────
   experiments: defineTable({

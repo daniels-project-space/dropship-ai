@@ -1,5 +1,5 @@
 // Tenant (store/brand) CRUD. One row per site; everything else is siteId-scoped.
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 

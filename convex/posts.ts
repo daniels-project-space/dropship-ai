@@ -4,7 +4,7 @@
 // The label gate is enforced in src/lib/distribute.ts BEFORE a post is published; `schedule`
 // additionally refuses to schedule a post for a creative that still requires a label but whose
 // asset isn't ready (defense in depth at the data layer).
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 

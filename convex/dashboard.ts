@@ -1,6 +1,6 @@
 // Control-plane portfolio view: every site + its pending-action / active-product counts.
 // Index-driven only — counts come from .withIndex() reads, never full-table scans.
-import { query } from "./_generated/server";
+import { query } from "./authz";
 import type { QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";

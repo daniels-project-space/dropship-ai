@@ -33,17 +33,11 @@ jobs:
           else
             npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           fi
-      - name: Typecheck (script if defined, else tsc --noEmit)
-        run: |
-          if node -e "process.exit(require('./package.json').scripts?.typecheck?0:1)"; then
-            ${{ steps.pm.outputs.pm }} run typecheck
-          else
-            npx --yes tsc --noEmit
-          fi
-      - name: Tests (if a test script exists)
-        run: |
-          if node -e "process.exit(require('./package.json').scripts?.test?0:1)"; then
-            ${{ steps.pm.outputs.pm }} test
-          else
-            echo "no test script — skipping"
-          fi
+      - name: Typecheck
+        run: ${{ steps.pm.outputs.pm }} run typecheck
+      - name: Security boundary tests
+        run: ${{ steps.pm.outputs.pm }} test
+      - name: Production build
+        env:
+          NEXT_PUBLIC_CONVEX_URL: https://ci-placeholder.convex.cloud
+        run: ${{ steps.pm.outputs.pm }} run build

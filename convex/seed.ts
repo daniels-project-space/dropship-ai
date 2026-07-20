@@ -7,7 +7,7 @@
 // Honesty: while sample sites exist, dashboard.sampleStatus returns present:true,
 // which lights the "SAMPLE DATA" pill in the UI. Clear it and the pill vanishes.
 
-import { mutation } from "./_generated/server";
+import { mutation } from "./authz";
 import type { MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 

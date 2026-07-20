@@ -3,10 +3,13 @@
 import { NextResponse } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { scheduleApprovedCreative } from "@/src/trigger/content-factory";
+import { requireOperator } from "@/src/lib/auth/server";
 
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
+  const guard = await requireOperator(req);
+  if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
   let body: { creativeId?: string; caption?: string };
   try {
     body = await req.json();

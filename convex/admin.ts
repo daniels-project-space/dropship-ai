@@ -5,7 +5,7 @@
 // Once the real Calm-Collar creative exists we purge that demo data so the dashboard shows ONLY
 // real, generated assets. These mutations are deliberately explicit (delete by id) rather than a
 // blanket wipe, so they can never touch a real site.
-import { mutation } from "./_generated/server";
+import { mutation } from "./authz";
 import { v } from "convex/values";
 
 /**

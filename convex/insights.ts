@@ -4,7 +4,7 @@
 // (labelled "computed"). Each insight carries an icon key, headline, supporting
 // stat, tone, and an optional suggested action (route + label).
 
-import { query } from "./_generated/server";
+import { query } from "./authz";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 

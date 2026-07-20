@@ -3,7 +3,7 @@
 //
 // AI-DISCLOSURE INVARIANT (locked): a creative with aiGenerated:true is ALWAYS stored with
 // aiLabelRequired:true. `requestGen` enforces this so the flag can never be dropped upstream.
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 
@@ -137,4 +137,9 @@ export const listForReview = query({
 export const get = query({
   args: { creativeId: v.id("creatives") },
   handler: async (ctx, { creativeId }) => ctx.db.get(creativeId),
+});
+
+export const getByR2Key = query({
+  args: { r2Key: v.string() },
+  handler: async (ctx, { r2Key }) => ctx.db.query("creatives").withIndex("by_r2_key", (q) => q.eq("r2Key", r2Key)).first(),
 });

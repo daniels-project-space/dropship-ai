@@ -4,11 +4,14 @@
 import { NextResponse } from "next/server";
 import { resolveShopifyConfig } from "@/src/lib/shopifyAuth";
 import { syncShopify } from "@/src/lib/shopifySync";
+import { requireOperator } from "@/src/lib/auth/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
+  const guard = await requireOperator(req);
+  if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
   let body: { siteId?: string; sinceDays?: number };
   try {
     body = await req.json();

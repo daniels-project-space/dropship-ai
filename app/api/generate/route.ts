@@ -7,10 +7,13 @@
 import { NextResponse } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { contentFactory } from "@/src/trigger/content-factory";
+import { requireOperator } from "@/src/lib/auth/server";
 
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
+  const guard = await requireOperator(req);
+  if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
   let body: { siteId?: string; productId?: string; variants?: number; scenePrompt?: string; hooks?: string[] };
   try {
     body = await req.json();

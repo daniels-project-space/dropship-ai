@@ -1,6 +1,6 @@
 // Append-only audit ledger. Every proposed/approved/rejected/executed action lands here.
 // No deletes, ever. Index-driven reads only (by_site_at).
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import type { MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";

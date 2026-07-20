@@ -1,7 +1,7 @@
 // Per-site credential REFERENCES (the secret value never lives here — only a vaultRef pointer).
 // Index-driven reads only (by_site / by_site_key). The actual token lives in the project-hub vault;
 // this table maps "which vault key does site X use for service Y".
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 
 // Insert-or-update the vaultRef for a (siteId, key) pair. Idempotent on (siteId, key).

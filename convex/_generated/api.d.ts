@@ -17,6 +17,7 @@ import type * as experiments from "../experiments.js";
 import type * as insights from "../insights.js";
 import type * as metrics from "../metrics.js";
 import type * as orders from "../orders.js";
+import type * as ops from "../ops.js";
 import type * as posts from "../posts.js";
 import type * as products from "../products.js";
 import type * as seed from "../seed.js";
@@ -40,6 +41,7 @@ declare const fullApi: ApiFromModules<{
   insights: typeof insights;
   metrics: typeof metrics;
   orders: typeof orders;
+  ops: typeof ops;
   posts: typeof posts;
   products: typeof products;
   seed: typeof seed;

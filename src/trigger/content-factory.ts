@@ -109,45 +109,57 @@ export const scheduleApprovedCreative = task({
       return { skipped: true, reason: `status ${creative.status}` };
     }
 
-    const mediaUrl = await getSignedUrl(creative.r2Key, 3600);
-    const forPublish: CreativeForPublish = {
-      aiGenerated: creative.aiGenerated,
-      aiLabelRequired: creative.aiLabelRequired,
-      labelBurned: Boolean(creative.r2Key), // asset exists ⇒ assembler burned the label
-      mediaUrl,
-      caption: payload.caption ?? creative.hook ?? "Calm Dog enrichment.",
-    };
+    const idempotencyKey = `distribution:${creativeId}`;
+    const target = `creative-distribution:${creativeId}`;
+    const queued = await convex.mutation(api.ops.enqueue, {
+      siteId: creative.siteId as Id<"sites">, kind: "creative.distribute", target, idempotencyKey, traceId: idempotencyKey,
+      payload: { creativeId, caption: payload.caption },
+    });
+    if (queued.duplicate && queued.status === "delivered") return { skipped: true, reason: "already distributed", creativeId };
+    const lock = await convex.mutation(api.ops.claimTarget, { target, owner: idempotencyKey, leaseMs: 10 * 60_000 });
+    if (!lock.acquired) return { skipped: true, reason: "target locked", creativeId };
 
-    // distribute() runs assertLabelGate() first — hard stop on any unlabeled AI asset.
-    const result = await distribute(forPublish);
+    try {
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "processing" });
+      const mediaUrl = await getSignedUrl(creative.r2Key, 3600);
+      const forPublish: CreativeForPublish = {
+        aiGenerated: creative.aiGenerated,
+        aiLabelRequired: creative.aiLabelRequired,
+        labelBurned: Boolean(creative.r2Key), // asset exists ⇒ assembler burned the label
+        mediaUrl,
+        caption: payload.caption ?? creative.hook ?? "Calm Dog enrichment.",
+      };
 
-    if (result.mode === "ayrshare" && result.ok) {
-      for (const platform of result.platforms) {
-        await convex.mutation(api.posts.schedule, {
-          siteId: creative.siteId as Id<"sites">,
-          creativeId,
-          platform,
-          status: "published",
-          externalPostId: result.postIds[platform],
-        });
+      // distribute() runs assertLabelGate() first — hard stop on any unlabeled AI asset.
+      const result = await distribute(forPublish);
+
+      if (result.mode === "ayrshare" && result.ok) {
+        for (const platform of result.platforms) {
+          await convex.mutation(api.posts.schedule, {
+            siteId: creative.siteId as Id<"sites">, creativeId, platform, status: "published", externalPostId: result.postIds[platform],
+          });
+        }
+        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { mode: "ayrshare", platforms: result.platforms } });
+        return { mode: "ayrshare", posts: result.platforms.length };
       }
-      return { mode: "ayrshare", posts: result.platforms.length };
-    }
 
-    if (result.mode === "semi_manual") {
-      // cold-start: one awaiting_manual_publish row per platform for Daniel to tap.
-      for (const platform of ["tiktok", "instagram", "youtube"] as const) {
-        await convex.mutation(api.posts.schedule, {
-          siteId: creative.siteId as Id<"sites">,
-          creativeId,
-          platform,
-          status: "awaiting_manual_publish",
-        });
+      if (result.mode === "semi_manual") {
+        // cold-start: one awaiting_manual_publish row per platform for Daniel to tap.
+        for (const platform of ["tiktok", "instagram", "youtube"] as const) {
+          await convex.mutation(api.posts.schedule, { siteId: creative.siteId as Id<"sites">, creativeId, platform, status: "awaiting_manual_publish" });
+        }
+        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { mode: "semi_manual" } });
+        return { mode: "semi_manual", posts: 3, reason: result.reason };
       }
-      return { mode: "semi_manual", posts: 3, reason: result.reason };
-    }
 
-    logger.error("schedule-approved-creative: distribution blocked", { creativeId, result });
-    return { mode: "blocked", reason: result.ok ? "unknown" : result.reason };
+      logger.error("schedule-approved-creative: distribution blocked", { creativeId, result });
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: result.ok ? "unknown" : result.reason });
+      return { mode: "blocked", reason: result.ok ? "unknown" : result.reason };
+    } catch (error) {
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: String(error).slice(0, 500) });
+      throw error;
+    } finally {
+      await convex.mutation(api.ops.releaseTarget, { target, owner: idempotencyKey });
+    }
   },
 });

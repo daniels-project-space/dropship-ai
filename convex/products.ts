@@ -1,5 +1,5 @@
 // Catalog CRUD. siteId-scoped; index-driven reads only.
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 

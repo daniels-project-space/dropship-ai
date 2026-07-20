@@ -4,6 +4,7 @@
 // exact next-step text — secret values never cross this boundary.
 import { NextResponse } from "next/server";
 import { getKey, getService } from "@/src/lib/vault";
+import { requireOperator } from "@/src/lib/auth/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -46,7 +47,9 @@ async function vaultKeyNames(service: string): Promise<string[]> {
   }
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  const guard = await requireOperator(request, { csrf: false });
+  if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const checks: CheckItem[] = [];
 
   // ── Ayrshare: key present + which social accounts are LIVE ──────────────────
