@@ -5,6 +5,14 @@ import { createOperatorSession, verifyOperatorSession } from "../src/lib/auth/se
 import { isCreativeAssetKey } from "../src/lib/storageKey.ts";
 import { requireOperator } from "../src/lib/auth/server.ts";
 import { proxy } from "../proxy.ts";
+import { GET as getAsset } from "../app/api/asset/route.ts";
+import { GET as getStatus } from "../app/api/status/route.ts";
+import { POST as postGenerate } from "../app/api/generate/route.ts";
+import { POST as postSchedule } from "../app/api/schedule/route.ts";
+import { POST as postShopifyConnect } from "../app/api/shopify/connect/route.ts";
+import { POST as postShopifySync } from "../app/api/shopify/sync/route.ts";
+import { GET as getOperatorToken } from "../app/api/auth/token/route.ts";
+import { POST as postLogout } from "../app/api/auth/logout/route.ts";
 
 const secret = "a-session-secret-that-is-longer-than-thirty-two-characters";
 
@@ -37,6 +45,40 @@ test("missing or forged operator sessions are denied before API work", async () 
     assert.deepEqual(noSession, { ok: false, status: 401, error: "authentication required" });
     const forged = await requireOperator(new Request("https://control.example/api/asset", { headers: { cookie: "dropship_ai_operator=forged.signature" } }), { csrf: false });
     assert.deepEqual(forged, { ok: false, status: 401, error: "authentication required" });
+  } finally {
+    if (original === undefined) delete process.env.DROPSHIP_AI_SESSION_SECRET;
+    else process.env.DROPSHIP_AI_SESSION_SECRET = original;
+  }
+});
+
+test("every operator route independently rejects a forged session", async () => {
+  const original = process.env.DROPSHIP_AI_SESSION_SECRET;
+  process.env.DROPSHIP_AI_SESSION_SECRET = secret;
+  const forgedHeaders = {
+    cookie: "dropship_ai_operator=forged.signature",
+    origin: "https://control.example",
+    "content-type": "application/json",
+  };
+  const get = () => new Request("https://control.example/api/protected", { headers: forgedHeaders });
+  const post = () => new Request("https://control.example/api/protected", {
+    method: "POST",
+    headers: forgedHeaders,
+    body: "{}",
+  });
+  try {
+    const responses = await Promise.all([
+      getAsset(new Request("https://control.example/api/asset?key=creatives/site_123/final.mp4", { headers: forgedHeaders })),
+      getStatus(get()),
+      getOperatorToken(get()),
+      postGenerate(post()),
+      postSchedule(post()),
+      postShopifyConnect(post()),
+      postShopifySync(post()),
+      postLogout(post()),
+    ]);
+    for (const response of responses) {
+      assert.equal(response.status, 401);
+    }
   } finally {
     if (original === undefined) delete process.env.DROPSHIP_AI_SESSION_SECRET;
     else process.env.DROPSHIP_AI_SESSION_SECRET = original;

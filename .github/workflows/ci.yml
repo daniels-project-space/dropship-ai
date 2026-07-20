@@ -29,9 +29,9 @@ jobs:
       - name: Install
         run: |
           if [ "${{ steps.pm.outputs.pm }}" = "pnpm" ]; then
-            pnpm install --frozen-lockfile || pnpm install
+            pnpm install --frozen-lockfile
           else
-            npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+            npm ci --no-audit --no-fund
           fi
       - name: Typecheck
         run: ${{ steps.pm.outputs.pm }} run typecheck
