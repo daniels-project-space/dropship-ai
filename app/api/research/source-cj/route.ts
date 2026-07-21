@@ -5,7 +5,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { approvalGate } from "@/src/trigger/approval-gate";
-import { getProduct } from "@/src/lib/cj";
+import { getInventoryByProduct, getInventoryByVariant, getProduct, getVariant, getVariants, quoteCjFreight, selectVerifiedCjFreight } from "@/src/lib/cj";
 import { parseCjEvidence } from "@/src/lib/cjEvidence";
 import { requireOperator } from "@/src/lib/auth/server";
 import { convexClient, api } from "@/src/lib/convexClient";
@@ -44,17 +44,37 @@ export async function POST(request: Request) {
   try {
     const cjProductId = body.cjProductId.trim();
     const cjVariantId = body.cjVariantId.trim();
-    // Product Details filtered to US returns the exact candidate's variants and their
-    // documented inventories. This refresh is intentionally outside discovery caching.
-    const product = await getProduct(cjProductId, "US");
+    // Re-read every decision input immediately before creating an approval. Discovery/search
+    // results are hints only: exact variant inventory and a fresh read-only US freight quote are
+    // the authority for this draft's contribution margin.
+    const [product, variants, inventory, variant, variantInventory] = await Promise.all([
+      getProduct(cjProductId, "US"),
+      getVariants(cjProductId, "US"),
+      getInventoryByProduct(cjProductId),
+      getVariant(cjVariantId),
+      getInventoryByVariant(cjVariantId),
+    ]);
     const readAt = Date.now();
-    const parsed = parseCjEvidence({ productId: cjProductId, variantId: cjVariantId, product, variants: [], inventory: [], variant: {}, variantInventory: [] });
+    const parsed = parseCjEvidence({ productId: cjProductId, variantId: cjVariantId, product, variants, inventory, variant, variantInventory });
+    // Shipping is unknown until CJ returns a route quote. Do not turn product-level
+    // free-shipping metadata into a freight assumption for a dispatchable draft.
+    let shippingUsd: number | undefined;
+    if (parsed.fromUsWarehouse && parsed.inventoryVerified && parsed.inventoryQty > 0 && parsed.fromCountryCode) {
+      const quote = selectVerifiedCjFreight(await quoteCjFreight({
+        fromCountryCode: parsed.fromCountryCode,
+        destinationCountryCode: "US",
+        products: [{ vid: cjVariantId, quantity: 1 }],
+      }));
+      shippingUsd = quote.logisticPriceUsd;
+    }
+    const { shippingUsd: _productLevelShipping, ...verifiedEvidence } = parsed;
     const convex = convexClient();
     const staged = await convex.mutation(api.products.stageSourcedDraftSelection, {
       siteId: body.siteId.trim() as Id<"sites">,
       requestId: body.requestId.trim(),
       priceUsd: body.priceUsd,
-      ...parsed,
+      ...verifiedEvidence,
+      ...(shippingUsd !== undefined ? { shippingUsd } : {}),
       traceId: randomUUID(),
       readAt,
     });

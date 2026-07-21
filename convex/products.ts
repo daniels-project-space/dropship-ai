@@ -115,6 +115,7 @@ export const createSourcedDraft = mutation({
       cjFromUsWarehouse: true,
       cjFromCountryCode: evidence.fromCountryCode,
       sourceUrl: evidence.sourceUrl,
+      sourceMediaUrl: evidence.mediaUrl,
       sourceVerifiedAt: evidence.readAt,
       cogsUsd: economics.cogsUsd,
       shippingUsd: economics.shippingUsd,
@@ -162,6 +163,7 @@ export const recordCjEvidence = mutation({
     fromCountryCode: v.optional(v.string()),
     inventoryVerified: v.boolean(),
     sourceUrl: v.string(),
+    mediaUrl: v.optional(v.string()),
     traceId: v.string(),
     readAt: v.number(),
   },
@@ -171,6 +173,7 @@ export const recordCjEvidence = mutation({
     if (!site) throw new Error(`site ${args.siteId} not found`);
     if (!args.title.trim() || !args.cjProductId.trim() || !args.cjVariantId.trim()) throw new Error("CJ evidence identifiers and title are required");
     if (!/^https:\/\/.+/i.test(args.sourceUrl)) throw new Error("CJ evidence sourceUrl must be HTTPS");
+    if (args.mediaUrl !== undefined && !/^https:\/\/.+/i.test(args.mediaUrl)) throw new Error("CJ evidence mediaUrl must be HTTPS when known");
     if (!Number.isFinite(args.inventoryQty) || args.inventoryQty < 0) throw new Error("CJ evidence inventory must be non-negative");
     for (const [name, value] of [["cogsUsd", args.cogsUsd], ["shippingUsd", args.shippingUsd]] as const) {
       if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error(`CJ evidence ${name} must be non-negative when known`);
@@ -183,14 +186,14 @@ export const recordCjEvidence = mutation({
       target: `cj:${args.cjProductId}:${args.cjVariantId}`,
       idempotencyKey: `cj:read:${args.traceId}`,
       status: "succeeded",
-      detail: { evidenceId, sourceUrl: args.sourceUrl, costsKnown: args.cogsUsd !== undefined && args.shippingUsd !== undefined },
+      detail: { evidenceId, sourceUrl: args.sourceUrl, mediaKnown: args.mediaUrl !== undefined, costsKnown: args.cogsUsd !== undefined && args.shippingUsd !== undefined },
       startedAt: args.readAt,
       finishedAt: args.readAt,
     });
     await appendAudit(ctx, {
       siteId: args.siteId,
       event: "cj_evidence_persisted",
-      detail: { evidenceId, traceId: args.traceId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, costsKnown: args.cogsUsd !== undefined && args.shippingUsd !== undefined },
+      detail: { evidenceId, traceId: args.traceId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, mediaKnown: args.mediaUrl !== undefined, costsKnown: args.cogsUsd !== undefined && args.shippingUsd !== undefined },
     });
     return { evidenceId, traceId: args.traceId };
   },
@@ -217,6 +220,7 @@ export const stageSourcedDraftSelection = mutation({
     fromCountryCode: v.optional(v.string()),
     inventoryVerified: v.boolean(),
     sourceUrl: v.string(),
+    mediaUrl: v.optional(v.string()),
     traceId: v.string(),
     readAt: v.number(),
   },
@@ -224,6 +228,7 @@ export const stageSourcedDraftSelection = mutation({
     await requireServiceIdentity(ctx);
     if (!args.requestId.trim()) throw new Error("source selection requestId is required");
     if (!Number.isFinite(args.priceUsd) || args.priceUsd <= 0) throw new Error("source selection price must be positive");
+    if (args.mediaUrl !== undefined && !/^https:\/\/.+/i.test(args.mediaUrl)) throw new Error("source selection mediaUrl must be HTTPS when known");
     const prior = await ctx.db.query("sourceSelections")
       .withIndex("by_site_request", (q) => q.eq("siteId", args.siteId).eq("requestId", args.requestId)).first();
     if (sourceSelectionDecision({ sameRequestExists: !!prior }) === "reuse" && prior) {
@@ -270,6 +275,7 @@ export const stageSourcedDraftSelection = mutation({
       ...(args.fromCountryCode ? { fromCountryCode: args.fromCountryCode } : {}),
       inventoryVerified: args.inventoryVerified,
       sourceUrl: args.sourceUrl,
+      ...(args.mediaUrl ? { mediaUrl: args.mediaUrl } : {}),
       traceId: args.traceId,
       readAt: args.readAt,
     };
@@ -286,7 +292,7 @@ export const stageSourcedDraftSelection = mutation({
       target: `cj:${args.cjProductId}:${args.cjVariantId}`,
       idempotencyKey: `cj:selection:${args.siteId}:${args.requestId}`,
       status: "succeeded",
-      detail: { evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, sourceUrl: args.sourceUrl, costsKnown: args.cogsUsd !== undefined && args.shippingUsd !== undefined, published: false },
+      detail: { evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, sourceUrl: args.sourceUrl, mediaKnown: args.mediaUrl !== undefined, costsKnown: args.cogsUsd !== undefined && args.shippingUsd !== undefined, published: false },
       startedAt: args.readAt,
       finishedAt: args.readAt,
     });
@@ -302,7 +308,7 @@ export const stageSourcedDraftSelection = mutation({
     const economics = gate.economics!;
     const record = {
       title: args.title, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, cjEvidenceId: evidenceId,
-      cjFromUsWarehouse: true, cjFromCountryCode: args.fromCountryCode, sourceUrl: args.sourceUrl, sourceVerifiedAt: args.readAt,
+      cjFromUsWarehouse: true, cjFromCountryCode: args.fromCountryCode, sourceUrl: args.sourceUrl, sourceMediaUrl: args.mediaUrl, sourceVerifiedAt: args.readAt,
       cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, dutyUsd: economics.dutyUsd,
       paymentFeeUsd: economics.paymentFeeUsd, refundReserveUsd: economics.refundReserveUsd, contentCostUsd: economics.contentCostUsd,
       landedCostUsd: economics.landedCostUsd, priceUsd: args.priceUsd, contributionMarginPct: economics.contributionMarginPct,
@@ -313,7 +319,7 @@ export const stageSourcedDraftSelection = mutation({
     const actionId = await ctx.db.insert("actions", {
       siteId: args.siteId, type: "import_sourced_product", riskTier: "human_gated", status: "pending_approval",
       selectionRequestId: args.requestId, approvalDispatchKey, approvalDispatchStatus: "pending",
-      params: { productId, evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, title: args.title, inventoryQty: args.inventoryQty, evidenceReadAt: args.readAt, priceUsd: args.priceUsd, cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, landedCostUsd: economics.landedCostUsd, contributionMarginPct: economics.contributionMarginPct, published: false },
+      params: { productId, evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, title: args.title, mediaUrl: args.mediaUrl, inventoryQty: args.inventoryQty, evidenceReadAt: args.readAt, priceUsd: args.priceUsd, cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, landedCostUsd: economics.landedCostUsd, contributionMarginPct: economics.contributionMarginPct, published: false },
       rationale: "Verified CJ evidence and server-derived contribution economics cleared the sourcing policy. Human approval can create one Shopify DRAFT only.", proposedAt: Date.now(),
     });
     await ctx.db.insert("sourceSelections", { siteId: args.siteId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, priceUsd: args.priceUsd, evidenceId, productId, actionId, status: "pending_approval", approvalDispatchKey, approvalDispatchStatus: "pending", createdAt: Date.now() });

@@ -75,7 +75,9 @@ export const list = query({
       }
 
       for (const p of products) {
-        const m = p.contributionMarginPct ?? (p.priceUsd > 0 ? ((p.priceUsd - p.cogsUsd - p.shippingUsd) / p.priceUsd) * 100 : null);
+        // Synced Shopify rows retain zero placeholders for unknown supplier costs. Only the
+        // sourced-draft gate writes this field, so unknown costs cannot create an insight.
+        const m = p.contributionMarginPct ?? null;
         if (m != null && (!bestMargin || m > bestMargin.margin)) bestMargin = { title: p.title, margin: m };
       }
     }

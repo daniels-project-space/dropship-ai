@@ -348,9 +348,9 @@ export const topProducts = query({
           .take(14);
         const views = metrics.reduce((sum, m) => sum + m.pageviews, 0);
         const latestCvr = metrics[0]?.cvr ?? 0;
-        const margin =
-          p.contributionMarginPct ??
-          (p.priceUsd > 0 ? ((p.priceUsd - p.cogsUsd - p.shippingUsd) / p.priceUsd) * 100 : null);
+        // No fallback arithmetic: synced Shopify rows have unknown supplier costs until a
+        // verified CJ evidence/quote record creates contributionMarginPct.
+        const margin = p.contributionMarginPct ?? null;
         rows.push({
           productId: p._id,
           title: p.title,

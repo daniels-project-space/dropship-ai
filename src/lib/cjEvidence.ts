@@ -14,6 +14,7 @@ export interface ParsedCjEvidence {
   fromCountryCode?: string;
   inventoryVerified: boolean;
   sourceUrl: string;
+  mediaUrl?: string;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -36,6 +37,17 @@ function string(value: unknown): string | undefined {
 function money(value: unknown): number | undefined {
   const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function httpsUrl(value: unknown): string | undefined {
+  const raw = string(value);
+  if (!raw) return undefined;
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function quantity(value: unknown): number {
@@ -84,6 +96,8 @@ export function parseCjEvidence(input: {
   const inventoryQty = usInventory.reduce((total, row) => total + quantity(row.totalInventoryNum ?? row.totalInventory ?? row.storageNum), 0);
   const inventoryVerified = usInventory.some((row) => row.verifiedWarehouse === 1 || row.verifiedWarehouse === "1");
   const freeShipping = product.isFreeShipping === true || product.addMarkStatus === 1 || product.addMarkStatus === "1";
+  const mediaUrl = httpsUrl(variant.variantImage ?? variant.variantImageUrl ?? listedVariant.variantImage ?? listedVariant.variantImageUrl)
+    ?? httpsUrl(product.productImage ?? product.productImageUrl ?? product.imageUrl ?? product.productImageSet);
   return {
     cjProductId: input.productId,
     cjVariantId: input.variantId,
@@ -95,5 +109,6 @@ export function parseCjEvidence(input: {
     ...(usInventory.length > 0 ? { fromCountryCode: "US" } : {}),
     inventoryVerified,
     sourceUrl: `https://developers.cjdropshipping.com/api2.0/v1/product/query?pid=${encodeURIComponent(input.productId)}`,
+    ...(mediaUrl ? { mediaUrl } : {}),
   };
 }

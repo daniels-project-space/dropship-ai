@@ -13,6 +13,7 @@ export interface VerifiedCjCostEvidence {
   shippingUsd?: number;
   fromUsWarehouse: boolean;
   inventoryVerified: boolean;
+  mediaUrl?: string;
 }
 
 /** The immutable CJ read fields required whenever a candidate can move state. */
@@ -55,6 +56,7 @@ export function evaluatePersistedCjEvidence(
   evidence: PersistedCjEvidence,
   policy: SourcedDraftPolicy,
 ): SourcedDraftGateResult {
+  if (!evidence.mediaUrl) return { eligible: false, reason: "CJ evidence has no verified product media" };
   let economics: LandedEconomics;
   try {
     economics = deriveCjEconomics(evidence, policy.priceUsd);

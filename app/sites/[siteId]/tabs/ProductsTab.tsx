@@ -8,7 +8,7 @@ import { DataTable, type Column } from "../../../components/ui/DataTable";
 import { Badge } from "../../../components/ui/Badge";
 import { Drawer } from "../../../components/ui/Drawer";
 import { Icon } from "../../../components/Icons";
-import { PRODUCT_STATUS, type ProductStatus, fmtUsd, contributionMargin } from "../../../components/tokens";
+import { PRODUCT_STATUS, type ProductStatus, fmtUsd } from "../../../components/tokens";
 
 type ProductRow = {
   _id: Id<"products">;
@@ -68,7 +68,7 @@ function ApprovedDraftImports({ siteId }: { siteId: Id<"sites"> }) {
 
 function ProductDrawer({ row, onClose }: { row: ProductRow | null; onClose: () => void }) {
   if (!row) return null;
-  const m = row.contributionMarginPct ?? contributionMargin(row.priceUsd, row.cogsUsd, row.shippingUsd);
+  const m = row.contributionMarginPct;
   const t = PRODUCT_STATUS[row.status];
   return (
     <Drawer open={!!row} onClose={onClose} eyebrow="Product" title={row.title}>
@@ -173,9 +173,9 @@ export function ProductsTab({ siteId }: { siteId: Id<"sites"> }) {
       header: "Margin",
       align: "right",
       sortable: true,
-      sortValue: (r) => r.contributionMarginPct ?? contributionMargin(r.priceUsd, r.cogsUsd, r.shippingUsd) ?? -1,
+      sortValue: (r) => r.contributionMarginPct ?? -1,
       render: (r) => {
-        const m = r.contributionMarginPct ?? contributionMargin(r.priceUsd, r.cogsUsd, r.shippingUsd);
+        const m = r.contributionMarginPct;
         if (m == null) return <span className="font-mono text-ink-faint">—</span>;
         const tone = m >= 70 ? "text-live" : m >= 50 ? "text-pending" : "text-danger";
         return <span className={`font-mono tabular-nums ${tone}`}>{m.toFixed(0)}%</span>;

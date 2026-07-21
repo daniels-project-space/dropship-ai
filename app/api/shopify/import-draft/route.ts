@@ -38,7 +38,10 @@ export async function POST(request: Request) {
       return { product, config: await resolveShopifyConfig(siteId) };
     },
     reserve: () => convex.mutation(api.products.reserveApprovedShopifyDraftImport, { siteId, productId, actionId, traceId }),
-    createDraft: (config, product) => productCreate(config, { title: product.title }),
+    createDraft: (config, product) => {
+      if (!product.cjVariantId || !product.sourceMediaUrl) throw new Error("Shopify draft import requires verified CJ variant and media");
+      return productCreate(config, { title: product.title, priceUsd: product.priceUsd, cjVariantId: product.cjVariantId, mediaUrl: product.sourceMediaUrl });
+    },
     complete: async (shopifyProductId, shopifyVariantId) => {
       await convex.mutation(api.products.completeApprovedShopifyDraftImport, { siteId, productId, actionId, traceId, shopifyProductId, shopifyVariantId });
     },

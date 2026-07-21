@@ -211,9 +211,9 @@ export async function listOrders(
 }
 
 const PRODUCT_CREATE = /* GraphQL */ `
-  mutation productCreate($product: ProductCreateInput!) {
-    productCreate(product: $product) {
-      product { id title handle variants(first: 1) { nodes { id } } }
+  mutation productCreate($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
+    productCreate(product: $product, media: $media) {
+      product { id title handle media(first: 1) { nodes { mediaContentType } } variants(first: 1) { nodes { id } } }
       userErrors { field message }
     }
   }
@@ -223,19 +223,56 @@ export interface ProductCreateInput {
   title: string;
   descriptionHtml?: string;
   vendor?: string;
+  /** Server-derived only. Shopify's initial variant gets this exact approved sell price. */
+  priceUsd: number;
+  /** Server-derived CJ VID, retained as Shopify SKU for exact order-lineage mapping. */
+  cjVariantId: string;
+  /** Exact HTTPS media URL from immutable CJ evidence. */
+  mediaUrl: string;
 }
+
+const PRODUCT_VARIANTS_BULK_UPDATE = /* GraphQL */ `
+  mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      productVariants { id price sku }
+      userErrors { field message }
+    }
+  }
+`;
 
 export async function productCreate(
   cfg: ShopifyClientConfig,
   input: ProductCreateInput,
 ): Promise<{ id: string; title: string; handle: string; variantId: string }> {
+  if (!Number.isFinite(input.priceUsd) || input.priceUsd <= 0) throw new Error("productCreate requires a positive verified price");
+  if (!input.cjVariantId.trim()) throw new Error("productCreate requires an exact CJ variant");
+  try {
+    const mediaUrl = new URL(input.mediaUrl);
+    if (mediaUrl.protocol !== "https:") throw new Error("not HTTPS");
+  } catch {
+    throw new Error("productCreate requires verified HTTPS media");
+  }
   const data = await graphql<{
-    productCreate: { product: { id: string; title: string; handle: string; variants: { nodes: Array<{ id: string }> } } | null; userErrors: Array<{ message: string }> };
-  }>(cfg, PRODUCT_CREATE, { product: { ...input, status: "DRAFT" } });
+    productCreate: { product: { id: string; title: string; handle: string; media: { nodes: Array<{ mediaContentType: string }> }; variants: { nodes: Array<{ id: string }> } } | null; userErrors: Array<{ message: string }> };
+  }>(cfg, PRODUCT_CREATE, {
+    product: { title: input.title, ...(input.descriptionHtml ? { descriptionHtml: input.descriptionHtml } : {}), ...(input.vendor ? { vendor: input.vendor } : {}), status: "DRAFT" },
+    media: [{ originalSource: input.mediaUrl, mediaContentType: "IMAGE" }],
+  });
   const { product, userErrors } = data.productCreate;
   const variantId = product?.variants.nodes[0]?.id;
-  if (userErrors.length || !product || !variantId) {
+  if (userErrors.length || !product || !variantId || !product.media.nodes.some((media) => media.mediaContentType === "IMAGE")) {
     throw new Error(`productCreate failed: ${userErrors.map((e) => e.message).join("; ") || "no product"}`);
+  }
+  const variants = await graphql<{
+    productVariantsBulkUpdate: { productVariants: Array<{ id: string; price: string; sku: string | null }>; userErrors: Array<{ message: string }> };
+  }>(cfg, PRODUCT_VARIANTS_BULK_UPDATE, {
+    productId: product.id,
+    variants: [{ id: variantId, price: input.priceUsd.toFixed(2), sku: input.cjVariantId }],
+  });
+  const updatedVariant = variants.productVariantsBulkUpdate.productVariants.find((candidate) => candidate.id === variantId);
+  if (variants.productVariantsBulkUpdate.userErrors.length || !updatedVariant
+    || Number(updatedVariant.price) !== Number(input.priceUsd.toFixed(2)) || updatedVariant.sku !== input.cjVariantId) {
+    throw new Error(`productVariantsBulkUpdate failed: ${variants.productVariantsBulkUpdate.userErrors.map((e) => e.message).join("; ") || "exact price/variant was not returned"}`);
   }
   return { id: product.id, title: product.title, handle: product.handle, variantId };
 }

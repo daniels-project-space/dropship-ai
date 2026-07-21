@@ -84,6 +84,7 @@ export default defineSchema({
     landedCostUsd: v.optional(v.number()),        // COGS + shipping + duty, computed by sourced-draft gate
     sourceVerifiedAt: v.optional(v.number()),     // CJ facts refreshed at this timestamp
     sourceUrl: v.optional(v.string()),            // read-only source evidence; never an affiliate click target
+    sourceMediaUrl: v.optional(v.string()),       // exact CJ image used only for a Shopify DRAFT
     priceUsd: v.number(),
     contributionMarginPct: v.optional(v.number()),// computed: after COGS+ship+duty+fees+refund+content
     status: v.union(v.literal("draft"), v.literal("active"), v.literal("archived"), v.literal("killed")),
@@ -105,6 +106,7 @@ export default defineSchema({
     fromCountryCode: v.optional(v.string()),
     inventoryVerified: v.boolean(),
     sourceUrl: v.string(),
+    mediaUrl: v.optional(v.string()),
     traceId: v.string(),
     readAt: v.number(),
   }).index("by_site_read_at", ["siteId", "readAt"])

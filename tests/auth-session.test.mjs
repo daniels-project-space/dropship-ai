@@ -14,6 +14,7 @@ import { POST as postShopifySync } from "../app/api/shopify/sync/route.ts";
 import { POST as postShopifyTestCheckout } from "../app/api/shopify/test-checkout/route.ts";
 import { POST as postShopifyDraftImport } from "../app/api/shopify/import-draft/route.ts";
 import { POST as postCjRefresh } from "../app/api/cj/refresh/route.ts";
+import { POST as postCjConnect } from "../app/api/cj/connect/route.ts";
 import { POST as postDiscover } from "../app/api/research/discover/route.ts";
 import { GET as getCjSearch } from "../app/api/research/cj-search/route.ts";
 import { POST as postSourceCj } from "../app/api/research/source-cj/route.ts";
@@ -94,6 +95,7 @@ test("every operator route independently rejects a forged session", async () => 
       postShopifyTestCheckout(post()),
       postShopifyDraftImport(post()),
       postCjRefresh(post()),
+      postCjConnect(post()),
       postDiscover(post()),
       getCjSearch(new Request("https://control.example/api/research/cj-search?q=widget", { headers: forgedHeaders })),
       postSourceCj(post()),

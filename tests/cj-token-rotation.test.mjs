@@ -1,0 +1,68 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { CjTokenCoordinator } from "../src/lib/cjTokenRotation.ts";
+
+function memoryStore(initial) {
+  let bundle = { ...initial };
+  return {
+    read: async () => ({ ...bundle }),
+    replace: async (expectedRefreshToken, next) => {
+      if (bundle.refreshToken !== expectedRefreshToken) return "conflict";
+      bundle = { ...next };
+      return "written";
+    },
+    snapshot: () => ({ ...bundle }),
+  };
+}
+
+test("authorization-code exchange persists the complete CJ bundle atomically before it is served", async () => {
+  const store = memoryStore({ accessToken: "old-access", refreshToken: "old-refresh" });
+  let codeCalls = 0;
+  const coordinator = new CjTokenCoordinator(store, async () => { throw new Error("not used"); }, async (code) => {
+    codeCalls++;
+    assert.equal(code, "authorization-code");
+    return { accessToken: "new-access", refreshToken: "new-refresh", accessTokenExpiryDate: "tomorrow" };
+  });
+  assert.equal(await coordinator.exchangeAuthorizationCode("authorization-code"), "new-access");
+  assert.equal(codeCalls, 1);
+  assert.deepEqual(store.snapshot(), { accessToken: "new-access", refreshToken: "new-refresh", accessTokenExpiryDate: "tomorrow" });
+});
+
+test("a restarted worker reads the persisted rotated CJ pair rather than stale process memory", async () => {
+  const store = memoryStore({ accessToken: "old-access", refreshToken: "old-refresh" });
+  const first = new CjTokenCoordinator(store, async () => ({ accessToken: "rotated-access", refreshToken: "rotated-refresh" }), async () => { throw new Error("not used"); });
+  assert.equal(await first.refreshAccessToken(), "rotated-access");
+  const restarted = new CjTokenCoordinator(store, async () => { throw new Error("not used"); }, async () => { throw new Error("not used"); });
+  assert.equal(await restarted.getAccessToken(), "rotated-access");
+});
+
+test("concurrent 401 refreshes issue one CJ refresh and all callers converge on the atomically written pair", async () => {
+  const store = memoryStore({ accessToken: "old-access", refreshToken: "old-refresh" });
+  let refreshCalls = 0;
+  const coordinator = new CjTokenCoordinator(store, async () => {
+    refreshCalls++;
+    await Promise.resolve();
+    return { accessToken: "rotated-access", refreshToken: "rotated-refresh" };
+  }, async () => { throw new Error("not used"); });
+  assert.deepEqual(await Promise.all([coordinator.refreshAccessToken(), coordinator.refreshAccessToken(), coordinator.refreshAccessToken()]), ["rotated-access", "rotated-access", "rotated-access"]);
+  assert.equal(refreshCalls, 1);
+  assert.deepEqual(store.snapshot(), { accessToken: "rotated-access", refreshToken: "rotated-refresh" });
+});
+
+test("a compare-and-swap conflict reloads the winning persisted pair without a second refresh", async () => {
+  const store = memoryStore({ accessToken: "old-access", refreshToken: "old-refresh" });
+  let refreshCalls = 0;
+  const conflictingStore = {
+    read: store.read,
+    replace: async () => {
+      await store.replace("old-refresh", { accessToken: "other-access", refreshToken: "other-refresh" });
+      return "conflict";
+    },
+  };
+  const coordinator = new CjTokenCoordinator(conflictingStore, async () => {
+    refreshCalls++;
+    return { accessToken: "lost-access", refreshToken: "lost-refresh" };
+  }, async () => { throw new Error("not used"); });
+  assert.equal(await coordinator.refreshAccessToken(), "other-access");
+  assert.equal(refreshCalls, 1);
+});

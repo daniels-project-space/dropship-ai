@@ -77,7 +77,7 @@ test("CJ evidence is parsed from a verified US variant and unknown shipping neve
   const evidence = parseCjEvidence({
     productId: "product-1",
     variantId: "variant-1",
-    product: { productNameEn: "Verified widget", isFreeShipping: true },
+    product: { productNameEn: "Verified widget", isFreeShipping: true, productImage: "https://images.example/widget.jpg" },
     variants: [{ vid: "variant-1", variantSellPrice: "12.50" }],
     inventory: [],
     variant: { vid: "variant-1", variantSellPrice: "12.50" },
@@ -94,6 +94,7 @@ test("CJ evidence is parsed from a verified US variant and unknown shipping neve
     fromCountryCode: "US",
     inventoryVerified: true,
     sourceUrl: "https://developers.cjdropshipping.com/api2.0/v1/product/query?pid=product-1",
+    mediaUrl: "https://images.example/widget.jpg",
   });
   const unknownShipping = parseCjEvidence({
     productId: "product-2", variantId: "variant-2", product: { productNameEn: "No shipping quote" }, variants: [], inventory: [], variant: { variantSellPrice: 2 }, variantInventory: [{ countryCode: "US", totalInventoryNum: 1, verifiedWarehouse: 1 }],
@@ -129,6 +130,7 @@ test("persisted CJ evidence is rechecked when a draft is activated or imported",
     inventoryQty: 7,
     fromUsWarehouse: true,
     inventoryVerified: true,
+    mediaUrl: "https://images.example/widget.jpg",
     readAt: 1_000,
   };
   const policy = { priceUsd: 100, minimumPriceUsd: 50, minimumMarginPct: 60, now: 1_100 };
@@ -144,4 +146,5 @@ test("persisted CJ evidence is rechecked when a draft is activated or imported",
   const belowMargin = evaluatePersistedCjEvidence({ ...evidence, cogsUsd: 90 }, policy);
   assert.equal(belowMargin.eligible, false);
   assert.equal(belowMargin.reason, "contribution margin is below the site's floor");
+  assert.match(evaluatePersistedCjEvidence({ ...evidence, mediaUrl: undefined }, policy).reason, /no verified product media/);
 });

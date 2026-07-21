@@ -1,29 +1,45 @@
 // Server-only CJ Dropshipping API v2 adapter. Product, variant, and inventory calls here are
 // read-only. The only write-capable function remains createOrder(), which deliberately uses
 // payType:3 (create-only) and is isolated in the fulfilment worker.
-import { getKey } from "./vault";
+import { assertCjTokenBundleWriterConfigured, getKey, replaceCjTokenBundleAtomically } from "./vault";
 import { CjStagingFailureError } from "./cjStagingState";
+import { CjTokenCoordinator, type CjTokenBundle } from "./cjTokenRotation";
 
 const CJ_BASE = "https://developers.cjdropshipping.com/api2.0/v1";
 
-type CjTokenBundle = { accessToken: string; refreshToken?: string; accessTokenExpiryDate?: string; refreshTokenExpiryDate?: string };
-let activeTokens: CjTokenBundle | null = null;
-let refreshInFlight: Promise<string> | null = null;
-
 async function readTokenBundle(): Promise<CjTokenBundle> {
-  const [vaultAccess, vaultRefresh] = await Promise.all([
+  const [vaultAccess, vaultRefresh, vaultAccessExpiry, vaultRefreshExpiry] = await Promise.all([
     getKey("cj", "CJ_ACCESS_TOKEN").catch(() => null),
     getKey("cj", "CJ_REFRESH_TOKEN").catch(() => null),
+    getKey("cj", "CJ_ACCESS_TOKEN_EXPIRY_DATE").catch(() => null),
+    getKey("cj", "CJ_REFRESH_TOKEN_EXPIRY_DATE").catch(() => null),
   ]);
   const accessToken = vaultAccess ?? process.env.CJ_ACCESS_TOKEN;
   const refreshToken = vaultRefresh ?? process.env.CJ_REFRESH_TOKEN;
   if (!accessToken) throw new Error("cj: no access token — add CJ_ACCESS_TOKEN to the server vault/control plane");
-  return { accessToken, refreshToken };
+  return {
+    accessToken,
+    ...(refreshToken ? { refreshToken } : {}),
+    ...(vaultAccessExpiry ?? process.env.CJ_ACCESS_TOKEN_EXPIRY_DATE ? { accessTokenExpiryDate: vaultAccessExpiry ?? process.env.CJ_ACCESS_TOKEN_EXPIRY_DATE } : {}),
+    ...(vaultRefreshExpiry ?? process.env.CJ_REFRESH_TOKEN_EXPIRY_DATE ? { refreshTokenExpiryDate: vaultRefreshExpiry ?? process.env.CJ_REFRESH_TOKEN_EXPIRY_DATE } : {}),
+  };
+}
+
+let tokenCoordinator: CjTokenCoordinator | null = null;
+
+function cjTokens(): CjTokenCoordinator {
+  if (!tokenCoordinator) {
+    tokenCoordinator = new CjTokenCoordinator(
+      { read: readTokenBundle, replace: replaceCjTokenBundleAtomically },
+      refreshAccessToken,
+      exchangeAuthorizationCode,
+    );
+  }
+  return tokenCoordinator;
 }
 
 export async function getAccessToken(): Promise<string> {
-  if (!activeTokens) activeTokens = await readTokenBundle();
-  return activeTokens.accessToken;
+  return cjTokens().getAccessToken();
 }
 
 export class CjApiError extends Error {
@@ -109,25 +125,35 @@ export async function refreshAccessToken(refreshToken: string): Promise<CjAccess
   return json.data;
 }
 
+/** Exchange a CJ authorization code; persistence is handled by the atomic bundle coordinator. */
+export async function exchangeAuthorizationCode(authorizationCode: string): Promise<CjAccessTokens> {
+  if (!authorizationCode.trim()) throw new Error("cj: authorizationCode is required");
+  const res = await fetch(`${CJ_BASE}/authentication/getAccessToken`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ authorizationCode }),
+    cache: "no-store",
+  });
+  const json = (await res.json()) as { result?: boolean; success?: boolean; message?: string; data?: CjAccessTokens };
+  if (!res.ok || json.result === false || json.success === false || !json.data?.accessToken || !json.data.refreshToken) {
+    throw new Error(`cj /authentication/getAccessToken failed: HTTP ${res.status} ${json.message ?? "invalid response"}`);
+  }
+  return json.data;
+}
+
 /**
- * Refresh is disabled unless the deployment supplies an atomic control-plane token-bundle
- * writer. Keeping a newly issued pair only in process memory loses CJ's rotated refresh token
- * on restart, so that would turn a transient 401 into an unrecoverable outage. This repository
- * has a read-only vault client; fail closed until its writer capability is attached.
+ * CJ rotates refresh tokens. The coordinator first persists the entire returned pair with an
+ * atomic compare-and-swap and only then replaces this process's token cache.
  */
 export async function refreshCurrentAccessToken(): Promise<string> {
-  if (refreshInFlight) return refreshInFlight;
-  refreshInFlight = (async () => {
-    // There is currently no scoped writer in this app. Do this check before contacting CJ: a
-    // refresh response invalidates the old refresh token and must be stored atomically with its
-    // new access token by the control plane.
-    throw new Error("cj: automatic token refresh is blocked: atomic control-plane token-bundle writer is not installed");
-  })();
-  try {
-    return await refreshInFlight;
-  } finally {
-    refreshInFlight = null;
-  }
+  assertCjTokenBundleWriterConfigured();
+  return cjTokens().refreshAccessToken();
+}
+
+/** Operator-controlled initial CJ connection. It never returns either credential to the browser. */
+export async function persistAuthorizationCodeExchange(authorizationCode: string): Promise<string> {
+  assertCjTokenBundleWriterConfigured();
+  return cjTokens().exchangeAuthorizationCode(authorizationCode);
 }
 
 export interface CjOrderLine {
