@@ -26,8 +26,10 @@ export const fulfillOrder = task({
       claimTarget: ({ target, owner }) => convex.mutation(api.ops.claimTarget, { target, owner, leaseMs: 10 * 60_000 }),
       markOutbox: async ({ outboxId, status, error, detail }) => { await convex.mutation(api.ops.markOutbox, { outboxId: outboxId as Id<"outbox">, status, ...(error ? { error } : {}), ...(detail ? { detail } : {}) }); },
       createSandboxOrder: (input) => createSandboxOrder(input as Parameters<typeof createSandboxOrder>[0]),
-      markDispatched: async ({ orderId, cjOrderId, receipt }) => convex.mutation(api.orders.markSandboxCjDispatched, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, cjOrderId, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
-      markAmbiguous: async ({ orderId, reason, receipt }) => convex.mutation(api.orders.markSandboxCjAmbiguous, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, reason, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      markDispatched: async ({ orderId, outboxId, cjOrderId, receipt }) => convex.mutation(api.orders.markSandboxCjDispatched, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, outboxId: outboxId as Id<"outbox">, cjOrderId, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      markAmbiguous: async ({ orderId, outboxId, reason, receipt }) => convex.mutation(api.orders.markSandboxCjAmbiguous, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, outboxId: outboxId as Id<"outbox">, reason, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      abortBeforeProvider: async ({ orderId, outboxId, reason, receipt }) => convex.mutation(api.orders.abortSandboxCjDispatchBeforeProvider, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, ...(outboxId ? { outboxId: outboxId as Id<"outbox"> } : {}), reason, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      repairDispatched: async ({ orderId }) => convex.mutation(api.orders.repairSandboxCjDispatchOutbox, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> }) as any,
       releaseTarget: async ({ target, owner }) => { await convex.mutation(api.ops.releaseTarget, { target, owner }); },
       isAmbiguousWriteError: isAmbiguousCjWriteError,
     });

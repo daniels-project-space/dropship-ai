@@ -5,6 +5,32 @@ import { v } from "convex/values";
 
 const outboxStatus = v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed"));
 
+/** Compare an idempotent request by value, not by its caller-controlled key alone. */
+function canonicalValue(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("outbox payload must contain finite numbers");
+    return String(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalValue).join(",")}]`;
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalValue(record[key])}`).join(",")}}`;
+  }
+  throw new Error("outbox payload must be JSON data");
+}
+
+function hasExactOutboxBinding(existing: any, incoming: { siteId: unknown; kind: string; target: string; idempotencyKey: string; traceId: string; payload: unknown }) {
+  return existing.siteId === incoming.siteId
+    && existing.kind === incoming.kind
+    && existing.target === incoming.target
+    && existing.idempotencyKey === incoming.idempotencyKey
+    && existing.traceId === incoming.traceId
+    && canonicalValue(existing.payload) === canonicalValue(incoming.payload);
+}
+
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }) {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: operations runtime requires the service identity");
 }
@@ -48,7 +74,11 @@ export const enqueue = mutation({
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const existing = await ctx.db.query("outbox").withIndex("by_idempotency_key", (q) => q.eq("idempotencyKey", args.idempotencyKey)).first();
-    if (existing) return { outboxId: existing._id, duplicate: true, status: existing.status };
+    // A key collision with different immutable inputs is a binding violation, not a replay.
+    if (existing) {
+      if (!hasExactOutboxBinding(existing, args)) throw new Error("outbox idempotency key is already bound to different immutable input");
+      return { outboxId: existing._id, duplicate: true, status: existing.status };
+    }
     const now = Date.now();
     const outboxId = await ctx.db.insert("outbox", { ...args, status: "pending", attempts: 0, availableAt: now, createdAt: now });
     await ctx.db.insert("traces", { traceId: args.traceId, siteId: args.siteId, operation: args.kind, target: args.target, idempotencyKey: args.idempotencyKey, status: "started", detail: {}, startedAt: now });

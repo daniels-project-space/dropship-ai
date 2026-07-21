@@ -20,6 +20,8 @@ function harness(claims = [reserved], overrides = {}) {
       createSandboxOrder: async (input) => { calls.push(["create", input]); return { orderId: "cj-1" }; },
       markDispatched: async (input) => { calls.push(["complete", input]); },
       markAmbiguous: async (input) => { calls.push(["ambiguous", input]); },
+      abortBeforeProvider: async (input) => { calls.push(["abort", input]); },
+      repairDispatched: async (input) => { calls.push(["repair", input]); },
       releaseTarget: async (input) => { calls.push(["release", input]); },
       isAmbiguousWriteError: () => true,
       ...overrides,
@@ -30,11 +32,11 @@ function harness(claims = [reserved], overrides = {}) {
 test("actual Trigger executor claims once before its only CJ create call and duplicate replay has no provider effect", async () => {
   const first = harness();
   await executeSandboxCjDispatch(first.deps);
-  assert.deepEqual(first.calls.map((entry) => Array.isArray(entry) ? entry[0] : entry), ["claim", "enqueue", "lock", "outbox", "create", "complete", "outbox", "release"]);
+  assert.deepEqual(first.calls.map((entry) => Array.isArray(entry) ? entry[0] : entry), ["claim", "enqueue", "lock", "outbox", "create", "complete", "release"]);
   const duplicate = harness([{ state: "reused", orderId: "order-1", orderNumber: "dsa-sb-1", cjOrderId: "cj-1" }]);
   const result = await executeSandboxCjDispatch(duplicate.deps);
   assert.equal(result.skipped, true);
-  assert.deepEqual(duplicate.calls, ["claim"]);
+  assert.deepEqual(duplicate.calls, ["claim", ["repair", { orderId: "order-1" }]]);
 });
 
 test("ambiguous CJ response requires a read reconciliation; found completes without another create", async () => {
@@ -58,16 +60,31 @@ test("an absent reconciliation never creates again while provider reads can be e
   assert.equal(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "release").length, 1);
 });
 
-test("post-completion outbox failure does not regress the completed dispatch or issue another provider call", async () => {
-  let completed = false;
+test("a lost terminal mutation response is repaired from the provider result without another CJ call", async () => {
+  let completes = 0;
   const run = harness([reserved], {
-    markDispatched: async () => { completed = true; run.calls.push("complete"); },
-    markOutbox: async (input) => { run.calls.push(["outbox", input]); if (input.status === "delivered") throw new Error("outbox unavailable"); },
+    markDispatched: async () => {
+      completes++;
+      run.calls.push("complete");
+      if (completes === 1) throw new Error("terminal response lost");
+    },
   });
-  await assert.rejects(() => executeSandboxCjDispatch(run.deps), /outbox unavailable/);
-  assert.equal(completed, true);
+  const result = await executeSandboxCjDispatch(run.deps);
+  assert.equal(result.cjOrderId, "cj-1");
+  assert.equal(completes, 2);
   assert.equal(run.calls.some((entry) => Array.isArray(entry) && entry[0] === "ambiguous"), false);
   assert.equal(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "create").length, 1);
+});
+
+test("enqueue and processing failures release the reservation before any CJ call", async () => {
+  const enqueueFailed = harness([reserved], { enqueue: async () => { throw new Error("outbox unavailable"); } });
+  await assert.rejects(() => executeSandboxCjDispatch(enqueueFailed.deps), /outbox unavailable/);
+  assert.equal(enqueueFailed.calls.some((entry) => Array.isArray(entry) && entry[0] === "abort"), true);
+  assert.equal(enqueueFailed.calls.some((entry) => Array.isArray(entry) && entry[0] === "create"), false);
+  const processingFailed = harness([reserved], { markOutbox: async () => { throw new Error("processing unavailable"); } });
+  await assert.rejects(() => executeSandboxCjDispatch(processingFailed.deps), /processing unavailable/);
+  assert.equal(processingFailed.calls.some((entry) => Array.isArray(entry) && entry[0] === "abort"), true);
+  assert.equal(processingFailed.calls.some((entry) => Array.isArray(entry) && entry[0] === "create"), false);
 });
 
 test("a claim or lock failure makes no real-effects call", async () => {
@@ -77,4 +94,5 @@ test("a claim or lock failure makes no real-effects call", async () => {
   const locked = harness([reserved], { claimTarget: async () => ({ acquired: false }) });
   await assert.rejects(() => executeSandboxCjDispatch(locked.deps), /locked/);
   assert.equal(locked.calls.some((entry) => Array.isArray(entry) && entry[0] === "create"), false);
+  assert.equal(locked.calls.some((entry) => Array.isArray(entry) && entry[0] === "abort"), true);
 });

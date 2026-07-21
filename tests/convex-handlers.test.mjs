@@ -47,6 +47,17 @@ async function seedApprovedDispatch(t) {
   });
 }
 
+async function enqueueDispatch(t, claim) {
+  return service(t).mutation(api.ops.enqueue, {
+    siteId: claim.siteId,
+    kind: "cj.sandbox.create_order",
+    target: `cj:sandbox:${claim.orderId}`,
+    idempotencyKey: `cj:sandbox:create:${claim.orderId}:${claim.inputHash}:${claim.attempt}`,
+    traceId: `cj:sandbox:create:${claim.orderId}:${claim.inputHash}:${claim.attempt}`,
+    payload: { actionId: claim.receipt.actionId, orderId: claim.orderId, orderNumber: claim.orderNumber, inputHash: claim.inputHash, isSandbox: 1, payType: 3 },
+  });
+}
+
 test("Convex handlers reject anonymous service calls and due index returns only oldest due rows", async () => {
   const t = convexTest({ schema, modules });
   await assert.rejects(() => t.query(api.orders.listDueCjStagingIntents, { limit: 25 }), /UNAUTHENTICATED/);
@@ -111,16 +122,17 @@ test("Convex rollout is resumable and completion stops legacy status fan-out", a
 
 test("final CJ provider writers reject stale immutable reservation receipts", async () => {
   const t = convexTest({ schema, modules });
-  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const { siteId, orderId, actionId } = await seedApprovedDispatch(t);
   await assert.rejects(() => t.mutation(api.orders.claimSandboxCjDispatch, { actionId }), /UNAUTHENTICATED/);
   const claim = await service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId });
   assert.equal(claim.state, "reserved");
   assert.equal(claim.receipt.attempt, 1);
+  const outboxId = await t.run((ctx) => ctx.db.insert("outbox", { siteId, kind: "test", target: "test", idempotencyKey: "test", traceId: "test", payload: {}, status: "pending", attempts: 0, availableAt: 1, createdAt: 1 }));
   // Simulate a newer reservation after reconciliation. A late worker from attempt 1 may not
   // mark success, ambiguity, or reconciliation on attempt 2.
   await t.run((ctx) => ctx.db.patch(orderId, { cjDispatchAttempt: 2 }));
-  const complete = await service(t).mutation(api.orders.markSandboxCjDispatched, { actionId, orderId, cjOrderId: "cj-old", receipt: claim.receipt });
-  const ambiguous = await service(t).mutation(api.orders.markSandboxCjAmbiguous, { actionId, orderId, reason: "lost", receipt: claim.receipt });
+  const complete = await service(t).mutation(api.orders.markSandboxCjDispatched, { actionId, orderId, outboxId, cjOrderId: "cj-old", receipt: claim.receipt });
+  const ambiguous = await service(t).mutation(api.orders.markSandboxCjAmbiguous, { actionId, orderId, outboxId, reason: "lost", receipt: claim.receipt });
   const reconcile = await service(t).mutation(api.orders.reconcileSandboxCjDispatch, { actionId, orderId, receipt: claim.receipt });
   assert.equal(complete.ignored, true);
   assert.equal(ambiguous.ignored, true);
@@ -128,6 +140,46 @@ test("final CJ provider writers reject stale immutable reservation receipts", as
   const order = await t.run((ctx) => ctx.db.get(orderId));
   assert.equal(order.cjDispatchStatus, "reserved");
   assert.equal(order.cjOrderId, undefined);
+});
+
+test("CJ completion and replay atomically converge the exact outbox and trace", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const claim = await service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId });
+  const queued = await enqueueDispatch(t, claim);
+  await service(t).mutation(api.orders.markSandboxCjDispatched, { actionId, orderId, outboxId: queued.outboxId, cjOrderId: "cj-1", receipt: claim.receipt });
+  let order = await t.run((ctx) => ctx.db.get(orderId));
+  let action = await t.run((ctx) => ctx.db.get(actionId));
+  let outbox = await t.run((ctx) => ctx.db.get(queued.outboxId));
+  let trace = await t.run((ctx) => ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", outbox.traceId)).first());
+  assert.equal(order.cjDispatchStatus, "sent");
+  assert.equal(action.status, "executed");
+  assert.equal(outbox.status, "delivered");
+  assert.equal(trace.status, "succeeded");
+  // A retry after a lost response repairs stale local receipts and never needs another CJ call.
+  await t.run(async (ctx) => { await ctx.db.patch(queued.outboxId, { status: "failed", lastError: "stale" }); await ctx.db.patch(trace._id, { status: "failed", detail: { code: "stale" } }); });
+  assert.deepEqual(await service(t).mutation(api.orders.repairSandboxCjDispatchOutbox, { actionId, orderId }), { repaired: true });
+  outbox = await t.run((ctx) => ctx.db.get(queued.outboxId));
+  trace = await t.run((ctx) => ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", outbox.traceId)).first());
+  assert.equal(outbox.status, "delivered");
+  assert.equal(trace.status, "succeeded");
+});
+
+test("pre-provider abort releases only its matching reservation and records a terminal failure", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const claim = await service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId });
+  const queued = await enqueueDispatch(t, claim);
+  assert.deepEqual(await service(t).mutation(api.orders.abortSandboxCjDispatchBeforeProvider, { actionId, orderId, outboxId: queued.outboxId, reason: "outbox_processing_failed", receipt: claim.receipt }), { ignored: false });
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  const outbox = await t.run((ctx) => ctx.db.get(queued.outboxId));
+  const lock = await t.run((ctx) => ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", `cj:sandbox:${orderId}`)).first());
+  assert.equal(order.cjDispatchStatus, "staged");
+  assert.equal(outbox.status, "failed");
+  assert.equal(lock, null);
+  const retry = await service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId });
+  assert.equal(retry.state, "reserved");
+  assert.equal(retry.attempt, 2);
 });
 
 test("provider intake and tracking handlers require the service identity", async () => {
@@ -154,6 +206,7 @@ test("provider intake and runtime primitives reject anonymous and operator ident
   ];
   for (const call of calls) await assert.rejects(call, /UNAUTHENTICATED/);
   const queued = await service(t).mutation(api.ops.enqueue, { siteId, kind: "test", target: "target", idempotencyKey: "key", traceId: "trace", payload: {} });
+  await assert.rejects(() => service(t).mutation(api.ops.enqueue, { siteId, kind: "test", target: "different-target", idempotencyKey: "key", traceId: "trace", payload: {} }), /different immutable input/);
   await assert.rejects(() => operator.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed" }), /UNAUTHENTICATED/);
   await assert.rejects(() => operator.mutation(api.ops.releaseTarget, { target: "target", owner: "owner" }), /UNAUTHENTICATED/);
   assert.equal((await service(t).mutation(api.ops.claimTarget, { target: "target", owner: "owner" })).acquired, true);

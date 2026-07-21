@@ -24,6 +24,50 @@ const cjOrderInput = v.object({
 const shopifyLine = v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() });
 const sandboxDispatchReceipt = v.object({ actionId: v.id("actions"), orderId: v.id("orders"), inputHash: v.string(), generation: v.number(), generationFingerprint: v.string(), attempt: v.number() });
 
+function sandboxOutboxBinding(order: any, actionId: any, attempt = order.cjDispatchAttempt) {
+  const target = `cj:sandbox:${order._id}`;
+  const idempotencyKey = `cj:sandbox:create:${order._id}:${order.cjOrderInputHash}:${attempt}`;
+  return {
+    target,
+    idempotencyKey,
+    traceId: idempotencyKey,
+    payload: { actionId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, inputHash: order.cjOrderInputHash, isSandbox: 1, payType: 3 },
+  };
+}
+
+function hasSandboxOutboxBinding(outbox: any, order: any, actionId: any) {
+  const expected = sandboxOutboxBinding(order, actionId);
+  const payload = outbox?.payload as Record<string, unknown> | undefined;
+  return !!outbox && outbox.siteId === order.siteId && outbox.kind === "cj.sandbox.create_order"
+    && outbox.target === expected.target && outbox.idempotencyKey === expected.idempotencyKey
+    && outbox.traceId === expected.traceId && payload?.actionId === actionId && payload?.orderId === order._id
+    && payload?.orderNumber === order.cjOrderInput.orderNumber && payload?.inputHash === order.cjOrderInputHash
+    && payload?.isSandbox === 1 && payload?.payType === 3;
+}
+
+/** Keep the CJ order/action and its outbox/trace terminal state in one Convex transaction. */
+async function settleSandboxDispatchOutbox(ctx: any, input: { order: any; actionId: any; outboxId?: any; status: "delivered" | "failed"; cjOrderId?: string; error?: string }) {
+  const expected = sandboxOutboxBinding(input.order, input.actionId);
+  let outbox = input.outboxId ? await ctx.db.get(input.outboxId) : await ctx.db.query("outbox").withIndex("by_idempotency_key", (q: any) => q.eq("idempotencyKey", expected.idempotencyKey)).first();
+  if (outbox && !hasSandboxOutboxBinding(outbox, input.order, input.actionId)) throw new Error("sandbox dispatch outbox binding is invalid");
+  const now = Date.now();
+  const detail = input.status === "delivered"
+    ? { orderId: input.order._id, cjOrderId: input.cjOrderId, isSandbox: 1, payType: 3, zeroCharge: true }
+    : { reconciliationRequired: true, code: input.error ?? "provider_response_ambiguous" };
+  if (!outbox) {
+    // A prior completion may have committed while the worker lost its enqueue response. Rebuild
+    // the exact non-PII receipt from the immutable order generation instead of issuing CJ again.
+    const outboxId = await ctx.db.insert("outbox", { siteId: input.order.siteId, kind: "cj.sandbox.create_order", target: expected.target, idempotencyKey: expected.idempotencyKey, traceId: expected.traceId, payload: expected.payload, status: input.status, attempts: 1, availableAt: now, ...(input.status === "delivered" ? { deliveredAt: now } : { lastError: input.error ?? "CJ response ambiguous; reconciliation required before retry" }), createdAt: now });
+    outbox = await ctx.db.get(outboxId);
+  } else {
+    await ctx.db.patch(outbox._id, { status: input.status, ...(input.status === "delivered" ? { deliveredAt: now, lastError: undefined } : { lastError: input.error ?? "CJ response ambiguous; reconciliation required before retry" }) });
+  }
+  const trace = await ctx.db.query("traces").withIndex("by_trace_id", (q: any) => q.eq("traceId", expected.traceId)).first();
+  if (trace && (trace.siteId !== input.order.siteId || trace.operation !== "cj.sandbox.create_order" || trace.target !== expected.target || trace.idempotencyKey !== expected.idempotencyKey)) throw new Error("sandbox dispatch trace binding is invalid");
+  if (trace) await ctx.db.patch(trace._id, { status: input.status === "delivered" ? "succeeded" : "failed", detail, finishedAt: now });
+  else await ctx.db.insert("traces", { traceId: expected.traceId, siteId: input.order.siteId, operation: "cj.sandbox.create_order", target: expected.target, idempotencyKey: expected.idempotencyKey, status: input.status === "delivered" ? "succeeded" : "failed", detail, startedAt: now, finishedAt: now });
+}
+
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: sandbox dispatch requires the service runtime");
 }
@@ -528,33 +572,74 @@ export const claimSandboxCjDispatch = mutation({
 });
 
 export const markSandboxCjDispatched = mutation({
-  args: { actionId: v.id("actions"), orderId: v.id("orders"), cjOrderId: v.string(), receipt: sandboxDispatchReceipt },
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), outboxId: v.id("outbox"), cjOrderId: v.string(), receipt: sandboxDispatchReceipt },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const order = await ctx.db.get(args.orderId);
     const action = await ctx.db.get(args.actionId);
     if (!order || !action || order.cjApprovalActionId !== args.actionId || !hasCurrentSandboxCjDispatchReceipt({ ...args, action, order })) return { ignored: true as const };
-    if (order.cjDispatchStatus === "sent" && action.status === "executed" && order.cjOrderId === args.cjOrderId) return { orderId: order._id, reused: true };
+    if (order.cjDispatchStatus === "sent" && action.status === "executed" && order.cjOrderId === args.cjOrderId) {
+      await settleSandboxDispatchOutbox(ctx, { order, actionId: args.actionId, outboxId: args.outboxId, status: "delivered", cjOrderId: args.cjOrderId });
+      return { orderId: order._id, reused: true };
+    }
     if (action.status !== "approved" || order.cjDispatchStatus !== "reserved") throw new Error("sandbox dispatch completion is not authorized");
     await ctx.db.patch(order._id, { cjOrderId: args.cjOrderId, cjOrderNumber: order.cjOrderInput?.orderNumber, cjDispatchStatus: "sent", fulfillmentStatus: "sent_to_cj" });
     await ctx.db.patch(action._id, { status: "executed", resolvedAt: Date.now() });
+    await settleSandboxDispatchOutbox(ctx, { order, actionId: args.actionId, outboxId: args.outboxId, status: "delivered", cjOrderId: args.cjOrderId });
     await appendAudit(ctx, { siteId: order.siteId, actionId: action._id, event: "cj_sandbox_dispatch_sent", detail: { orderId: order._id, isSandbox: 1, payType: 3 } });
     return { orderId: order._id, reused: false };
   },
 });
 
 export const markSandboxCjAmbiguous = mutation({
-  args: { actionId: v.id("actions"), orderId: v.id("orders"), reason: v.string(), receipt: sandboxDispatchReceipt },
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), outboxId: v.id("outbox"), reason: v.string(), receipt: sandboxDispatchReceipt },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const order = await ctx.db.get(args.orderId);
     const action = await ctx.db.get(args.actionId);
     if (!order || !action || order.cjApprovalActionId !== args.actionId || !hasCurrentSandboxCjDispatchReceipt({ ...args, action, order })) return { ignored: true as const };
-    if (order.cjDispatchStatus === "sent") return { orderId: order._id, reused: true };
+    if (order.cjDispatchStatus === "sent") {
+      await settleSandboxDispatchOutbox(ctx, { order, actionId: args.actionId, outboxId: args.outboxId, status: "delivered", cjOrderId: order.cjOrderId });
+      return { orderId: order._id, reused: true };
+    }
     if (order.cjDispatchStatus !== "reserved") throw new Error("sandbox dispatch ambiguity is not authorized");
     await ctx.db.patch(order._id, { cjDispatchStatus: "ambiguous" });
+    await settleSandboxDispatchOutbox(ctx, { order, actionId: args.actionId, outboxId: args.outboxId, status: "failed", error: "provider_response_ambiguous" });
     await appendAudit(ctx, { siteId: order.siteId, actionId: args.actionId, event: "cj_sandbox_dispatch_ambiguous", detail: { orderId: order._id, reconciliationRequired: true } });
     return { orderId: order._id, reused: false };
+  },
+});
+
+/** A failure before the CJ request starts releases this exact reservation for a fresh attempt. */
+export const abortSandboxCjDispatchBeforeProvider = mutation({
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), outboxId: v.optional(v.id("outbox")), reason: v.string(), receipt: sandboxDispatchReceipt },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const order = await ctx.db.get(args.orderId);
+    const action = await ctx.db.get(args.actionId);
+    if (!order || !action || order.cjApprovalActionId !== args.actionId || !hasCurrentSandboxCjDispatchReceipt({ ...args, action, order })) return { ignored: true as const };
+    if (order.cjDispatchStatus !== "reserved" || action.status !== "approved") return { ignored: true as const };
+    const expected = sandboxOutboxBinding(order, args.actionId);
+    const lock = await ctx.db.query("targetLocks").withIndex("by_target", (q: any) => q.eq("target", expected.target)).first();
+    if (lock?.owner === expected.idempotencyKey) await ctx.db.delete(lock._id);
+    await ctx.db.patch(order._id, { cjDispatchStatus: "staged" });
+    if (args.outboxId) await settleSandboxDispatchOutbox(ctx, { order, actionId: args.actionId, outboxId: args.outboxId, status: "failed", error: args.reason });
+    await appendAudit(ctx, { siteId: order.siteId, actionId: args.actionId, event: "cj_sandbox_dispatch_pre_provider_failed", detail: { orderId: order._id, code: args.reason } });
+    return { ignored: false as const };
+  },
+});
+
+/** Replays of a sent action repair its terminal receipt without a second provider request. */
+export const repairSandboxCjDispatchOutbox = mutation({
+  args: { actionId: v.id("actions"), orderId: v.id("orders") },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const order = await ctx.db.get(args.orderId);
+    const action = await ctx.db.get(args.actionId);
+    if (!order || !action || order.cjApprovalActionId !== args.actionId || !hasValidSandboxCjApprovalBinding({ actionId: args.actionId, action, order })) return { ignored: true as const };
+    if (order.cjDispatchStatus !== "sent" || action.status !== "executed" || !order.cjOrderId) return { ignored: true as const };
+    await settleSandboxDispatchOutbox(ctx, { order, actionId: args.actionId, status: "delivered", cjOrderId: order.cjOrderId });
+    return { repaired: true as const };
   },
 });
 
@@ -571,6 +656,7 @@ export const reconcileSandboxCjDispatch = mutation({
     if (args.cjOrderId) {
       await ctx.db.patch(order._id, { cjOrderId: args.cjOrderId, cjOrderNumber: order.cjOrderInput.orderNumber, cjDispatchStatus: "sent", fulfillmentStatus: "sent_to_cj" });
       await ctx.db.patch(action._id, { status: "executed", resolvedAt: Date.now() });
+      await settleSandboxDispatchOutbox(ctx, { order, actionId: args.actionId, status: "delivered", cjOrderId: args.cjOrderId });
       await appendAudit(ctx, { siteId: order.siteId, actionId: args.actionId, event: "cj_sandbox_dispatch_reconciled", detail: { orderId: order._id, isSandbox: 1 } });
       return { state: "found" as const };
     }
