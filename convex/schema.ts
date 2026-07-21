@@ -183,6 +183,9 @@ export default defineSchema({
     siteId: v.id("sites"),
     shopifyOrderId: v.string(),
     cjOrderId: v.optional(v.string()),            // may arrive later (§C3: async)
+    // CJ's immutable custom order identity. This is distinct from Shopify's order id and is
+    // the only key accepted for CJ tracking/reconciliation.
+    cjOrderNumber: v.optional(v.string()),
     fulfillmentStatus: v.union(
       v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
     ),
@@ -206,11 +209,12 @@ export default defineSchema({
       products: v.array(v.object({ vid: v.string(), quantity: v.number() })),
     })),
     cjOrderInputHash: v.optional(v.string()),
+    cjDispatchAttempt: v.optional(v.number()),   // fenced reservation generation; never reused after a reconcile miss
     cjApprovalActionId: v.optional(v.id("actions")),
     cjDispatchStatus: v.optional(v.union(v.literal("staged"), v.literal("reserved"), v.literal("ambiguous"), v.literal("sent"), v.literal("failed"))),
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
-  }).index("by_site", ["siteId"]).index("by_shopify_order", ["shopifyOrderId"]).index("by_site_status", ["siteId", "fulfillmentStatus"]),
+  }).index("by_site", ["siteId"]).index("by_shopify_order", ["shopifyOrderId"]).index("by_cj_order_number", ["cjOrderNumber"]).index("by_site_status", ["siteId", "fulfillmentStatus"]),
 
   // ── the brain: proposed actions + risk-tiered approval ────────────────────
   actions: defineTable({

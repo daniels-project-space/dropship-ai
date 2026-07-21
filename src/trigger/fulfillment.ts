@@ -19,7 +19,7 @@ export const fulfillOrder = task({
     const convex = convexClient();
     // This transaction is the reservation point. It is intentionally before both the outbox
     // record and every CJ network request, and returns no input unless the reservation succeeds.
-    const claimed = await convex.mutation(api.orders.claimSandboxCjDispatch, { actionId: actionId as Id<"actions"> });
+    let claimed = await convex.mutation(api.orders.claimSandboxCjDispatch, { actionId: actionId as Id<"actions"> });
     if (claimed.state === "reused") return { skipped: true, reason: "already_dispatched", orderId: claimed.orderId, cjOrderId: claimed.cjOrderId };
     if (claimed.state === "blocked") return { skipped: true, reason: "dispatch_blocked", orderId: claimed.orderId };
 
@@ -31,11 +31,15 @@ export const fulfillOrder = task({
         actionId: actionId as Id<"actions">, orderId: claimed.orderId as Id<"orders">,
         cjOrderId: existing?.orderId,
       });
-      return { reconciled: reconciled.state, orderId: claimed.orderId, orderNumber: claimed.orderNumber, retryRequired: reconciled.state === "absent" };
+      if (reconciled.state === "found") return { reconciled: "found", orderId: claimed.orderId, orderNumber: claimed.orderNumber };
+      // A negative read atomically reopens the order. Claim a new generation in this same
+      // bounded run; its idempotency key cannot collide with the prior reservation.
+      claimed = await convex.mutation(api.orders.claimSandboxCjDispatch, { actionId: actionId as Id<"actions"> });
+      if (claimed.state !== "reserved") throw new Error("CJ reconciliation continuation could not reserve the next generation");
     }
 
     const target = `cj:sandbox:${claimed.orderId}`;
-    const idempotencyKey = `cj:sandbox:create:${claimed.orderId}:${claimed.inputHash}`;
+    const idempotencyKey = `cj:sandbox:create:${claimed.orderId}:${claimed.inputHash}:${claimed.attempt}`;
     const queued = await convex.mutation(api.ops.enqueue, {
       siteId: claimed.siteId,
       kind: "cj.sandbox.create_order",
@@ -46,7 +50,7 @@ export const fulfillOrder = task({
       payload: { actionId, orderId: claimed.orderId, orderNumber: claimed.orderNumber, inputHash: claimed.inputHash, isSandbox: 1, payType: 3 },
     });
     const lock = await convex.mutation(api.ops.claimTarget, { target, owner: idempotencyKey, leaseMs: 10 * 60_000 });
-    if (!lock.acquired) return { skipped: true, reason: "target_locked", orderId: claimed.orderId };
+    if (!lock.acquired) throw new Error("CJ sandbox target is locked; reconciliation retry is required");
 
     try {
       await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "processing" });
@@ -85,7 +89,7 @@ export async function handleCjTrackingWebhook(args: CjWebhookHandlerArgs) {
   const tracking = parseOrderWebhook(args.payload);
   if (!tracking.orderNumber) throw new Error("cj webhook: missing orderNumber — cannot map to a Shopify order");
   await convex.mutation(api.orders.applyTracking, {
-    shopifyOrderId: tracking.orderNumber, trackingNumber: tracking.trackNumber, trackingUrl: tracking.trackingUrl,
+    cjOrderNumber: tracking.orderNumber, trackingNumber: tracking.trackNumber, trackingUrl: tracking.trackingUrl,
     cjOrderId: tracking.cjOrderId, status: "shipped",
   });
   if (args.shopify && tracking.trackNumber) {

@@ -21,6 +21,32 @@ type OrderRow = {
   createdAt: number;
 };
 
+type ApprovedSandboxAction = { _id: Id<"actions">; type: string; params: { orderId?: Id<"orders">; orderNumber?: string; isSandbox?: number; payType?: number } };
+
+function ApprovedSandboxDispatches({ siteId }: { siteId: Id<"sites"> }) {
+  const actions = useQuery(api.actions.listBySite, { siteId, status: "approved", limit: 50 });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const dispatches = ((actions ?? []) as ApprovedSandboxAction[]).filter((action) => action.type === "dispatch_cj_sandbox_order" && action.params.isSandbox === 1 && action.params.payType === 3);
+  if (!dispatches.length) return null;
+  async function dispatch(action: ApprovedSandboxAction) {
+    setBusy(action._id); setMessage(null);
+    try {
+      const response = await fetch("/api/orders/dispatch-sandbox", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ actionId: action._id }) });
+      const result = await response.json() as { error?: string; runId?: string };
+      if (!response.ok) throw new Error(result.error ?? "sandbox dispatch failed");
+      setMessage(`Sandbox-only CJ dispatch queued (${result.runId ?? "existing run"}). No payment, reservation, fulfillment, or messaging is enabled.`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "sandbox dispatch failed"); }
+    finally { setBusy(null); }
+  }
+  return <section className="mb-6 rounded-2xl border border-pending/25 bg-pending/[0.04] p-5">
+    <p className="label-eyebrow text-pending">Approved CJ sandbox dispatches</p>
+    <p className="mt-2 text-[13px] text-ink-dim">Approval is the human gate. Start only the exact approved, create-only CJ sandbox action; customer details stay server-side.</p>
+    <div className="mt-4 flex flex-col gap-2">{dispatches.map((action) => <div key={action._id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line-soft px-4 py-3"><span className="font-mono text-[11px] text-ink-faint">{action.params.orderNumber}</span><button onClick={() => dispatch(action)} disabled={busy !== null} className="rounded-lg bg-pending/15 px-3 py-2 text-[12px] font-semibold text-pending ring-1 ring-pending/30 disabled:opacity-50">{busy === action._id ? "Queueing…" : "Run CJ sandbox dispatch"}</button></div>)}</div>
+    {message && <p className="mt-3 text-[12px] text-ink-dim">{message}</p>}
+  </section>;
+}
+
 function OrderDrawer({ row, onClose }: { row: OrderRow | null; onClose: () => void }) {
   if (!row) return null;
   const t = FULFILLMENT_STATUS[row.fulfillmentStatus];
@@ -128,6 +154,7 @@ export function OrdersTab({ siteId }: { siteId: Id<"sites"> }) {
 
   return (
     <>
+      <ApprovedSandboxDispatches siteId={siteId} />
       <DataTable
         columns={columns}
         rows={rows}

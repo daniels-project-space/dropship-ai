@@ -41,7 +41,7 @@ test("CJ refresh exchanges only the refresh token and returns rotated credential
   }
 });
 
-test("an expired server-held CJ token refreshes once and retries with the rotated pair", async () => {
+test("an expired server-held CJ token fails closed before rotating without an atomic token-bundle writer", async () => {
   const originalFetch = globalThis.fetch;
   const originalAccess = process.env.CJ_ACCESS_TOKEN;
   const originalRefresh = process.env.CJ_REFRESH_TOKEN;
@@ -59,12 +59,11 @@ test("an expired server-held CJ token refreshes once and retries with the rotate
     return new Response(JSON.stringify({ result: true, data: { id: "after-rotation" } }), { status: 200 });
   };
   try {
-    assert.deepEqual(await getProduct("product-rotation", "US"), { id: "after-rotation" });
+    await assert.rejects(() => getProduct("product-rotation", "US"), /atomic control-plane token-bundle writer is not installed/);
     const productCalls = calls.filter((call) => call.url.includes("product/query"));
-    assert.equal(productCalls.length, 2);
+    assert.equal(productCalls.length, 1);
     assert.equal(productCalls[0].options.headers["CJ-Access-Token"], "expired-access");
-    assert.equal(productCalls[1].options.headers["CJ-Access-Token"], "rotated-access");
-    assert.deepEqual(JSON.parse(calls.find((call) => call.url.includes("refreshAccessToken")).options.body), { refreshToken: "rotation-refresh" });
+    assert.equal(calls.some((call) => call.url.includes("refreshAccessToken")), false);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalAccess === undefined) delete process.env.CJ_ACCESS_TOKEN;

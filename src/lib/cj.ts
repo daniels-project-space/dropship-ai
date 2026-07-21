@@ -109,23 +109,18 @@ export async function refreshAccessToken(refreshToken: string): Promise<CjAccess
 }
 
 /**
- * Refresh exactly once per process when CJ rejects the current access token. Both tokens are
- * replaced together, so concurrent requests cannot pair a new access token with an old refresh
- * token. Persistent rotation remains a vault/control-plane operation, never a Convex write.
+ * Refresh is disabled unless the deployment supplies an atomic control-plane token-bundle
+ * writer. Keeping a newly issued pair only in process memory loses CJ's rotated refresh token
+ * on restart, so that would turn a transient 401 into an unrecoverable outage. This repository
+ * has a read-only vault client; fail closed until its writer capability is attached.
  */
 export async function refreshCurrentAccessToken(): Promise<string> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const current = activeTokens ?? await readTokenBundle();
-    if (!current.refreshToken) throw new Error("cj: access token expired and CJ_REFRESH_TOKEN is not configured in the server vault/control plane");
-    const next = await refreshAccessToken(current.refreshToken);
-    activeTokens = {
-      accessToken: next.accessToken,
-      refreshToken: next.refreshToken,
-      accessTokenExpiryDate: next.accessTokenExpiryDate,
-      refreshTokenExpiryDate: next.refreshTokenExpiryDate,
-    };
-    return next.accessToken;
+    // There is currently no scoped writer in this app. Do this check before contacting CJ: a
+    // refresh response invalidates the old refresh token and must be stored atomically with its
+    // new access token by the control plane.
+    throw new Error("cj: automatic token refresh is blocked: atomic control-plane token-bundle writer is not installed");
   })();
   try {
     return await refreshInFlight;

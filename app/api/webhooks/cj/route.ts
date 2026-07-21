@@ -48,7 +48,7 @@ export async function POST(req: Request) {
   const tracking = parseOrderWebhook(payload);
   if (!tracking.orderNumber) return NextResponse.json({ ok: true, ignored: "no order number" });
   const convex = convexClient();
-  const order = await convex.query(api.orders.getByShopifyOrder, { shopifyOrderId: tracking.orderNumber });
+  const order = await convex.query(api.orders.getByCjOrderNumber, { cjOrderNumber: tracking.orderNumber });
   if (!order) return NextResponse.json({ ok: true, ignored: "unknown order" });
 
   const topic = req.headers.get("x-cj-topic") ?? "ORDER";
@@ -60,7 +60,7 @@ export async function POST(req: Request) {
       deliveryId,
       topic,
       payloadHash,
-      shopifyOrderId: tracking.orderNumber,
+      cjOrderNumber: tracking.orderNumber,
       trackingNumber: tracking.trackNumber,
       trackingUrl: tracking.trackingUrl,
       cjOrderId: tracking.cjOrderId,

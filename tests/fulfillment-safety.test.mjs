@@ -86,6 +86,18 @@ test("a persisted input snapshot and approval fingerprint are stable; reserved o
   assert.equal(sandboxDispatchDecision("failed"), "blocked");
 });
 
+test("sandbox identities are deterministic, CJ-safe, and collision-resistant across distinct orders", () => {
+  const first = sandboxOrderNumber("site_1", "gid://shopify/Order/1");
+  const repeat = sandboxOrderNumber("site_1", "gid://shopify/Order/1");
+  const otherOrder = sandboxOrderNumber("site_1", "gid://shopify/Order/2");
+  const otherSite = sandboxOrderNumber("site_2", "gid://shopify/Order/1");
+  assert.equal(first, repeat);
+  assert.notEqual(first, otherOrder);
+  assert.notEqual(first, otherSite);
+  assert.match(first, /^dsa-sb-[a-f0-9]{32}$/);
+  assert.ok(first.length <= 50);
+});
+
 test("CJ reconciliation accepts only an isSandbox=1 order with the exact stable identity", async () => {
   const originalFetch = globalThis.fetch;
   const orderNumber = sandboxOrderNumber("site_1", "gid://shopify/Order/1");

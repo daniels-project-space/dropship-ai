@@ -45,7 +45,7 @@ export const recordShopifyOrder = mutation({
 export const recordCjTracking = mutation({
   args: {
     siteId: v.id("sites"), deliveryId: v.string(), topic: v.string(), payloadHash: v.string(),
-    shopifyOrderId: v.string(), trackingNumber: v.optional(v.string()), trackingUrl: v.optional(v.string()), cjOrderId: v.optional(v.string()),
+    cjOrderNumber: v.string(), trackingNumber: v.optional(v.string()), trackingUrl: v.optional(v.string()), cjOrderId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const prior = await ctx.db.query("webhookReceipts")
@@ -53,8 +53,15 @@ export const recordCjTracking = mutation({
     if (prior) return { duplicate: true, outcome: prior.outcome };
 
     const order = await ctx.db.query("orders")
-      .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
+      .withIndex("by_cj_order_number", (q) => q.eq("cjOrderNumber", args.cjOrderNumber)).first();
     if (!order || order.siteId !== args.siteId) {
+      await ctx.db.insert("webhookReceipts", {
+        provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
+        payloadHash: args.payloadHash, outcome: "ignored", receivedAt: Date.now(),
+      });
+      return { duplicate: false, outcome: "ignored" as const };
+    }
+    if (args.cjOrderId && order.cjOrderId && args.cjOrderId !== order.cjOrderId) {
       await ctx.db.insert("webhookReceipts", {
         provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
         payloadHash: args.payloadHash, outcome: "ignored", receivedAt: Date.now(),
