@@ -335,6 +335,40 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_idempotency_key", ["idempotencyKey"]).index("by_status_available_at", ["status", "availableAt"]).index("by_site_created_at", ["siteId", "createdAt"]),
 
+  // The provider-bound CJ create receipt.  This is deliberately separate from an order's
+  // display status: a response can be lost after a Convex commit, and only this row tells a
+  // later worker whether it is safe to create, must reconcile, or is terminal.
+  cjDispatchExecutions: defineTable({
+    siteId: v.id("sites"),
+    actionId: v.id("actions"),
+    orderId: v.id("orders"),
+    orderNumber: v.string(),
+    inputHash: v.string(),
+    generation: v.number(),
+    generationFingerprint: v.string(),
+    attempt: v.number(),
+    triggerRunId: v.string(),
+    // A deterministic opaque digest of the Trigger run id. It is not an order/customer value.
+    leaseToken: v.string(),
+    leaseVersion: v.number(),
+    providerMode: v.literal("sandbox"),
+    providerIdentity: v.string(),
+    phase: v.union(v.literal("prepared"), v.literal("provider_calling"), v.literal("reconciliation_required"), v.literal("sent"), v.literal("pre_provider_failed"), v.literal("needs_attention")),
+    idempotencyKey: v.string(),
+    traceId: v.string(),
+    // It is assigned before this atomic mutation commits. Optional solely because Convex
+    // validates an insert before the subsequently-created outbox has an ID.
+    outboxId: v.optional(v.id("outbox")),
+    leaseExpiresAt: v.number(),
+    reconciliationCount: v.number(),
+    reconciliationMax: v.number(),
+    nextReconcileAt: v.optional(v.number()),
+    lastReconcileResult: v.optional(v.union(v.literal("absent"), v.literal("found"), v.literal("mismatched"), v.literal("exhausted"))),
+    cjOrderId: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_order", ["orderId"]).index("by_action_run", ["actionId", "triggerRunId"]).index("by_phase_next_reconcile", ["phase", "nextReconcileAt"]),
+
   traces: defineTable({
     traceId: v.string(),
     siteId: v.id("sites"),

@@ -1,12 +1,13 @@
 // Sandbox-only CJ fulfillment loop. Supplier writes are impossible without an immutable order
 // snapshot, its exact approved action, an atomic reservation, and a second adapter-level
 // `isSandbox: 1` boundary.
-import { task, logger } from "@trigger.dev/sdk/v3";
+import { task, tasks, logger } from "@trigger.dev/sdk/v3";
 import { convexClient, api } from "../lib/convexClient";
 import { createSandboxOrder, getSandboxOrderByOrderNumber, isAmbiguousCjWriteError, parseOrderWebhook } from "../lib/cj";
 import { fulfillmentTrackingInfoUpdate, type ShopifyClientConfig } from "../lib/shopify";
 import { assertLiveEffectsEnabled, type EffectMode } from "../lib/effects";
 import { executeSandboxCjDispatch } from "../lib/sandboxCjDispatchExecutor";
+import { stableSha256 } from "../lib/cjOrder";
 import type { Id } from "../../convex/_generated/dataModel";
 
 export interface FulfillOrderPayload {
@@ -16,21 +17,26 @@ export interface FulfillOrderPayload {
 
 export const fulfillOrder = task({
   id: "fulfill-order",
-  run: async ({ actionId }: FulfillOrderPayload) => {
+  run: async ({ actionId }: FulfillOrderPayload, { ctx }) => {
     const convex = convexClient();
+    const triggerRunId = ctx.run.id;
+    // Stable across an automatic retry of this exact Trigger run, but opaque to Convex callers.
+    const leaseToken = stableSha256(`dropship-ai:cj-sandbox-lease:${triggerRunId}`);
     const result = await executeSandboxCjDispatch({
-      claim: () => convex.mutation(api.orders.claimSandboxCjDispatch, { actionId: actionId as Id<"actions"> }) as any,
-      findByOrderNumber: getSandboxOrderByOrderNumber,
-      reconcile: async ({ orderId, cjOrderId, receipt }) => convex.mutation(api.orders.reconcileSandboxCjDispatch, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, cjOrderId, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }),
-      enqueue: async ({ siteId, target, idempotencyKey, orderId, orderNumber, inputHash }) => convex.mutation(api.ops.enqueue, { siteId: siteId as Id<"sites">, kind: "cj.sandbox.create_order", target, idempotencyKey, traceId: idempotencyKey, payload: { actionId, orderId, orderNumber, inputHash, isSandbox: 1, payType: 3 } }),
-      claimTarget: ({ target, owner }) => convex.mutation(api.ops.claimTarget, { target, owner, leaseMs: 10 * 60_000 }),
-      markOutbox: async ({ outboxId, status, error, detail }) => { await convex.mutation(api.ops.markOutbox, { outboxId: outboxId as Id<"outbox">, status, ...(error ? { error } : {}), ...(detail ? { detail } : {}) }); },
+      claim: () => convex.mutation(api.orders.claimSandboxCjDispatch, { actionId: actionId as Id<"actions">, triggerRunId, leaseToken }) as any,
+      beginProviderCall: ({ orderId, receipt }) => convex.mutation(api.orders.beginSandboxCjProviderCall, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      findByOrderNumber: async (orderNumber) => {
+        const found = await getSandboxOrderByOrderNumber(orderNumber);
+        if (!found) return null;
+        if (found.orderNumber !== orderNumber || (found.isSandbox !== 1 && found.isSandbox !== true)) throw new Error("CJ reconciliation returned an invalid sandbox identity");
+        return { orderId: found.orderId, orderNumber: found.orderNumber, isSandbox: found.isSandbox };
+      },
+      reconcile: async ({ orderId, receipt, lookup }) => convex.mutation(api.orders.reconcileSandboxCjDispatchExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> }, ...(lookup ? { lookup } : {}) }) as any,
       createSandboxOrder: (input) => createSandboxOrder(input as Parameters<typeof createSandboxOrder>[0]),
-      markDispatched: async ({ orderId, outboxId, cjOrderId, receipt }) => convex.mutation(api.orders.markSandboxCjDispatched, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, outboxId: outboxId as Id<"outbox">, cjOrderId, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
-      markAmbiguous: async ({ orderId, outboxId, reason, receipt }) => convex.mutation(api.orders.markSandboxCjAmbiguous, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, outboxId: outboxId as Id<"outbox">, reason, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
-      abortBeforeProvider: async ({ orderId, outboxId, reason, receipt }) => convex.mutation(api.orders.abortSandboxCjDispatchBeforeProvider, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, ...(outboxId ? { outboxId: outboxId as Id<"outbox"> } : {}), reason, receipt: { ...receipt, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
-      repairDispatched: async ({ orderId }) => convex.mutation(api.orders.repairSandboxCjDispatchOutbox, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> }) as any,
-      releaseTarget: async ({ target, owner }) => { await convex.mutation(api.ops.releaseTarget, { target, owner }); },
+      complete: async ({ orderId, cjOrderId, receipt }) => convex.mutation(api.orders.completeSandboxCjDispatchExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, cjOrderId, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      ambiguous: async ({ orderId, reason, receipt }) => convex.mutation(api.orders.markSandboxCjDispatchAmbiguousExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, reason, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      failBeforeProvider: async ({ orderId, reason, receipt }) => convex.mutation(api.orders.failSandboxCjDispatchBeforeProvider, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, reason, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      scheduleReconciliation: async ({ actionId: scheduledActionId, nextReconcileAt }) => { await tasks.trigger<typeof fulfillOrder>("fulfill-order", { actionId: scheduledActionId }, { idempotencyKey: `cj-sandbox-reconcile:${scheduledActionId}:${nextReconcileAt}`, idempotencyKeyTTL: "24h", delay: `${Math.max(1, nextReconcileAt - Date.now())}ms` }); },
       isAmbiguousWriteError: isAmbiguousCjWriteError,
     });
     if (!result.skipped && !("reconciled" in result)) logger.info("CJ sandbox order created", { actionId });
