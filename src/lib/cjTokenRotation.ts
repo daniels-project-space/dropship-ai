@@ -18,6 +18,21 @@ export interface CjTokenBundleStore {
   replace: (expectedRefreshToken: string | undefined, next: RotatedCjTokenBundle) => Promise<"written" | "conflict">;
 }
 
+function assertBundle(bundle: CjTokenBundle): CjTokenBundle {
+  if (!bundle || typeof bundle.accessToken !== "string" || !bundle.accessToken.trim()
+    || (bundle.refreshToken !== undefined && (typeof bundle.refreshToken !== "string" || !bundle.refreshToken.trim()))
+    || (bundle.accessTokenExpiryDate !== undefined && typeof bundle.accessTokenExpiryDate !== "string")
+    || (bundle.refreshTokenExpiryDate !== undefined && typeof bundle.refreshTokenExpiryDate !== "string")) {
+    throw new Error("cj: durable token bundle is invalid");
+  }
+  return bundle;
+}
+
+function sameBundle(a: CjTokenBundle, b: CjTokenBundle): boolean {
+  return a.accessToken === b.accessToken && a.refreshToken === b.refreshToken
+    && a.accessTokenExpiryDate === b.accessTokenExpiryDate && a.refreshTokenExpiryDate === b.refreshTokenExpiryDate;
+}
+
 export class CjTokenCoordinator {
   private active: CjTokenBundle | null = null;
   private refreshInFlight: Promise<string> | null = null;
@@ -29,7 +44,7 @@ export class CjTokenCoordinator {
   ) {}
 
   async getAccessToken(): Promise<string> {
-    if (!this.active) this.active = await this.store.read();
+    if (!this.active) this.active = assertBundle(await this.store.read());
     return this.active.accessToken;
   }
 
@@ -37,7 +52,15 @@ export class CjTokenCoordinator {
   async refreshAccessToken(): Promise<string> {
     if (this.refreshInFlight) return this.refreshInFlight;
     this.refreshInFlight = (async () => {
-      const current = this.active ?? await this.store.read();
+      // A 401 may be observed by a warm instance after another process has already consumed
+      // CJ's one-time refresh token. Reload the durable winner before any refresh request.
+      const cached = this.active;
+      const durable = assertBundle(await this.store.read());
+      if (cached && !sameBundle(cached, durable)) {
+        this.active = durable;
+        return durable.accessToken;
+      }
+      const current = cached ?? durable;
       if (!current.refreshToken) throw new Error("cj: no refresh token — add CJ_REFRESH_TOKEN to the server vault/control plane");
       const next = await this.refresh(current.refreshToken);
       const result = await this.store.replace(current.refreshToken, next);
@@ -47,7 +70,7 @@ export class CjTokenCoordinator {
       }
       // A different instance won the compare-and-swap. The durable bundle, not either process
       // cache, is now authoritative.
-      this.active = await this.store.read();
+      this.active = assertBundle(await this.store.read());
       return this.active.accessToken;
     })();
     try {

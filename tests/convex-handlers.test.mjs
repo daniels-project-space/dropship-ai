@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
 import test from "node:test";
 import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
@@ -319,6 +320,58 @@ test("read-only reconciliation backs off five times then reaches one terminal at
   assert.equal(order.cjDispatchStatus, "ambiguous");
 });
 
+test("reconciliation keeps one active trace/outbox lineage, and a lost schedule handoff is durably reclaimable", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const claim = await claimDispatch(t, actionId, "run-a", "a".repeat(64));
+  await service(t).mutation(api.orders.beginSandboxCjProviderCall, { actionId, orderId, receipt: claim.receipt });
+  await service(t).mutation(api.orders.markSandboxCjDispatchAmbiguousExecution, { actionId, orderId, reason: "timeout", receipt: claim.receipt });
+  let execution = await t.run((ctx) => ctx.db.get(claim.receipt.executionId));
+  let outbox = await t.run((ctx) => ctx.db.get(execution.outboxId));
+  let trace = await t.run((ctx) => ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", execution.traceId)).first());
+  assert.equal(execution.phase, "reconciliation_required");
+  assert.equal(outbox.status, "ambiguous");
+  assert.equal(trace.status, "reconciling");
+  assert.equal(trace.finishedAt, undefined);
+  const due = await service(t).query(api.orders.listDueSandboxCjDispatchReconciliations, { limit: 25 });
+  assert.deepEqual(due.map((row) => row._id), [execution._id]);
+  const [first, second] = await Promise.all([
+    service(t).mutation(api.orders.claimDueSandboxCjDispatchReconciliationSchedule, { executionId: execution._id }),
+    service(t).mutation(api.orders.claimDueSandboxCjDispatchReconciliationSchedule, { executionId: execution._id }),
+  ]);
+  assert.deepEqual([first.state, second.state].sort(), ["busy", "scheduled"]);
+  execution = await t.run((ctx) => ctx.db.get(execution._id));
+  await t.run((ctx) => ctx.db.patch(execution._id, { reconciliationScheduleLeaseExpiresAt: Date.now() - 1 }));
+  const recovered = await service(t).mutation(api.orders.claimDueSandboxCjDispatchReconciliationSchedule, { executionId: execution._id });
+  assert.equal(recovered.state, "scheduled");
+  assert.equal(recovered.generation, 2);
+  // The recovered task must still be reconciliation-only; no create crosses the boundary.
+  const creates = { count: 0 };
+  await executeSandboxCjDispatch(convexExecutor(t, actionId, "run-b", "b".repeat(64), { creates }));
+  assert.equal(creates.count, 0);
+  execution = await t.run((ctx) => ctx.db.get(execution._id));
+  outbox = await t.run((ctx) => ctx.db.get(execution.outboxId));
+  trace = await t.run((ctx) => ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", execution.traceId)).first());
+  assert.equal(outbox._id, execution.outboxId);
+  assert.equal(trace.finishedAt, undefined);
+});
+
+test("legacy CJ dispatch mutation shapes are absent and the order pointer controls a large historical set", async () => {
+  const source = await fs.readFile(new URL("../convex/orders.ts", import.meta.url), "utf8");
+  for (const name of ["markSandboxCjDispatched", "markSandboxCjAmbiguous", "abortSandboxCjDispatchBeforeProvider", "repairSandboxCjDispatchOutbox", "reconcileSandboxCjDispatch ="]) assert.equal(source.includes(name), false);
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const claim = await claimDispatch(t, actionId);
+  const execution = await t.run((ctx) => ctx.db.get(claim.receipt.executionId));
+  const { _id, _creationTime, ...historicalBase } = execution;
+  await t.run(async (ctx) => {
+    for (let n = 0; n < 40; n++) await ctx.db.insert("cjDispatchExecutions", { ...historicalBase, triggerRunId: `historical-${n}`, leaseToken: `h${n}`.padEnd(64, "x"), phase: "pre_provider_failed", attempt: n + 100, reconciliationScheduleGeneration: 0, createdAt: n, updatedAt: n });
+  });
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  assert.equal(order.cjDispatchExecutionId, execution._id);
+  assert.equal((await claimDispatch(t, actionId, "new-run", "n".repeat(64))).state, "blocked");
+});
+
 test("provider intake and tracking handlers require the service identity", async () => {
   const t = convexTest({ schema, modules });
   const { orderId } = await seedApprovedDispatch(t);
@@ -340,6 +393,9 @@ test("provider intake and runtime primitives reject anonymous and operator ident
     () => operator.mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" }),
     () => operator.mutation(api.orders.claimSandboxCjDispatch, { actionId, triggerRunId: "run", leaseToken: "t".repeat(64) }),
     () => operator.mutation(api.orders.beginSandboxCjDispatchReconciliation, { actionId, orderId, receipt: claim.receipt }),
+    () => operator.query(api.orders.listDueSandboxCjDispatchReconciliations, { limit: 1 }),
+    () => operator.mutation(api.orders.claimDueSandboxCjDispatchReconciliationSchedule, { executionId: claim.receipt.executionId }),
+    () => operator.mutation(api.orders.claimSandboxCjDispatchReconciliationSchedule, { actionId, orderId, receipt: claim.receipt }),
     () => operator.mutation(api.ops.enqueue, { siteId, kind: "test", target: "target", idempotencyKey: "key", traceId: "trace", payload: {} }),
     () => operator.mutation(api.ops.claimTarget, { target: "target", owner: "owner" }),
   ];

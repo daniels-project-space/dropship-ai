@@ -103,9 +103,15 @@ test("sandbox identities are deterministic, CJ-safe, and collision-resistant acr
 test("CJ reconciliation accepts only an isSandbox=1 order with the exact stable identity", async () => {
   const originalFetch = globalThis.fetch;
   const orderNumber = sandboxOrderNumber("site_1", "gid://shopify/Order/1");
-  globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", orderNum: orderNumber, isSandbox: 1 } }), { status: 200 });
   try {
-    assert.deepEqual(await getSandboxOrderByOrderNumber(orderNumber, "token"), { orderId: "cj-1", orderNumber, isSandbox: 1 });
+    for (const providerSandbox of [1, true]) {
+      globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", orderNum: orderNumber, isSandbox: providerSandbox } }), { status: 200 });
+      assert.deepEqual(await getSandboxOrderByOrderNumber(orderNumber, "token"), { orderId: "cj-1", orderNumber, isSandbox: 1 });
+    }
+    globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", orderNum: "different-order", isSandbox: 1 } }), { status: 200 });
+    assert.equal(await getSandboxOrderByOrderNumber(orderNumber, "token"), null);
+    globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", orderNum: orderNumber, isSandbox: false } }), { status: 200 });
+    await assert.rejects(() => getSandboxOrderByOrderNumber(orderNumber, "token"), /non-sandbox/);
   } finally {
     globalThis.fetch = originalFetch;
   }

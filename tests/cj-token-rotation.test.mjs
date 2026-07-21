@@ -66,3 +66,21 @@ test("a compare-and-swap conflict reloads the winning persisted pair without a s
   assert.equal(await coordinator.refreshAccessToken(), "other-access");
   assert.equal(refreshCalls, 1);
 });
+
+test("a stale warm instance reloads a durable winner before consuming a one-time refresh token", async () => {
+  const store = memoryStore({ accessToken: "old-access", refreshToken: "old-refresh" });
+  const stale = new CjTokenCoordinator(store, async () => { throw new Error("stale refresh must not run"); }, async () => { throw new Error("not used"); });
+  assert.equal(await stale.getAccessToken(), "old-access");
+  await store.replace("old-refresh", { accessToken: "winner-access", refreshToken: "winner-refresh" });
+  assert.equal(await stale.refreshAccessToken(), "winner-access");
+});
+
+test("a failed durable reload blocks refresh rather than spending a cached one-time token", async () => {
+  let refreshCalls = 0;
+  const coordinator = new CjTokenCoordinator({
+    read: async () => { throw new Error("durable read unavailable"); },
+    replace: async () => "written",
+  }, async () => { refreshCalls++; return { accessToken: "new", refreshToken: "new-refresh" }; }, async () => { throw new Error("not used"); });
+  await assert.rejects(() => coordinator.refreshAccessToken(), /durable read unavailable/);
+  assert.equal(refreshCalls, 0);
+});

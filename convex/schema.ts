@@ -254,6 +254,9 @@ export default defineSchema({
     cjDispatchGenerationFingerprint: v.optional(v.string()),
     cjQuoteInputDigest: v.optional(v.string()),
     cjDispatchAttempt: v.optional(v.number()),   // fenced reservation generation; never reused after a reconcile miss
+    // The one current provider-bound receipt. Historical attempts remain in
+    // cjDispatchExecutions for audit, but the hot path never scans them.
+    cjDispatchExecutionId: v.optional(v.id("cjDispatchExecutions")),
     cjApprovalActionId: v.optional(v.id("actions")),
     cjDispatchStatus: v.optional(v.union(v.literal("staged"), v.literal("reserved"), v.literal("ambiguous"), v.literal("sent"), v.literal("failed"))),
     createdAt: v.number(),
@@ -387,11 +390,15 @@ export default defineSchema({
     reconciliationCount: v.number(),
     reconciliationMax: v.number(),
     nextReconcileAt: v.optional(v.number()),
+    // Scheduling is a replayable projection of nextReconcileAt. A short lease means a
+    // lost Trigger response can be reclaimed without inventing another provider write.
+    reconciliationScheduleGeneration: v.number(),
+    reconciliationScheduleLeaseExpiresAt: v.optional(v.number()),
     lastReconcileResult: v.optional(v.union(v.literal("absent"), v.literal("found"), v.literal("mismatched"), v.literal("exhausted"))),
     cjOrderId: v.optional(v.string()),
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_order", ["orderId"]).index("by_action_run", ["actionId", "triggerRunId"]).index("by_phase_next_reconcile", ["phase", "nextReconcileAt"]),
+  }).index("by_order", ["orderId"]).index("by_order_updated_at", ["orderId", "updatedAt"]).index("by_action_run", ["actionId", "triggerRunId"]).index("by_phase_next_reconcile", ["phase", "nextReconcileAt"]),
 
   traces: defineTable({
     traceId: v.string(),
@@ -399,7 +406,7 @@ export default defineSchema({
     operation: v.string(),
     target: v.string(),
     idempotencyKey: v.string(),
-    status: v.union(v.literal("started"), v.literal("succeeded"), v.literal("failed"), v.literal("skipped")),
+    status: v.union(v.literal("started"), v.literal("reconciling"), v.literal("succeeded"), v.literal("failed"), v.literal("skipped")),
     detail: v.any(),
     startedAt: v.number(),
     finishedAt: v.optional(v.number()),

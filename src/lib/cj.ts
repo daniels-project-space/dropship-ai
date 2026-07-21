@@ -255,7 +255,8 @@ export const createOrder = createSandboxOrder;
 export interface CjOrderLookup {
   orderId: string;
   orderNumber: string;
-  isSandbox: number | boolean | undefined;
+  /** Canonical provider identity persisted across the Convex boundary. */
+  isSandbox: 1;
 }
 
 /** CJ accepts the custom order number as `orderId` for this lookup. */
@@ -267,7 +268,9 @@ export async function getSandboxOrderByOrderNumber(orderNumber: string, token?: 
     const actualOrderNumber = data.orderNumber ?? data.orderNum ?? orderNumber;
     if (!data.orderId || actualOrderNumber !== orderNumber) return null;
     if (data.isSandbox !== 1 && data.isSandbox !== true) throw new Error("CJ reconciliation found a non-sandbox order");
-    return { orderId: data.orderId, orderNumber: actualOrderNumber, isSandbox: data.isSandbox };
+    // CJ has emitted both `true` and `1`; normalize the adapter boundary so storage and every
+    // reconciliation receipt have one exact identity.
+    return { orderId: data.orderId, orderNumber: actualOrderNumber, isSandbox: 1 };
   } catch (error) {
     if (error instanceof CjApiError && error.status === 404) return null;
     throw error;

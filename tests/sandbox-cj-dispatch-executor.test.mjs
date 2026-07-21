@@ -47,7 +47,7 @@ test("absent reconciliation is bounded by Convex and schedules no provider creat
   const result = await executeSandboxCjDispatch(run.deps);
   assert.equal(result.reason, "scheduled");
   assert.equal(run.calls.some((x) => Array.isArray(x) && x[0] === "create"), false);
-  assert.deepEqual(run.calls.find((x) => Array.isArray(x) && x[0] === "schedule")[1], { actionId: "action-1", nextReconcileAt: 123 });
+  assert.deepEqual(run.calls.find((x) => Array.isArray(x) && x[0] === "schedule")[1], { actionId: "action-1", receipt, nextReconcileAt: 123 });
 });
 
 test("a committed terminal response is retried locally without another provider create", async () => {

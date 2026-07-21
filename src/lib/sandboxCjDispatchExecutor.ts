@@ -17,13 +17,13 @@ export interface SandboxCjDispatchDependencies {
   claim(): Promise<ClaimedSandboxDispatch>;
   beginProviderCall(input: { orderId: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
   beginReconciliation(input: { orderId: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ready: boolean; nextReconcileAt?: number }>;
-  findByOrderNumber(orderNumber: string): Promise<{ orderId: string; orderNumber: string; isSandbox: 1 | true } | null>;
-  reconcile(input: { orderId: string; receipt: SandboxCjDispatchReceipt; lookup?: { orderId: string; orderNumber: string; isSandbox: 1 | true } }): Promise<{ state: "found" | "scheduled" | "needs_attention" | "ignored"; nextReconcileAt?: number }>;
+  findByOrderNumber(orderNumber: string): Promise<{ orderId: string; orderNumber: string; isSandbox: 1 } | null>;
+  reconcile(input: { orderId: string; receipt: SandboxCjDispatchReceipt; lookup?: { orderId: string; orderNumber: string; isSandbox: 1 } }): Promise<{ state: "found" | "scheduled" | "needs_attention" | "ignored"; nextReconcileAt?: number }>;
   createSandboxOrder(input: unknown): Promise<{ orderId: string }>;
   complete(input: { orderId: string; cjOrderId: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
   ambiguous(input: { orderId: string; reason: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
   failBeforeProvider(input: { orderId: string; reason: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
-  scheduleReconciliation?(input: { actionId: string; nextReconcileAt: number }): Promise<void>;
+  scheduleReconciliation?(input: { actionId: string; receipt: SandboxCjDispatchReceipt; nextReconcileAt: number }): Promise<void>;
   isAmbiguousWriteError(error: unknown): boolean;
 }
 
@@ -38,7 +38,7 @@ export async function executeSandboxCjDispatch(deps: SandboxCjDispatchDependenci
     if (!reconciliation.ready) return { skipped: true as const, reason: "reconciliation_not_due", orderId: claimed.orderId };
     const lookup = await deps.findByOrderNumber(claimed.orderNumber);
     const result = await deps.reconcile({ orderId: claimed.orderId, receipt: claimed.receipt, ...(lookup ? { lookup } : {}) });
-    if (result.state === "scheduled" && result.nextReconcileAt) await deps.scheduleReconciliation?.({ actionId: claimed.receipt.actionId, nextReconcileAt: result.nextReconcileAt });
+    if (result.state === "scheduled" && result.nextReconcileAt) await deps.scheduleReconciliation?.({ actionId: claimed.receipt.actionId, receipt: claimed.receipt, nextReconcileAt: result.nextReconcileAt });
     return result.state === "found"
       ? { reconciled: "found" as const, orderId: claimed.orderId, orderNumber: claimed.orderNumber }
       : { skipped: true as const, reason: result.state, orderId: claimed.orderId };

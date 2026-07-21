@@ -1,7 +1,7 @@
 // Sandbox-only CJ fulfillment loop. Supplier writes are impossible without an immutable order
 // snapshot, its exact approved action, an atomic reservation, and a second adapter-level
 // `isSandbox: 1` boundary.
-import { task, tasks, logger } from "@trigger.dev/sdk/v3";
+import { task, tasks, schedules, logger } from "@trigger.dev/sdk/v3";
 import { convexClient, api } from "../lib/convexClient";
 import { createSandboxOrder, getSandboxOrderByOrderNumber, isAmbiguousCjWriteError, parseOrderWebhook } from "../lib/cj";
 import { fulfillmentTrackingInfoUpdate, type ShopifyClientConfig } from "../lib/shopify";
@@ -36,7 +36,7 @@ export const fulfillOrder = task({
       findByOrderNumber: async (orderNumber) => {
         const found = await getSandboxOrderByOrderNumber(orderNumber);
         if (!found) return null;
-        if (found.orderNumber !== orderNumber || (found.isSandbox !== 1 && found.isSandbox !== true)) throw new Error("CJ reconciliation returned an invalid sandbox identity");
+        if (found.orderNumber !== orderNumber || found.isSandbox !== 1) throw new Error("CJ reconciliation returned an invalid sandbox identity");
         return { orderId: found.orderId, orderNumber: found.orderNumber, isSandbox: found.isSandbox };
       },
       reconcile: async ({ orderId, receipt, lookup }) => convex.mutation(api.orders.reconcileSandboxCjDispatchExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> }, ...(lookup ? { lookup } : {}) }) as any,
@@ -44,11 +44,44 @@ export const fulfillOrder = task({
       complete: async ({ orderId, cjOrderId, receipt }) => convex.mutation(api.orders.completeSandboxCjDispatchExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, cjOrderId, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
       ambiguous: async ({ orderId, reason, receipt }) => convex.mutation(api.orders.markSandboxCjDispatchAmbiguousExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, reason, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
       failBeforeProvider: async ({ orderId, reason, receipt }) => convex.mutation(api.orders.failSandboxCjDispatchBeforeProvider, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, reason, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
-      scheduleReconciliation: async ({ actionId: scheduledActionId, nextReconcileAt }) => { await tasks.trigger<typeof fulfillOrder>("fulfill-order", { actionId: scheduledActionId }, { idempotencyKey: `cj-sandbox-reconcile:${scheduledActionId}:${nextReconcileAt}`, idempotencyKeyTTL: "24h", delay: `${Math.max(1, nextReconcileAt - Date.now())}ms` }); },
+      scheduleReconciliation: async ({ actionId: scheduledActionId, receipt, nextReconcileAt }) => {
+        const handoff: any = await convex.mutation(api.orders.claimSandboxCjDispatchReconciliationSchedule, {
+          actionId: scheduledActionId as Id<"actions">, orderId: receipt.orderId as Id<"orders">,
+          receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: scheduledActionId as Id<"actions">, orderId: receipt.orderId as Id<"orders"> },
+        });
+        if (handoff.state !== "scheduled") return;
+        await tasks.trigger<typeof fulfillOrder>("fulfill-order", { actionId: scheduledActionId }, {
+          idempotencyKey: `cj-sandbox-reconcile:${handoff.executionId}:${handoff.generation}`,
+          idempotencyKeyTTL: "24h", delay: `${Math.max(1, nextReconcileAt - Date.now())}ms`,
+        });
+      },
       isAmbiguousWriteError: isAmbiguousCjWriteError,
     });
     if (!result.skipped && !("reconciled" in result)) logger.info("CJ sandbox order created", { actionId });
     return result;
+  },
+});
+
+// A Trigger response is only a projection of the durable due row. This short sweep reclaims a
+// lost handoff after its lease, then emits the deterministic generation key; duplicate task
+// deliveries can only enter the fenced read-only reconciliation branch above.
+export const cjDispatchReconciliationSweep = schedules.task({
+  id: "cj-dispatch-reconciliation-sweep",
+  cron: "*/1 * * * *",
+  run: async () => {
+    const convex = convexClient();
+    const due: Array<{ _id: string }> = await convex.query(api.orders.listDueSandboxCjDispatchReconciliations, { limit: 25 }) as any;
+    let scheduled = 0;
+    for (const execution of due) {
+      const handoff: any = await convex.mutation(api.orders.claimDueSandboxCjDispatchReconciliationSchedule, { executionId: execution._id as Id<"cjDispatchExecutions"> });
+      if (handoff.state !== "scheduled") continue;
+      await tasks.trigger<typeof fulfillOrder>("fulfill-order", { actionId: handoff.actionId }, {
+        idempotencyKey: `cj-sandbox-reconcile:${handoff.executionId}:${handoff.generation}`,
+        idempotencyKeyTTL: "24h",
+      });
+      scheduled++;
+    }
+    return { due: due.length, scheduled };
   },
 });
 

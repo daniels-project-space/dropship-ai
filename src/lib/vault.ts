@@ -89,7 +89,7 @@ export async function replaceCjTokenBundleAtomically(
   if (!response.ok) throw new Error(`cj: atomic token-bundle write failed: HTTP ${response.status}`);
   const payload = await response.json().catch(() => null) as BundleWriteResponse | null;
   if (payload?.value?.status === "conflict") return "conflict";
-  if (payload?.value?.status === "written" || payload?.value === undefined) return "written";
+  if (payload?.value?.status === "written") return "written";
   throw new Error("cj: atomic token-bundle writer returned an invalid response");
 }
 
