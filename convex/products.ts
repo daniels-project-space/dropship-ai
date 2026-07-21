@@ -3,6 +3,7 @@ import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { evaluatePersistedCjEvidence } from "../src/lib/sourcingPolicy";
+import { hasVerifiedInternalShopifyDraftLineage } from "../src/lib/shopifyDraftLineage";
 
 const productStatus = v.union(
   v.literal("draft"),
@@ -19,7 +20,8 @@ async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Prom
   }
 }
 
-// Insert-or-update keyed on (siteId + cjProductId) when present, else creates new.
+// Insert-or-update for non-CJ catalog rows. CJ-linked candidates always use
+// createSourcedDraft(), which owns evidence and economics.
 export const upsert = mutation({
   args: {
     siteId: v.id("sites"),
@@ -39,24 +41,9 @@ export const upsert = mutation({
     // Shopify mirrors and non-supplier catalog maintenance only.
     if (args.cjProductId) throw new Error("CJ-sourced products must use products.createSourcedDraft");
     if (args.status === "active") throw new Error("products.upsert cannot activate a product; use products.setStatus after verified sourcing");
-    const { status, cjProductId, ...rest } = args;
-    // Dedup by cjProductId within the site if one was supplied.
-    if (cjProductId) {
-      const existing = await ctx.db
-        .query("products")
-        .withIndex("by_site", (q) => q.eq("siteId", args.siteId))
-        .filter((q) => q.eq(q.field("cjProductId"), cjProductId))
-        .first();
-      if (existing) {
-        const patch = { ...rest, cjProductId, ...(status ? { status } : {}) };
-        await ctx.db.patch(existing._id, patch);
-        await appendAudit(ctx, { siteId: args.siteId, event: "product_updated", detail: { productId: existing._id, title: args.title } });
-        return existing._id;
-      }
-    }
+    const { status, cjProductId: _cjProductId, ...rest } = args;
     const productId = await ctx.db.insert("products", {
       ...rest,
-      cjProductId,
       status: status ?? "draft",
       createdAt: Date.now(),
     });
@@ -192,12 +179,20 @@ export const recordCjEvidence = mutation({
   },
 });
 
-function actionMatchesApprovedDraftImport(action: { siteId: unknown; type: string; riskTier: string; status: string; params: unknown }, product: { siteId: unknown; _id: unknown; cjEvidenceId?: unknown }): boolean {
+function actionMatchesApprovedDraftImport(action: { siteId: unknown; type: string; riskTier: string; status: string; params: unknown }, product: { siteId: unknown; _id: unknown; cjEvidenceId?: unknown; cjProductId?: unknown; cjVariantId?: unknown; priceUsd: number; cogsUsd: number; shippingUsd: number; landedCostUsd?: number; contributionMarginPct?: number; sourceVerifiedAt?: number }): boolean {
   if (action.siteId !== product.siteId || action.type !== "import_sourced_product" || action.riskTier !== "human_gated" || action.status !== "approved") return false;
   const params = action.params;
   return typeof params === "object" && params !== null
     && (params as Record<string, unknown>).productId === product._id
-    && (params as Record<string, unknown>).evidenceId === product.cjEvidenceId;
+    && (params as Record<string, unknown>).evidenceId === product.cjEvidenceId
+    && (params as Record<string, unknown>).cjProductId === product.cjProductId
+    && (params as Record<string, unknown>).cjVariantId === product.cjVariantId
+    && (params as Record<string, unknown>).priceUsd === product.priceUsd
+    && (params as Record<string, unknown>).cogsUsd === product.cogsUsd
+    && (params as Record<string, unknown>).shippingUsd === product.shippingUsd
+    && (params as Record<string, unknown>).landedCostUsd === product.landedCostUsd
+    && (params as Record<string, unknown>).contributionMarginPct === product.contributionMarginPct
+    && (params as Record<string, unknown>).sourceVerifiedAt === product.sourceVerifiedAt;
 }
 
 /** Reserve one approved, draft-only Shopify import before crossing the provider boundary. */
@@ -223,7 +218,20 @@ export const reserveApprovedShopifyDraftImport = mutation({
       minimumMarginPct: site.minBlendedMarginPct,
     });
     if (!gate.eligible) throw new Error(`Shopify draft import denied: ${gate.reason}`);
-    if (product.shopifyProductId || product.shopifyDraftImportStatus === "created") return { status: "already_created" as const, shopifyProductId: product.shopifyProductId };
+    if (product.shopifyProductId || product.shopifyDraftImportStatus === "created") {
+      const trace = product.shopifyDraftImportTraceId
+        ? await ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", product.shopifyDraftImportTraceId!)).first()
+        : null;
+      const importedHere = hasVerifiedInternalShopifyDraftLineage({
+        shopifyProductId: product.shopifyProductId,
+        shopifyDraftImportStatus: product.shopifyDraftImportStatus,
+        trace,
+      });
+      if (!importedHere) {
+        throw new Error("Shopify product is provider-mirrored or has incomplete draft-import lineage; reconcile provider state before retrying");
+      }
+      return { status: "already_created" as const, shopifyProductId: product.shopifyProductId };
+    }
     if (product.shopifyDraftImportStatus) throw new Error(`Shopify draft import is ${product.shopifyDraftImportStatus}; reconcile before retrying`);
     await ctx.db.patch(args.productId, { shopifyDraftImportStatus: "creating", shopifyDraftImportTraceId: args.traceId });
     await ctx.db.insert("traces", {

@@ -15,6 +15,8 @@ import { POST as postShopifyTestCheckout } from "../app/api/shopify/test-checkou
 import { POST as postShopifyDraftImport } from "../app/api/shopify/import-draft/route.ts";
 import { POST as postCjRefresh } from "../app/api/cj/refresh/route.ts";
 import { POST as postDiscover } from "../app/api/research/discover/route.ts";
+import { POST as postSourceCj } from "../app/api/research/source-cj/route.ts";
+import { POST as postApprovalResolve } from "../app/api/approvals/resolve/route.ts";
 import { GET as getOperatorToken } from "../app/api/auth/token/route.ts";
 import { POST as postLogout } from "../app/api/auth/logout/route.ts";
 
@@ -34,6 +36,12 @@ test("a modified session is denied", async () => {
   // itself end in "x", which made this security test intermittently leave the session unchanged.
   const alteredFinalCharacter = signature.endsWith("x") ? "y" : "x";
   assert.equal(await verifyOperatorSession(`${payload}.${signature.slice(0, -1)}${alteredFinalCharacter}`, secret), false);
+  // HMAC output is 32 bytes, so its final base64url sextet has four canonical encodings. A
+  // non-zero unused padding bit used to decode to the same bytes; canonical decoding rejects it.
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const index = alphabet.indexOf(signature.at(-1));
+  const nonCanonical = alphabet[index | 1];
+  assert.equal(await verifyOperatorSession(`${payload}.${signature.slice(0, -1)}${nonCanonical}`, secret), false);
   assert.equal(await verifyOperatorSession(session, `${secret}changed`), false);
 });
 
@@ -85,6 +93,8 @@ test("every operator route independently rejects a forged session", async () => 
       postShopifyDraftImport(post()),
       postCjRefresh(post()),
       postDiscover(post()),
+      postSourceCj(post()),
+      postApprovalResolve(post()),
       postLogout(post()),
     ]);
     for (const response of responses) {

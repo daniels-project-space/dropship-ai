@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
@@ -38,6 +39,48 @@ const RUBRIC = [
   { label: "Min kit price floor", note: "premium positioning", key: "price" },
   { label: "Sustained trend signal", note: "not a 2-week spike", key: "trend" },
 ];
+
+function SourceCjCandidate({ siteId }: { siteId: Id<"sites"> }) {
+  const [cjProductId, setCjProductId] = useState("");
+  const [cjVariantId, setCjVariantId] = useState("");
+  const [priceUsd, setPriceUsd] = useState("");
+  const [state, setState] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setState(null);
+    try {
+      const response = await fetch("/api/research/source-cj", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ siteId, cjProductId, cjVariantId, priceUsd: Number(priceUsd) }),
+      });
+      const result = await response.json() as { error?: string; reason?: string; actionId?: string };
+      if (!response.ok) throw new Error(result.reason ?? result.error ?? "candidate was not accepted");
+      setState(`CJ evidence recorded; approval ${result.actionId} is waiting. No Shopify product has been created.`);
+    } catch (error) {
+      setState(error instanceof Error ? error.message : "candidate was not accepted");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="mt-12">
+      <SectionHeader eyebrow="Source selected CJ candidate" accent="text-signal" />
+      <form onSubmit={submit} className="panel grid grid-cols-1 gap-3 rounded-2xl p-5 md:grid-cols-4 md:items-end">
+        <label className="block"><span className="label-eyebrow text-[9px]">CJ product ID</span><input required value={cjProductId} onChange={(e) => setCjProductId(e.target.value)} className="mt-1 w-full rounded-lg border border-line bg-void px-3 py-2 text-sm text-ink" /></label>
+        <label className="block"><span className="label-eyebrow text-[9px]">Exact CJ variant ID</span><input required value={cjVariantId} onChange={(e) => setCjVariantId(e.target.value)} className="mt-1 w-full rounded-lg border border-line bg-void px-3 py-2 text-sm text-ink" /></label>
+        <label className="block"><span className="label-eyebrow text-[9px]">Proposed price (USD)</span><input required min="0.01" step="0.01" type="number" value={priceUsd} onChange={(e) => setPriceUsd(e.target.value)} className="mt-1 w-full rounded-lg border border-line bg-void px-3 py-2 text-sm text-ink" /></label>
+        <button disabled={busy} className="rounded-lg bg-signal/15 px-4 py-2 text-sm font-semibold text-signal ring-1 ring-signal/30 disabled:opacity-50">{busy ? "Verifying CJ…" : "Verify & request approval"}</button>
+        <p className="md:col-span-4 text-[12px] leading-relaxed text-ink-faint">Select a researched CJ offer by its exact product and variant IDs. The server refreshes CJ facts, persists a read trace, calculates economics, and opens a human waitpoint only if it clears policy. It never publishes or imports automatically.</p>
+        {state && <p className="md:col-span-4 text-[12px] text-ink-dim">{state}</p>}
+      </form>
+    </section>
+  );
+}
 
 function ExperimentsSection({ siteId }: { siteId: Id<"sites"> }) {
   const experiments = useQuery(api.experiments.listBySite, { siteId, limit: 50 });
@@ -169,6 +212,7 @@ export function ResearchTab({ siteId }: { siteId: Id<"sites"> }) {
         </div>
       </aside>
     </div>
+    <SourceCjCandidate siteId={siteId} />
     <ExperimentsSection siteId={siteId} />
     </>
   );

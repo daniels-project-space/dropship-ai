@@ -1,8 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation } from "convex/react";
-import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { StatusDot } from "./StatusDot";
 import { RISK_TIER, type RiskTier } from "./tokens";
@@ -41,8 +39,6 @@ export function ActionCard({
   siteName: string;
   index?: number;
 }) {
-  const approve = useMutation(api.actions.approve);
-  const reject = useMutation(api.actions.reject);
   const [busy, setBusy] = useState<null | "approve" | "reject">(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -54,9 +50,15 @@ export function ActionCard({
     setError(null);
     setBusy(kind);
     try {
-      if (kind === "approve") await approve({ actionId: action._id, approver: "Daniel" });
-      else await reject({ actionId: action._id, approver: "Daniel" });
-      // optimistic: the row leaves listPending and Convex re-renders the list.
+      const response = await fetch("/api/approvals/resolve", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actionId: action._id, approved: kind === "approve" }),
+      });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error ?? "approval resolution failed");
+      // Trigger resumes the persisted waitpoint and writes the state transition; sourced imports
+      // remain approved until the separate draft-only executor is explicitly requested.
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed");
       setBusy(null);

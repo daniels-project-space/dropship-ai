@@ -22,6 +22,50 @@ type ProductRow = {
   status: ProductStatus;
 };
 
+type ApprovedImport = {
+  _id: Id<"actions">;
+  type: string;
+  params: { productId?: Id<"products">; evidenceId?: string };
+};
+
+function ApprovedDraftImports({ siteId }: { siteId: Id<"sites"> }) {
+  const actions = useQuery(api.actions.listBySite, { siteId, status: "approved", limit: 50 });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const imports = ((actions ?? []) as ApprovedImport[]).filter((action) => action.type === "import_sourced_product" && action.params.productId);
+  if (!imports.length) return null;
+  async function execute(action: ApprovedImport) {
+    if (!action.params.productId) return;
+    setBusy(action._id);
+    setMessage(null);
+    try {
+      const response = await fetch("/api/shopify/import-draft", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ siteId, productId: action.params.productId, actionId: action._id }),
+      });
+      const result = await response.json() as { error?: string; shopifyProductId?: string };
+      if (!response.ok) throw new Error(result.error ?? "draft import failed");
+      setMessage(`Shopify DRAFT ${result.shopifyProductId ?? "created"}. It remains unpublished.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "draft import failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+  return <section className="mt-8 panel rounded-2xl p-5">
+    <p className="label-eyebrow text-pending">Approved draft imports</p>
+    <p className="mt-2 text-[13px] text-ink-dim">Approval did not contact Shopify. Execute each approved candidate separately to create one Shopify DRAFT; no publish, order, or customer action is available here.</p>
+    <div className="mt-4 flex flex-col gap-2">
+      {imports.map((action) => <div key={action._id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line-soft px-4 py-3">
+        <span className="font-mono text-[11px] text-ink-faint">{action.params.productId}</span>
+        <button onClick={() => execute(action)} disabled={busy !== null} className="rounded-lg bg-pending/15 px-3 py-2 text-[12px] font-semibold text-pending ring-1 ring-pending/30 disabled:opacity-50">{busy === action._id ? "Creating DRAFT…" : "Create Shopify DRAFT"}</button>
+      </div>)}
+    </div>
+    {message && <p className="mt-3 text-[12px] text-ink-dim">{message}</p>}
+  </section>;
+}
+
 function ProductDrawer({ row, onClose }: { row: ProductRow | null; onClose: () => void }) {
   if (!row) return null;
   const m = row.contributionMarginPct ?? contributionMargin(row.priceUsd, row.cogsUsd, row.shippingUsd);
@@ -163,6 +207,7 @@ export function ProductsTab({ siteId }: { siteId: Id<"sites"> }) {
           body: "The brain sources US-warehouse candidates that clear the margin rubric, then proposes imports for your approval. Approved products land here with live COGS, shipping and contribution margin.",
         }}
       />
+      <ApprovedDraftImports siteId={siteId} />
       <ProductDrawer row={active} onClose={() => setActive(null)} />
     </>
   );

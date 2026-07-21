@@ -17,7 +17,10 @@ function base64UrlToBytes(value: string): Uint8Array | null {
   try {
     const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (value.length % 4)) % 4);
     const binary = atob(padded);
-    return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    // `atob` accepts non-canonical padding bits. Accepting those would let multiple textual
+    // encodings represent the same signed bytes, so reject anything that does not round-trip.
+    return bytesToBase64Url(bytes) === value ? bytes : null;
   } catch {
     return null;
   }
