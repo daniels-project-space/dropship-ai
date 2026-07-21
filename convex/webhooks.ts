@@ -3,7 +3,8 @@
 import { mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
-import { webhookDeliveryDecision, cjTrackingMappingDecision, shopifyReceiptDecision } from "../src/lib/webhookReceiptState";
+import { webhookDeliveryDecision, cjTrackingMappingDecision, shopifyReceiptDecision, shopifyStagingIntakeDecision } from "../src/lib/webhookReceiptState";
+import { cjStagingInputDigest } from "../src/lib/cjOrder";
 
 const fulfillmentStatus = v.union(
   v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
@@ -50,17 +51,25 @@ export const recordShopifyOrder = mutation({
       await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { shopifyOrderId: args.shopifyOrderId, source: "shopify_webhook" } });
     }
     let intentId: any = null;
+    let intentNeedsAttention = false;
     if (args.stagingInput) {
       // Deterministic on the mirrored order, not merely delivery ID: Shopify can redeliver a
       // semantically identical create as a distinct delivery and it still gets one CJ intent.
       const existingIntent = await ctx.db.query("cjStagingIntents").withIndex("by_order", (q) => q.eq("orderId", orderId)).first();
+      const stagingInputDigest = cjStagingInputDigest(args.stagingInput);
       if (existingIntent) {
+        if (shopifyStagingIntakeDecision({ incoming: { payloadHash: args.payloadHash, topic: args.topic }, existingStagingDigest: existingIntent.stagingInputDigest, incomingStagingDigest: stagingInputDigest }) === "needs_attention") {
+          // A distinct delivery cannot silently attach an old approval to a new address/line set.
+          await ctx.db.patch(existingIntent._id, { status: "needs_attention", runnableAt: undefined, leaseExpiresAt: undefined, lastError: { code: "shopify_staging_semantics_changed" }, updatedAt: Date.now() });
+          await appendAudit(ctx, { siteId: args.siteId, event: "cj_staging_needs_attention", detail: { orderId, reason: "shopify_staging_semantics_changed" } });
+          intentNeedsAttention = true;
+        }
         intentId = existingIntent._id;
       } else {
         const now = Date.now();
         intentId = await ctx.db.insert("cjStagingIntents", {
           siteId: args.siteId, orderId, deliveryId: args.deliveryId, payloadHash: args.payloadHash,
-          status: "pending", attempt: 0, shipping: args.stagingInput.shipping,
+          status: "pending", attempt: 0, runnableAt: now, stagingInputDigest, shipping: args.stagingInput.shipping,
           shopifyLines: args.stagingInput.shopifyLines, createdAt: now, updatedAt: now,
         });
       }
@@ -70,7 +79,7 @@ export const recordShopifyOrder = mutation({
       payloadHash: args.payloadHash, outcome: "applied", receivedAt: Date.now(),
     });
     // `applied` means intake/mirroring completed, never that CJ quote, staging, or approval did.
-    return { duplicate: false, outcome: "applied" as const, intentId };
+    return { duplicate: false, outcome: "applied" as const, intentId, intentNeedsAttention };
   },
 });
 

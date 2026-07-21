@@ -223,6 +223,9 @@ export default defineSchema({
       quotedPriceUsd: v.number(),
     })),
     cjOrderInputHash: v.optional(v.string()),
+    // Each fresh freight quote is an immutable approval generation. Provider lineage is never
+    // rewritten once a create has been reserved, ambiguous, or sent.
+    cjDispatchGeneration: v.optional(v.number()),
     cjDispatchAttempt: v.optional(v.number()),   // fenced reservation generation; never reused after a reconcile miss
     cjApprovalActionId: v.optional(v.id("actions")),
     cjDispatchStatus: v.optional(v.union(v.literal("staged"), v.literal("reserved"), v.literal("ambiguous"), v.literal("sent"), v.literal("failed"))),
@@ -237,20 +240,25 @@ export default defineSchema({
     orderId: v.id("orders"),
     deliveryId: v.string(),
     payloadHash: v.string(),
-    status: v.union(v.literal("pending"), v.literal("preflighting"), v.literal("quoted"), v.literal("preflight_required"), v.literal("staged"), v.literal("approval_dispatching"), v.literal("approval_dispatched"), v.literal("failed")),
+    status: v.union(v.literal("pending"), v.literal("preflighting"), v.literal("quoted"), v.literal("preflight_required"), v.literal("staged"), v.literal("approval_dispatching"), v.literal("approval_dispatched"), v.literal("needs_attention"), v.literal("failed")),
     attempt: v.number(),
     leaseExpiresAt: v.optional(v.number()),
+    // The only scheduler index. Ready rows are due now; leased rows are due at their fence.
+    runnableAt: v.optional(v.number()),
+    lastError: v.optional(v.object({ code: v.string() })),
     // PII is durable only here and in the immutable CJ order snapshot. It must never enter an
     // outbox, trace, audit detail, Trigger payload, or logger context.
     shipping: v.object({ shippingZip: v.string(), shippingCountryCode: v.string(), shippingCountry: v.string(), shippingProvince: v.string(), shippingCity: v.string(), shippingAddress: v.string(), shippingCustomerName: v.string(), shippingPhone: v.string() }),
     shopifyLines: v.array(v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() })),
+    // Optional solely for pre-existing rows; an absent digest fails closed into reconciliation.
+    stagingInputDigest: v.optional(v.string()),
     quoteInputDigest: v.optional(v.string()),
     quoteProvider: v.optional(v.object({ endpoint: v.string(), version: v.string() })),
     quote: v.optional(v.object({ logisticName: v.string(), logisticPriceUsd: v.number(), fromCountryCode: v.string(), quotedAt: v.number() })),
     actionId: v.optional(v.id("actions")),
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_site_status", ["siteId", "status"]).index("by_status", ["status"]).index("by_order", ["orderId"]).index("by_site_delivery", ["siteId", "deliveryId"]),
+  }).index("by_site_status", ["siteId", "status"]).index("by_runnable_at", ["runnableAt"]).index("by_order", ["orderId"]).index("by_site_delivery", ["siteId", "deliveryId"]),
 
   // ── the brain: proposed actions + risk-tiered approval ────────────────────
   actions: defineTable({

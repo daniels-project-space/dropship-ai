@@ -103,6 +103,19 @@ export function cjFreightQuoteDigest(input: {
   }));
 }
 
+/** Canonical, customer-confined digest for cross-delivery Shopify intake idempotency. */
+export function cjStagingInputDigest(input: {
+  shipping: { shippingZip: string; shippingCountryCode: string; shippingCountry: string; shippingProvince: string; shippingCity: string; shippingAddress: string; shippingCustomerName: string; shippingPhone: string };
+  shopifyLines: Array<{ productId: string; variantId: string; quantity: number }>;
+}): string {
+  return stableSha256(JSON.stringify({
+    shipping: input.shipping,
+    shopifyLines: [...input.shopifyLines]
+      .map(({ productId, variantId, quantity }) => ({ productId, variantId, quantity }))
+      .sort((a, b) => `${a.productId}:${a.variantId}:${a.quantity}`.localeCompare(`${b.productId}:${b.variantId}:${b.quantity}`)),
+  }));
+}
+
 export type SandboxDispatchState = "staged" | "reserved" | "ambiguous" | "sent" | "failed";
 
 /** A provider write is never retried from reserved/ambiguous state until a read reconciliation. */

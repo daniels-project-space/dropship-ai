@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { executeCjStaging } from "../src/lib/cjStagingExecutor.ts";
 import { cjFreightQuoteDigest } from "../src/lib/cjOrder.ts";
+import { CJ_STAGING_MAX_ATTEMPTS, cjStagingFailureTransition, cjStagingRetryAt, stagingInputDuplicateDecision } from "../src/lib/cjStagingState.ts";
 
 function worker(overrides = {}) {
   const calls = { quote: 0, recordQuote: 0, stage: 0, trigger: 0, recordApproval: 0 };
@@ -20,14 +21,20 @@ function worker(overrides = {}) {
   return { calls, deps };
 }
 
-test("duplicate intake has no CJ or Trigger surface; a durable worker later completes exactly once", async () => {
-  // The webhook's sole external dependency is the atomic intake mutation. A duplicate resolves
-  // to its existing intent; neither result has a provider/Trigger operation to repeat.
-  const intake = async () => ({ intentId: "intent-1", duplicate: true });
-  assert.deepEqual(await intake(), { intentId: "intent-1", duplicate: true });
+test("durable semantic duplicate intake has no CJ or Trigger surface", async () => {
+  // This is the same reducer used to decide cross-delivery intent reuse, not a stubbed route.
+  assert.equal(stagingInputDuplicateDecision("digest-a", "digest-a"), "reuse");
+  assert.equal(stagingInputDuplicateDecision("digest-a", "digest-b"), "needs_attention");
   const { calls, deps } = worker();
   await executeCjStaging(deps);
   assert.deepEqual(calls, { quote: 1, recordQuote: 1, stage: 1, trigger: 1, recordApproval: 1 });
+});
+
+test("bounded retry transitions are due once, then terminal; permanent inputs need attention", () => {
+  assert.equal(cjStagingRetryAt(1000, 1), 61_000);
+  assert.deepEqual(cjStagingFailureTransition(1000, 1, "retryable"), { status: "pending", runnableAt: 61_000 });
+  assert.deepEqual(cjStagingFailureTransition(1000, CJ_STAGING_MAX_ATTEMPTS, "retryable"), { status: "failed", runnableAt: undefined });
+  assert.deepEqual(cjStagingFailureTransition(1000, 1, "permanent"), { status: "needs_attention", runnableAt: undefined });
 });
 
 test("failure after durable intake retries in the worker, and a persisted quote is reused", async () => {
@@ -51,6 +58,19 @@ test("a stale quote re-enters explicit preflight and cannot arm or execute appro
   assert.deepEqual(await executeCjStaging(deps), { state: "preflight_required" });
   assert.equal(calls.quote, 0);
   assert.equal(calls.trigger, 0);
+  assert.equal(calls.recordApproval, 0);
+});
+
+test("a resolved action is never armed or marked dispatched by a stale worker", async () => {
+  const { calls, deps } = worker({ beginApproval: async () => ({ status: "resolved" }) });
+  assert.deepEqual(await executeCjStaging(deps), { state: "resolved" });
+  assert.equal(calls.trigger, 0);
+  assert.equal(calls.recordApproval, 0);
+});
+
+test("an ambiguous Trigger response cannot mark the intent dispatched", async () => {
+  const { calls, deps } = worker({ triggerApproval: async () => { calls.trigger++; throw new Error("response lost"); } });
+  await assert.rejects(() => executeCjStaging(deps), /response lost/);
   assert.equal(calls.recordApproval, 0);
 });
 
