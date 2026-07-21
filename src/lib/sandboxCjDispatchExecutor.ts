@@ -7,6 +7,7 @@ export type SandboxCjDispatchReceipt = {
   generationFingerprint: string; attempt: number; triggerRunId: string; leaseToken: string;
   leaseVersion: number; providerMode: "sandbox"; providerIdentity: string;
 };
+export type DefinitiveSandboxCjProviderRejection = "invalid_request" | "invalid_credentials" | "sandbox_not_permitted" | "provider_resource_missing" | "invalid_order";
 export type ClaimedSandboxDispatch =
   | { state: "reused"; orderId: string; orderNumber: string; cjOrderId?: string }
   | { state: "blocked"; orderId: string; orderNumber: string }
@@ -22,9 +23,12 @@ export interface SandboxCjDispatchDependencies {
   createSandboxOrder(input: unknown): Promise<{ orderId: string }>;
   complete(input: { orderId: string; cjOrderId: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
   ambiguous(input: { orderId: string; reason: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
+  /** Only local failures that occurred before beginProviderCall may use this path. */
   failBeforeProvider(input: { orderId: string; reason: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
-  scheduleReconciliation?(input: { actionId: string; receipt: SandboxCjDispatchReceipt; nextReconcileAt: number }): Promise<void>;
-  isAmbiguousWriteError(error: unknown): boolean;
+  /** A closed, typed provider rejection may safely close a provider_calling execution. */
+  rejectDefinitiveProviderRejection(input: { orderId: string; rejection: DefinitiveSandboxCjProviderRejection; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
+  scheduleReconciliation?(input: { actionId: string; receipt: SandboxCjDispatchReceipt }): Promise<void>;
+  definitiveProviderRejection(error: unknown): DefinitiveSandboxCjProviderRejection | null;
 }
 
 export async function executeSandboxCjDispatch(deps: SandboxCjDispatchDependencies) {
@@ -38,7 +42,7 @@ export async function executeSandboxCjDispatch(deps: SandboxCjDispatchDependenci
     if (!reconciliation.ready) return { skipped: true as const, reason: "reconciliation_not_due", orderId: claimed.orderId };
     const lookup = await deps.findByOrderNumber(claimed.orderNumber);
     const result = await deps.reconcile({ orderId: claimed.orderId, receipt: claimed.receipt, ...(lookup ? { lookup } : {}) });
-    if (result.state === "scheduled" && result.nextReconcileAt) await deps.scheduleReconciliation?.({ actionId: claimed.receipt.actionId, receipt: claimed.receipt, nextReconcileAt: result.nextReconcileAt });
+    if (result.state === "scheduled") await deps.scheduleReconciliation?.({ actionId: claimed.receipt.actionId, receipt: claimed.receipt });
     return result.state === "found"
       ? { reconciled: "found" as const, orderId: claimed.orderId, orderNumber: claimed.orderNumber }
       : { skipped: true as const, reason: result.state, orderId: claimed.orderId };
@@ -59,12 +63,17 @@ export async function executeSandboxCjDispatch(deps: SandboxCjDispatchDependenci
     if (result) {
       const terminal = await deps.complete({ orderId: claimed.orderId, cjOrderId: result.orderId, receipt: claimed.receipt });
       if (!terminal.ignored) return { orderId: claimed.orderId, cjOrderId: result.orderId, orderNumber: claimed.orderNumber, isSandbox: 1 as const, payType: 3 as const, zeroCharge: true as const };
-    } else if (deps.isAmbiguousWriteError(error)) {
-      await deps.ambiguous({ orderId: claimed.orderId, reason: "provider_response_ambiguous", receipt: claimed.receipt });
     } else {
-      // The adapter has classified this as a definitive pre-write rejection. Unknown errors
-      // stay reconciliation-only; no caller can turn them back into a create.
-      await deps.failBeforeProvider({ orderId: claimed.orderId, reason: "provider_write_rejected", receipt: claimed.receipt });
+      const rejection = deps.definitiveProviderRejection(error);
+      if (rejection) {
+        // This is a closed adapter classification, not a caller-provided escape hatch. The
+        // Convex handler accepts it only while this exact receipt is provider_calling.
+        await deps.rejectDefinitiveProviderRejection({ orderId: claimed.orderId, rejection, receipt: claimed.receipt });
+      } else {
+        // Timeouts, 409/429, 5xx, response loss, and unknown errors stay on the same read-only
+        // reconciliation lineage. They can never re-enter the create branch.
+        await deps.ambiguous({ orderId: claimed.orderId, reason: "provider_response_ambiguous", receipt: claimed.receipt });
+      }
     }
     throw error;
   }

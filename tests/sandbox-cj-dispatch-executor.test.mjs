@@ -17,8 +17,9 @@ function harness(claims = [prepared], overrides = {}) {
     complete: async (input) => { calls.push(["complete", input]); return {}; },
     ambiguous: async (input) => { calls.push(["ambiguous", input]); return {}; },
     failBeforeProvider: async (input) => { calls.push(["failed", input]); return {}; },
+    rejectDefinitiveProviderRejection: async (input) => { calls.push(["definitive-rejection", input]); return {}; },
     scheduleReconciliation: async (input) => { calls.push(["schedule", input]); },
-    isAmbiguousWriteError: () => true,
+    definitiveProviderRejection: () => null,
     ...overrides,
   }};
 }
@@ -47,7 +48,7 @@ test("absent reconciliation is bounded by Convex and schedules no provider creat
   const result = await executeSandboxCjDispatch(run.deps);
   assert.equal(result.reason, "scheduled");
   assert.equal(run.calls.some((x) => Array.isArray(x) && x[0] === "create"), false);
-  assert.deepEqual(run.calls.find((x) => Array.isArray(x) && x[0] === "schedule")[1], { actionId: "action-1", receipt, nextReconcileAt: 123 });
+  assert.deepEqual(run.calls.find((x) => Array.isArray(x) && x[0] === "schedule")[1], { actionId: "action-1", receipt });
 });
 
 test("a committed terminal response is retried locally without another provider create", async () => {
@@ -73,4 +74,20 @@ test("a reconciliation lookup is impossible until Convex grants its due lease", 
   const result = await executeSandboxCjDispatch(run.deps);
   assert.equal(result.reason, "reconciliation_not_due");
   assert.equal(run.calls.some((x) => Array.isArray(x) && (x[0] === "find" || x[0] === "reconcile" || x[0] === "create")), false);
+});
+
+test("only a closed definitive rejection can close the post-boundary execution", async () => {
+  const definitive = new Error("CJ rejected invalid input");
+  const run = harness([prepared], {
+    createSandboxOrder: async () => { throw definitive; },
+    definitiveProviderRejection: (error) => error === definitive ? "invalid_order" : null,
+  });
+  await assert.rejects(() => executeSandboxCjDispatch(run.deps), /invalid input/);
+  assert.deepEqual(run.calls.find((x) => Array.isArray(x) && x[0] === "definitive-rejection")[1].rejection, "invalid_order");
+
+  const unknown = new Error("untyped transport failure");
+  const ambiguous = harness([prepared], { createSandboxOrder: async () => { throw unknown; } });
+  await assert.rejects(() => executeSandboxCjDispatch(ambiguous.deps), /untyped transport/);
+  assert.equal(ambiguous.calls.some((x) => Array.isArray(x) && x[0] === "definitive-rejection"), false);
+  assert.equal(ambiguous.calls.some((x) => Array.isArray(x) && x[0] === "ambiguous"), true);
 });

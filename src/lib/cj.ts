@@ -49,8 +49,32 @@ export class CjApiError extends Error {
   }
 }
 
+/**
+ * Closed set of provider responses that prove CJ rejected this create before accepting it.
+ * Transport failures, throttling, conflicts, and every untyped error deliberately have no
+ * member here: after the provider fence those cases must be read-reconciled, never retried.
+ */
+export type CjDefinitiveSandboxOrderRejection =
+  | "invalid_request"
+  | "invalid_credentials"
+  | "sandbox_not_permitted"
+  | "provider_resource_missing"
+  | "invalid_order";
+
+export function definitiveSandboxCjWriteRejection(error: unknown): CjDefinitiveSandboxOrderRejection | null {
+  if (!(error instanceof CjApiError)) return null;
+  switch (error.status) {
+    case 400: return "invalid_request";
+    case 401: return "invalid_credentials";
+    case 403: return "sandbox_not_permitted";
+    case 404: return "provider_resource_missing";
+    case 422: return "invalid_order";
+    default: return null;
+  }
+}
+
 export function isAmbiguousCjWriteError(error: unknown): boolean {
-  return error instanceof CjApiError ? error.status >= 500 : true;
+  return definitiveSandboxCjWriteRejection(error) === null;
 }
 
 async function cjFetch<T>(
@@ -265,7 +289,9 @@ export async function getSandboxOrderByOrderNumber(orderNumber: string, token?: 
     const data = await cjFetch<{ orderId?: string; orderNum?: string; orderNumber?: string; isSandbox?: number | boolean }>("/shopping/order/getOrderDetail", {
       method: "GET", token, query: { orderId: orderNumber },
     });
-    const actualOrderNumber = data.orderNumber ?? data.orderNum ?? orderNumber;
+    // A lookup request is not provider evidence. CJ must echo one of its canonical identity
+    // fields exactly; falling back to the requested value could incorrectly settle a write.
+    const actualOrderNumber = data.orderNumber ?? data.orderNum;
     if (!data.orderId || actualOrderNumber !== orderNumber) return null;
     if (data.isSandbox !== 1 && data.isSandbox !== true) throw new Error("CJ reconciliation found a non-sandbox order");
     // CJ has emitted both `true` and `1`; normalize the adapter boundary so storage and every

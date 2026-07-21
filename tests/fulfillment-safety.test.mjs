@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 import { createZeroChargeDraftCheckout } from "../src/lib/shopify.ts";
-import { createSandboxOrder, getSandboxOrderByOrderNumber } from "../src/lib/cj.ts";
+import { CjApiError, createSandboxOrder, definitiveSandboxCjWriteRejection, getSandboxOrderByOrderNumber } from "../src/lib/cj.ts";
 import { assertLiveEffectsEnabled, sandboxShopAllowed } from "../src/lib/effects.ts";
 import { cjOrderInputHash, normalizeCjOrderInput, sandboxDispatchDecision, sandboxOrderNumber } from "../src/lib/cjOrder.ts";
 import { verifyShopifyHmac } from "../app/api/webhooks/shopify/route.ts";
@@ -110,11 +110,19 @@ test("CJ reconciliation accepts only an isSandbox=1 order with the exact stable 
     }
     globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", orderNum: "different-order", isSandbox: 1 } }), { status: 200 });
     assert.equal(await getSandboxOrderByOrderNumber(orderNumber, "token"), null);
+    globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", isSandbox: 1 } }), { status: 200 });
+    assert.equal(await getSandboxOrderByOrderNumber(orderNumber, "token"), null);
     globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", orderNum: orderNumber, isSandbox: false } }), { status: 200 });
     await assert.rejects(() => getSandboxOrderByOrderNumber(orderNumber, "token"), /non-sandbox/);
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("only closed definitive CJ rejections may leave the provider-calling phase", () => {
+  assert.equal(definitiveSandboxCjWriteRejection(new CjApiError(422, "invalid order")), "invalid_order");
+  for (const status of [409, 429, 500]) assert.equal(definitiveSandboxCjWriteRejection(new CjApiError(status, "ambiguous")), null);
+  assert.equal(definitiveSandboxCjWriteRejection(new Error("untyped")), null);
 });
 
 test("provider writes fail closed unless each sandbox/live gate is explicitly configured", () => {

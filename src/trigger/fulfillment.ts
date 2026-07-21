@@ -3,7 +3,7 @@
 // `isSandbox: 1` boundary.
 import { task, tasks, schedules, logger } from "@trigger.dev/sdk/v3";
 import { convexClient, api } from "../lib/convexClient";
-import { createSandboxOrder, getSandboxOrderByOrderNumber, isAmbiguousCjWriteError, parseOrderWebhook } from "../lib/cj";
+import { createSandboxOrder, definitiveSandboxCjWriteRejection, getSandboxOrderByOrderNumber, parseOrderWebhook } from "../lib/cj";
 import { fulfillmentTrackingInfoUpdate, type ShopifyClientConfig } from "../lib/shopify";
 import { assertLiveEffectsEnabled, type EffectMode } from "../lib/effects";
 import { executeSandboxCjDispatch } from "../lib/sandboxCjDispatchExecutor";
@@ -44,7 +44,8 @@ export const fulfillOrder = task({
       complete: async ({ orderId, cjOrderId, receipt }) => convex.mutation(api.orders.completeSandboxCjDispatchExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, cjOrderId, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
       ambiguous: async ({ orderId, reason, receipt }) => convex.mutation(api.orders.markSandboxCjDispatchAmbiguousExecution, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, reason, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
       failBeforeProvider: async ({ orderId, reason, receipt }) => convex.mutation(api.orders.failSandboxCjDispatchBeforeProvider, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, reason, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
-      scheduleReconciliation: async ({ actionId: scheduledActionId, receipt, nextReconcileAt }) => {
+      rejectDefinitiveProviderRejection: async ({ orderId, rejection, receipt }) => convex.mutation(api.orders.rejectSandboxCjDispatchAfterDefinitiveProviderRejection, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, rejection, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      scheduleReconciliation: async ({ actionId: scheduledActionId, receipt }) => {
         const handoff: any = await convex.mutation(api.orders.claimSandboxCjDispatchReconciliationSchedule, {
           actionId: scheduledActionId as Id<"actions">, orderId: receipt.orderId as Id<"orders">,
           receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: scheduledActionId as Id<"actions">, orderId: receipt.orderId as Id<"orders"> },
@@ -52,10 +53,12 @@ export const fulfillOrder = task({
         if (handoff.state !== "scheduled") return;
         await tasks.trigger<typeof fulfillOrder>("fulfill-order", { actionId: scheduledActionId }, {
           idempotencyKey: `cj-sandbox-reconcile:${handoff.executionId}:${handoff.generation}`,
-          idempotencyKeyTTL: "24h", delay: `${Math.max(1, nextReconcileAt - Date.now())}ms`,
+          // Convex owns the due time. Do not reuse the executor's stale reconciliation result
+          // if another durable handoff updated this execution before this response arrived.
+          idempotencyKeyTTL: "24h", delay: `${Math.max(1, handoff.nextReconcileAt - Date.now())}ms`,
         });
       },
-      isAmbiguousWriteError: isAmbiguousCjWriteError,
+      definitiveProviderRejection: definitiveSandboxCjWriteRejection,
     });
     if (!result.skipped && !("reconciled" in result)) logger.info("CJ sandbox order created", { actionId });
     return result;
@@ -70,10 +73,10 @@ export const cjDispatchReconciliationSweep = schedules.task({
   cron: "*/1 * * * *",
   run: async () => {
     const convex = convexClient();
-    const due: Array<{ _id: string }> = await convex.query(api.orders.listDueSandboxCjDispatchReconciliations, { limit: 25 }) as any;
+    const due: Array<{ executionId: string }> = await convex.query(api.orders.listDueSandboxCjDispatchReconciliations, { limit: 25 }) as any;
     let scheduled = 0;
-    for (const execution of due) {
-      const handoff: any = await convex.mutation(api.orders.claimDueSandboxCjDispatchReconciliationSchedule, { executionId: execution._id as Id<"cjDispatchExecutions"> });
+    for (const dueExecution of due) {
+      const handoff: any = await convex.mutation(api.orders.claimDueSandboxCjDispatchReconciliationSchedule, { executionId: dueExecution.executionId as Id<"cjDispatchExecutions"> });
       if (handoff.state !== "scheduled") continue;
       await tasks.trigger<typeof fulfillOrder>("fulfill-order", { actionId: handoff.actionId }, {
         idempotencyKey: `cj-sandbox-reconcile:${handoff.executionId}:${handoff.generation}`,

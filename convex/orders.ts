@@ -655,6 +655,32 @@ export const failSandboxCjDispatchBeforeProvider = mutation({
   },
 });
 
+/**
+ * The only post-boundary rejection transition. `rejection` is intentionally a closed
+ * adapter-derived vocabulary: ambiguous responses cannot select this retryable path.
+ */
+export const rejectSandboxCjDispatchAfterDefinitiveProviderRejection = mutation({
+  args: {
+    actionId: v.id("actions"), orderId: v.id("orders"), receipt: dispatchReceipt,
+    rejection: v.union(
+      v.literal("invalid_request"),
+      v.literal("invalid_credentials"),
+      v.literal("sandbox_not_permitted"),
+      v.literal("provider_resource_missing"),
+      v.literal("invalid_order"),
+    ),
+  },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const loaded = await loadFencedExecution(ctx, args); if (!loaded) return { ignored: true as const };
+    if (loaded.execution.phase !== "provider_calling" || loaded.action.status !== "approved") return { ignored: true as const };
+    await settleExecution(ctx, loaded.execution, loaded.order, loaded.action, {
+      phase: "pre_provider_failed", code: args.rejection, event: "cj_sandbox_dispatch_provider_rejected",
+    });
+    return { ignored: false as const };
+  },
+});
+
 export const markSandboxCjDispatchAmbiguousExecution = mutation({
   args: { actionId: v.id("actions"), orderId: v.id("orders"), reason: v.string(), receipt: dispatchReceipt },
   handler: async (ctx, args) => {
@@ -711,7 +737,12 @@ export const listDueSandboxCjDispatchReconciliations = query({
     await requireServiceIdentity(ctx);
     const now = Date.now();
     const cap = Math.max(1, Math.min(args.limit ?? 25, 100));
-    return await ctx.db.query("cjDispatchExecutions").withIndex("by_phase_next_reconcile", (q: any) => q.eq("phase", "reconciliation_required").lte("nextReconcileAt", now)).take(cap);
+    const due = await ctx.db.query("cjDispatchExecutions")
+      .withIndex("by_phase_next_reconcile", (q: any) => q.eq("phase", "reconciliation_required").lte("nextReconcileAt", now))
+      .take(cap);
+    // The sweeper has no provider, order, or lease capability: it only needs this opaque row ID
+    // to claim the next durable schedule generation.
+    return due.map((execution) => ({ executionId: execution._id }));
   },
 });
 
