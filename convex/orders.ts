@@ -3,6 +3,8 @@ import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { cjOrderInputHash, normalizeCjOrderInput, sandboxDispatchDecision, sandboxOrderNumber } from "../src/lib/cjOrder";
+import { hasVerifiedShopifyCjLineage } from "../src/lib/orderLineageState";
+import { hasValidSandboxCjApprovalBinding } from "../src/lib/sandboxCjBinding";
 
 const fulfillmentStatus = v.union(
   v.literal("received"),
@@ -15,13 +17,54 @@ const cjDispatchStatus = v.union(v.literal("staged"), v.literal("reserved"), v.l
 const cjOrderInput = v.object({
   orderNumber: v.string(), shippingZip: v.string(), shippingCountryCode: v.string(), shippingCountry: v.string(),
   shippingProvince: v.string(), shippingCity: v.string(), shippingAddress: v.string(), shippingCustomerName: v.string(),
-  shippingPhone: v.string(), logisticName: v.optional(v.string()), fromCountryCode: v.optional(v.string()),
+  shippingPhone: v.string(), logisticName: v.string(), fromCountryCode: v.string(),
   products: v.array(v.object({ vid: v.string(), quantity: v.number() })),
 });
+const shopifyLine = v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() });
+const shippingInput = v.object({
+  shippingZip: v.string(), shippingCountryCode: v.string(), shippingCountry: v.string(), shippingProvince: v.string(),
+  shippingCity: v.string(), shippingAddress: v.string(), shippingCustomerName: v.string(), shippingPhone: v.string(),
+});
+const logisticsPreflight = v.object({ logisticName: v.string(), fromCountryCode: v.string(), quotedAt: v.number(), quotedPriceUsd: v.number() });
 
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: sandbox dispatch requires the service runtime");
 }
+
+type ShopifyLine = { productId: string; variantId: string; quantity: number };
+
+/** Resolve signed Shopify product+variant IDs through this site's immutable DRAFT import mapping. */
+async function resolvePersistedShopifyCjLineage(ctx: any, siteId: any, lines: ShopifyLine[]) {
+  if (!lines.length) throw new Error("Shopify order has no lines eligible for CJ staging");
+  const resolved: Array<{ productId: string; variantId: string; cjProductId: string; cjVariantId: string; cjEvidenceId: any; fromCountryCode: string; quantity: number }> = [];
+  for (const line of lines) {
+    if (!Number.isInteger(line.quantity) || line.quantity < 1 || !line.productId.startsWith("gid://shopify/Product/") || !line.variantId.startsWith("gid://shopify/ProductVariant/")) {
+      throw new Error("Shopify order line identity is invalid");
+    }
+    const product = await ctx.db.query("products").withIndex("by_site", (q: any) => q.eq("siteId", siteId))
+      .filter((q: any) => q.eq(q.field("shopifyProductId"), line.productId))
+      .filter((q: any) => q.eq(q.field("shopifyVariantId"), line.variantId)).first();
+    const evidence = product?.cjEvidenceId ? await ctx.db.get(product.cjEvidenceId) : null;
+    if (!hasVerifiedShopifyCjLineage({ siteId, line, product, evidence })) {
+      throw new Error("Shopify order line CJ evidence lineage is invalid");
+    }
+    resolved.push({ productId: line.productId, variantId: line.variantId, cjProductId: product.cjProductId, cjVariantId: product.cjVariantId, cjEvidenceId: product.cjEvidenceId, fromCountryCode: product.cjFromCountryCode, quantity: line.quantity });
+  }
+  const fromCountryCode = resolved[0].fromCountryCode;
+  if (!/^[A-Z]{2}$/.test(fromCountryCode) || resolved.some((line) => line.fromCountryCode !== fromCountryCode)) {
+    throw new Error("Shopify order has no single verified CJ origin; an operator must split or reconcile fulfillment");
+  }
+  return { fromCountryCode, lines: resolved };
+}
+
+/** Service-only, read-free mapping used by the webhook before the read-only CJ freight quote. */
+export const resolveShopifyCjLineage = query({
+  args: { siteId: v.id("sites"), lines: v.array(shopifyLine) },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    return resolvePersistedShopifyCjLineage(ctx, args.siteId, args.lines);
+  },
+});
 
 // Map a Shopify displayFulfillmentStatus → our fulfillment enum. We DON'T touch sent_to_cj here
 // (that's set by the CJ loop in Phase 2b) — a Shopify-side FULFILLED maps straight to "shipped".
@@ -142,28 +185,32 @@ export const record = mutation({
  * human-gated sandbox-dispatch action. This is service-only: order PII never crosses a browser.
  */
 export const stageSandboxCjDispatch = mutation({
-  args: { siteId: v.id("sites"), shopifyOrderId: v.string(), totalUsd: v.number(), cjInput: cjOrderInput },
+  args: { siteId: v.id("sites"), shopifyOrderId: v.string(), totalUsd: v.number(), shipping: shippingInput, shopifyLines: v.array(shopifyLine), logistics: logisticsPreflight },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
+    const lineage = await resolvePersistedShopifyCjLineage(ctx, args.siteId, args.shopifyLines);
+    if (args.logistics.fromCountryCode !== lineage.fromCountryCode || !args.logistics.logisticName.trim() || !Number.isFinite(args.logistics.quotedAt) || !Number.isFinite(args.logistics.quotedPriceUsd) || args.logistics.quotedPriceUsd < 0) {
+      throw new Error("CJ logistics preflight is missing, stale, or not bound to this order's verified source origin; operator action is required");
+    }
     const orderNumber = sandboxOrderNumber(String(args.siteId), args.shopifyOrderId);
-    const input = normalizeCjOrderInput(args.cjInput, orderNumber);
+    const input = normalizeCjOrderInput({ orderNumber, ...args.shipping, logisticName: args.logistics.logisticName, fromCountryCode: args.logistics.fromCountryCode, products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })) }, orderNumber);
     const inputHash = cjOrderInputHash(input);
     let order = await ctx.db.query("orders").withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
     if (order && order.siteId !== args.siteId) throw new Error("shopify order belongs to another site");
     if (order?.cjOrderInputHash && order.cjOrderInputHash !== inputHash) throw new Error("CJ order inputs are immutable once staged");
     if (!order) {
-      const orderId = await ctx.db.insert("orders", { siteId: args.siteId, shopifyOrderId: args.shopifyOrderId, totalUsd: args.totalUsd, fulfillmentStatus: "received", cjOrderInput: input, cjOrderInputHash: inputHash, cjOrderNumber: orderNumber, cjDispatchStatus: "staged", cjDispatchAttempt: 0, createdAt: Date.now(), sample: false });
+      const orderId = await ctx.db.insert("orders", { siteId: args.siteId, shopifyOrderId: args.shopifyOrderId, totalUsd: args.totalUsd, fulfillmentStatus: "received", cjOrderInput: input, cjLogisticsPreflight: args.logistics, cjOrderInputHash: inputHash, cjOrderNumber: orderNumber, cjDispatchStatus: "staged", cjDispatchAttempt: 0, createdAt: Date.now(), sample: false });
       order = await ctx.db.get(orderId);
     } else if (!order.cjOrderInputHash) {
-      await ctx.db.patch(order._id, { cjOrderInput: input, cjOrderInputHash: inputHash, cjOrderNumber: orderNumber, cjDispatchStatus: "staged", cjDispatchAttempt: 0 });
+      await ctx.db.patch(order._id, { cjOrderInput: input, cjLogisticsPreflight: args.logistics, cjOrderInputHash: inputHash, cjOrderNumber: orderNumber, cjDispatchStatus: "staged", cjDispatchAttempt: 0 });
       order = await ctx.db.get(order._id);
     }
     if (!order) throw new Error("order staging failed");
     if (order.cjApprovalActionId) return { orderId: order._id, actionId: order.cjApprovalActionId, orderNumber, inputHash, reused: true };
     const actionId = await ctx.db.insert("actions", {
       siteId: args.siteId, type: "dispatch_cj_sandbox_order", riskTier: "human_gated", status: "pending_approval",
-      params: { orderId: order._id, orderNumber, inputHash, isSandbox: 1, payType: 3 }, approvalDispatchKey: `approval-gate:cj:${args.siteId}:${orderNumber}`, approvalDispatchStatus: "pending",
-      rationale: "Immutable order-input snapshot is ready. Approval can dispatch exactly one CJ sandbox-only, create-only order.", proposedAt: Date.now(),
+      params: { orderId: order._id, orderNumber, inputHash, isSandbox: 1, payType: 3, logisticName: input.logisticName, fromCountryCode: input.fromCountryCode, logisticsQuotedAt: args.logistics.quotedAt, logisticsQuotedPriceUsd: args.logistics.quotedPriceUsd }, approvalDispatchKey: `approval-gate:cj:${args.siteId}:${orderNumber}`, approvalDispatchStatus: "pending",
+      rationale: "Immutable order-input snapshot and verified CJ freight route are ready. Approval can dispatch exactly one CJ sandbox-only, create-only order.", proposedAt: Date.now(),
     });
     await ctx.db.patch(order._id, { cjApprovalActionId: actionId });
     await appendAudit(ctx, { siteId: args.siteId, actionId, event: "cj_sandbox_dispatch_staged", detail: { orderId: order._id, orderNumber, inputHash, isSandbox: 1, payType: 3 } });
@@ -178,12 +225,11 @@ export const claimSandboxCjDispatch = mutation({
     await requireServiceIdentity(ctx);
     const action = await ctx.db.get(actionId);
     if (!action || action.type !== "dispatch_cj_sandbox_order") throw new Error("CJ sandbox dispatch needs its exact approved action");
-    const params = action.params as { orderId?: string; orderNumber?: string; inputHash?: string; isSandbox?: number; payType?: number };
+    const params = action.params as { orderId?: string };
     // `params` is intentionally untyped action metadata; constrain this dynamic lookup back to
     // the order shape before inspecting any PII/state fields.
     const order = params.orderId ? await ctx.db.get(params.orderId as any) as any : null;
-    if (!order || order.siteId !== action.siteId || order.cjApprovalActionId !== actionId || !order.cjOrderInput || !order.cjOrderInputHash) throw new Error("CJ approval is not bound to a persisted order input");
-    if (params.orderNumber !== order.cjOrderInput.orderNumber || params.inputHash !== order.cjOrderInputHash || params.isSandbox !== 1 || params.payType !== 3) throw new Error("CJ approval binding is invalid");
+    if (!hasValidSandboxCjApprovalBinding({ actionId, action, order })) throw new Error("CJ approval binding is invalid");
     // Completion is replay-safe even if a later local outbox write failed. A different action
     // or CJ id never gets to reuse this success path.
     if (action.status === "executed" && order.cjDispatchStatus === "sent" && order.cjOrderId) return { state: "reused" as const, siteId: order.siteId, orderId: order._id, cjOrderId: order.cjOrderId, orderNumber: order.cjOrderInput.orderNumber };

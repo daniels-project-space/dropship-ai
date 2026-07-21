@@ -12,8 +12,8 @@ export async function executeApprovedShopifyDraftImport<TProduct extends { title
   dependencies: {
     preflight: () => Promise<DraftImportPreflight<TProduct, TConfig>>;
     reserve: () => Promise<{ status: "reserved" } | { status: "already_created"; shopifyProductId?: string }>;
-    createDraft: (config: TConfig, product: TProduct) => Promise<{ id: string; title: string }>;
-    complete: (shopifyProductId: string) => Promise<void>;
+    createDraft: (config: TConfig, product: TProduct) => Promise<{ id: string; title: string; variantId: string }>;
+    complete: (shopifyProductId: string, shopifyVariantId: string) => Promise<void>;
     markAmbiguous: (error: string) => Promise<void>;
   },
 ): Promise<{ ok: true; reused?: boolean; shopifyProductId?: string; title?: string; status?: "DRAFT" } | { ok: false; error: string; reconcileRequired: boolean }> {
@@ -33,7 +33,7 @@ export async function executeApprovedShopifyDraftImport<TProduct extends { title
   }
   try {
     const created = await dependencies.createDraft(ready.config, ready.product);
-    await dependencies.complete(created.id);
+    await dependencies.complete(created.id, created.variantId);
     return { ok: true, shopifyProductId: created.id, title: created.title, status: "DRAFT" };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Shopify draft import failed";

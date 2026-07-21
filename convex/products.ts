@@ -113,6 +113,7 @@ export const createSourcedDraft = mutation({
       cjVariantId: evidence.cjVariantId,
       cjEvidenceId: evidence._id,
       cjFromUsWarehouse: true,
+      cjFromCountryCode: evidence.fromCountryCode,
       sourceUrl: evidence.sourceUrl,
       sourceVerifiedAt: evidence.readAt,
       cogsUsd: economics.cogsUsd,
@@ -158,6 +159,7 @@ export const recordCjEvidence = mutation({
     shippingUsd: v.optional(v.number()),
     inventoryQty: v.number(),
     fromUsWarehouse: v.boolean(),
+    fromCountryCode: v.optional(v.string()),
     inventoryVerified: v.boolean(),
     sourceUrl: v.string(),
     traceId: v.string(),
@@ -212,6 +214,7 @@ export const stageSourcedDraftSelection = mutation({
     shippingUsd: v.optional(v.number()),
     inventoryQty: v.number(),
     fromUsWarehouse: v.boolean(),
+    fromCountryCode: v.optional(v.string()),
     inventoryVerified: v.boolean(),
     sourceUrl: v.string(),
     traceId: v.string(),
@@ -264,6 +267,7 @@ export const stageSourcedDraftSelection = mutation({
       ...(args.shippingUsd !== undefined ? { shippingUsd: args.shippingUsd } : {}),
       inventoryQty: args.inventoryQty,
       fromUsWarehouse: args.fromUsWarehouse,
+      ...(args.fromCountryCode ? { fromCountryCode: args.fromCountryCode } : {}),
       inventoryVerified: args.inventoryVerified,
       sourceUrl: args.sourceUrl,
       traceId: args.traceId,
@@ -298,7 +302,7 @@ export const stageSourcedDraftSelection = mutation({
     const economics = gate.economics!;
     const record = {
       title: args.title, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, cjEvidenceId: evidenceId,
-      cjFromUsWarehouse: true, sourceUrl: args.sourceUrl, sourceVerifiedAt: args.readAt,
+      cjFromUsWarehouse: true, cjFromCountryCode: args.fromCountryCode, sourceUrl: args.sourceUrl, sourceVerifiedAt: args.readAt,
       cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, dutyUsd: economics.dutyUsd,
       paymentFeeUsd: economics.paymentFeeUsd, refundReserveUsd: economics.refundReserveUsd, contentCostUsd: economics.contentCostUsd,
       landedCostUsd: economics.landedCostUsd, priceUsd: args.priceUsd, contributionMarginPct: economics.contributionMarginPct,
@@ -380,7 +384,7 @@ export const reserveApprovedShopifyDraftImport = mutation({
 });
 
 export const completeApprovedShopifyDraftImport = mutation({
-  args: { siteId: v.id("sites"), productId: v.id("products"), actionId: v.id("actions"), traceId: v.string(), shopifyProductId: v.string() },
+  args: { siteId: v.id("sites"), productId: v.id("products"), actionId: v.id("actions"), traceId: v.string(), shopifyProductId: v.string(), shopifyVariantId: v.string() },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const product = await ctx.db.get(args.productId);
@@ -390,11 +394,12 @@ export const completeApprovedShopifyDraftImport = mutation({
     const trace = await ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", args.traceId)).first();
     if (!trace) throw new Error("draft import trace is missing");
     const now = Date.now();
-    await ctx.db.patch(args.productId, { shopifyProductId: args.shopifyProductId, shopifyDraftImportStatus: "created" });
+    if (!args.shopifyProductId.startsWith("gid://shopify/Product/") || !args.shopifyVariantId.startsWith("gid://shopify/ProductVariant/")) throw new Error("Shopify draft import returned invalid product or variant identity");
+    await ctx.db.patch(args.productId, { shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, shopifyDraftImportStatus: "created" });
     await ctx.db.patch(args.actionId, { status: "executed", resolvedAt: now });
     const traceDetail = typeof trace.detail === "object" && trace.detail !== null ? trace.detail as Record<string, unknown> : {};
-    await ctx.db.patch(trace._id, { status: "succeeded", detail: { ...traceDetail, productId: args.productId, actionId: args.actionId, evidenceId: product.cjEvidenceId, shopifyProductId: args.shopifyProductId, published: false }, finishedAt: now });
-    await appendAudit(ctx, { siteId: args.siteId, actionId: args.actionId, event: "shopify_draft_imported", detail: { productId: args.productId, shopifyProductId: args.shopifyProductId, traceId: args.traceId, published: false } });
+    await ctx.db.patch(trace._id, { status: "succeeded", detail: { ...traceDetail, productId: args.productId, actionId: args.actionId, evidenceId: product.cjEvidenceId, shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, published: false }, finishedAt: now });
+    await appendAudit(ctx, { siteId: args.siteId, actionId: args.actionId, event: "shopify_draft_imported", detail: { productId: args.productId, shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, traceId: args.traceId, published: false } });
     return args.productId;
   },
 });

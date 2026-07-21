@@ -91,6 +91,7 @@ test("CJ evidence is parsed from a verified US variant and unknown shipping neve
     shippingUsd: 0,
     inventoryQty: 7,
     fromUsWarehouse: true,
+    fromCountryCode: "US",
     inventoryVerified: true,
     sourceUrl: "https://developers.cjdropshipping.com/api2.0/v1/product/query?pid=product-1",
   });

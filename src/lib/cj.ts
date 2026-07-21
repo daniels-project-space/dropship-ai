@@ -144,8 +144,10 @@ export interface CreateOrderInput {
   shippingAddress: string;
   shippingCustomerName: string;
   shippingPhone: string;
-  logisticName?: string;
-  fromCountryCode?: string;
+  /** Required by CJ createOrderV2 and copied only from a verified freight preflight. */
+  logisticName: string;
+  /** Required by CJ createOrderV2 and bound to persisted source warehouse lineage. */
+  fromCountryCode: string;
   products: CjOrderLine[];
 }
 
@@ -157,12 +159,55 @@ export interface CreateOrderResult {
 /** Create-only order (payType:3). Returns CJ orderId; no tracking is expected here. */
 export async function createSandboxOrder(input: CreateOrderInput, token?: string): Promise<CreateOrderResult> {
   if (!input.orderNumber.startsWith("dsa-sb-")) throw new Error("CJ sandbox orderNumber must use the persisted sandbox identity");
+  if (!input.logisticName.trim() || !/^[A-Za-z]{2}$/.test(input.fromCountryCode)) {
+    throw new Error("CJ sandbox order requires a verified logisticName and two-letter fromCountryCode");
+  }
   const data = await cjFetch<{ orderId: string }>("/shopping/order/createOrderV2", {
     // These are a second, adapter-level boundary in addition to the dispatch mutation below.
     body: { ...input, payType: 3, isSandbox: 1 },
     token,
   });
   return { orderId: data.orderId, orderNumber: input.orderNumber };
+}
+
+export interface CjFreightPreflightInput {
+  fromCountryCode: string;
+  destinationCountryCode: string;
+  shippingZip?: string;
+  products: CjOrderLine[];
+}
+
+export interface CjFreightQuote {
+  logisticName: string;
+  logisticPriceUsd: number;
+}
+
+/**
+ * Read-only CJ freight trial. The caller persists the selected result with the order before it
+ * can be approved; this helper never creates, reserves, pays for, or confirms an order.
+ */
+export async function quoteCjFreight(input: CjFreightPreflightInput, token?: string): Promise<CjFreightQuote[]> {
+  const fromCountryCode = input.fromCountryCode.trim().toUpperCase();
+  const destinationCountryCode = input.destinationCountryCode.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(fromCountryCode) || !/^[A-Z]{2}$/.test(destinationCountryCode) || !input.products.length) {
+    throw new Error("CJ freight preflight requires verified two-letter origin/destination and products");
+  }
+  const data = await cjFetch<Array<{ logisticName?: unknown; logisticPrice?: unknown }>>("/logistic/freightCalculate", {
+    body: { startCountryCode: fromCountryCode, endCountryCode: destinationCountryCode, zip: input.shippingZip || undefined, products: input.products },
+    token,
+  });
+  return data.flatMap((candidate) => {
+    const logisticName = typeof candidate.logisticName === "string" ? candidate.logisticName.trim() : "";
+    const logisticPriceUsd = typeof candidate.logisticPrice === "number" ? candidate.logisticPrice : Number(candidate.logisticPrice);
+    return logisticName && Number.isFinite(logisticPriceUsd) && logisticPriceUsd >= 0 ? [{ logisticName, logisticPriceUsd }] : [];
+  });
+}
+
+/** Deterministic policy over actual CJ quote rows; it never invents a carrier or warehouse. */
+export function selectVerifiedCjFreight(quotes: CjFreightQuote[]): CjFreightQuote {
+  const valid = quotes.filter((quote) => quote.logisticName.trim() && Number.isFinite(quote.logisticPriceUsd) && quote.logisticPriceUsd >= 0);
+  if (!valid.length) throw new Error("CJ freight preflight found no valid logistics route; refresh sourcing or resolve warehouse/logistics with an operator");
+  return [...valid].sort((a, b) => a.logisticPriceUsd - b.logisticPriceUsd || a.logisticName.localeCompare(b.logisticName))[0];
 }
 
 /** @deprecated All supplier writes are sandbox-only. Use createSandboxOrder. */

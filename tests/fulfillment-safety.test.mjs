@@ -56,6 +56,7 @@ test("CJ sandbox dispatch is create-only, binds isSandbox=1, and has no real-eff
     const input = {
       orderNumber: "ignored", shippingZip: "00000", shippingCountryCode: "US", shippingCountry: "United States",
       shippingProvince: "CA", shippingCity: "Test", shippingAddress: "Sandbox", shippingCustomerName: "Test", shippingPhone: "0000000000",
+      logisticName: "Verified CJ route", fromCountryCode: "US",
       products: [{ vid: "variant", quantity: 1 }],
     };
     const orderNumber = sandboxOrderNumber("site_1", "gid://shopify/Order/1");
@@ -75,6 +76,7 @@ test("a persisted input snapshot and approval fingerprint are stable; reserved o
   const first = normalizeCjOrderInput({
     orderNumber: "untrusted", shippingZip: "00000", shippingCountryCode: "us", shippingCountry: "United States",
     shippingProvince: "CA", shippingCity: "Test", shippingAddress: "Sandbox", shippingCustomerName: "Test", shippingPhone: "0000000000",
+    logisticName: "Verified CJ route", fromCountryCode: "US",
     products: [{ vid: "variant", quantity: 1 }],
   }, orderNumber);
   const replay = normalizeCjOrderInput({ ...first, orderNumber: "other" }, orderNumber);

@@ -39,7 +39,8 @@ export function sandboxOrderNumber(siteId: string, shopifyOrderId: string): stri
 
 export function normalizeCjOrderInput(input: CreateOrderInput, orderNumber: string): CreateOrderInput {
   if (!orderNumber || !input.shippingCountryCode || !input.shippingCountry || !input.shippingProvince
-    || !input.shippingCity || !input.shippingAddress || !input.shippingCustomerName || !input.products.length) {
+    || !input.shippingCity || !input.shippingAddress || !input.shippingCustomerName || typeof input.logisticName !== "string" || !input.logisticName.trim()
+    || typeof input.fromCountryCode !== "string" || !/^[A-Za-z]{2}$/.test(input.fromCountryCode) || !input.products.length) {
     throw new Error("CJ order input is incomplete");
   }
   if (input.products.some((line) => !line.vid || !Number.isInteger(line.quantity) || line.quantity <= 0)) {
@@ -55,8 +56,8 @@ export function normalizeCjOrderInput(input: CreateOrderInput, orderNumber: stri
     shippingAddress: input.shippingAddress,
     shippingCustomerName: input.shippingCustomerName,
     shippingPhone: input.shippingPhone,
-    logisticName: input.logisticName,
-    fromCountryCode: input.fromCountryCode,
+    logisticName: input.logisticName.trim(),
+    fromCountryCode: input.fromCountryCode.toUpperCase(),
     products: input.products.map((line) => ({ vid: line.vid, quantity: line.quantity })),
   };
 }
@@ -73,8 +74,8 @@ export function cjOrderInputHash(input: CreateOrderInput): string {
     shippingAddress: input.shippingAddress,
     shippingCustomerName: input.shippingCustomerName,
     shippingPhone: input.shippingPhone,
-    logisticName: input.logisticName ?? null,
-    fromCountryCode: input.fromCountryCode ?? null,
+    logisticName: input.logisticName,
+    fromCountryCode: input.fromCountryCode,
     products: input.products.map((line) => ({ vid: line.vid, quantity: line.quantity })),
   }));
 }

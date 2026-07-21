@@ -213,7 +213,7 @@ export async function listOrders(
 const PRODUCT_CREATE = /* GraphQL */ `
   mutation productCreate($product: ProductCreateInput!) {
     productCreate(product: $product) {
-      product { id title handle }
+      product { id title handle variants(first: 1) { nodes { id } } }
       userErrors { field message }
     }
   }
@@ -228,15 +228,16 @@ export interface ProductCreateInput {
 export async function productCreate(
   cfg: ShopifyClientConfig,
   input: ProductCreateInput,
-): Promise<{ id: string; title: string; handle: string }> {
+): Promise<{ id: string; title: string; handle: string; variantId: string }> {
   const data = await graphql<{
-    productCreate: { product: { id: string; title: string; handle: string } | null; userErrors: Array<{ message: string }> };
+    productCreate: { product: { id: string; title: string; handle: string; variants: { nodes: Array<{ id: string }> } } | null; userErrors: Array<{ message: string }> };
   }>(cfg, PRODUCT_CREATE, { product: { ...input, status: "DRAFT" } });
   const { product, userErrors } = data.productCreate;
-  if (userErrors.length || !product) {
+  const variantId = product?.variants.nodes[0]?.id;
+  if (userErrors.length || !product || !variantId) {
     throw new Error(`productCreate failed: ${userErrors.map((e) => e.message).join("; ") || "no product"}`);
   }
-  return product;
+  return { id: product.id, title: product.title, handle: product.handle, variantId };
 }
 
 const PAGE_CREATE = /* GraphQL */ `

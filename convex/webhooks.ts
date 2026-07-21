@@ -3,6 +3,7 @@
 import { mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
+import { webhookDeliveryDecision, cjTrackingMappingDecision } from "../src/lib/webhookReceiptState";
 
 const fulfillmentStatus = v.union(
   v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
@@ -19,7 +20,7 @@ export const recordShopifyOrder = mutation({
   handler: async (ctx, args) => {
     const prior = await ctx.db.query("webhookReceipts")
       .withIndex("by_provider_site_delivery", (q) => q.eq("provider", "shopify").eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
-    if (prior) return { duplicate: true, outcome: prior.outcome };
+    if (webhookDeliveryDecision(prior) === "duplicate") return { duplicate: true, outcome: prior!.outcome };
 
     const existing = await ctx.db.query("orders")
       .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
@@ -50,24 +51,20 @@ export const recordCjTracking = mutation({
   handler: async (ctx, args) => {
     const prior = await ctx.db.query("webhookReceipts")
       .withIndex("by_provider_site_delivery", (q) => q.eq("provider", "cj").eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
-    if (prior) return { duplicate: true, outcome: prior.outcome };
+    if (webhookDeliveryDecision(prior) === "duplicate") return { duplicate: true, outcome: prior!.outcome };
 
     const order = await ctx.db.query("orders")
       .withIndex("by_cj_order_number", (q) => q.eq("cjOrderNumber", args.cjOrderNumber)).first();
-    if (!order || order.siteId !== args.siteId) {
+    if (cjTrackingMappingDecision({ order, siteId: args.siteId, incomingCjOrderId: args.cjOrderId }) === "ignore") {
       await ctx.db.insert("webhookReceipts", {
         provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
         payloadHash: args.payloadHash, outcome: "ignored", receivedAt: Date.now(),
       });
       return { duplicate: false, outcome: "ignored" as const };
     }
-    if (args.cjOrderId && order.cjOrderId && args.cjOrderId !== order.cjOrderId) {
-      await ctx.db.insert("webhookReceipts", {
-        provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
-        payloadHash: args.payloadHash, outcome: "ignored", receivedAt: Date.now(),
-      });
-      return { duplicate: false, outcome: "ignored" as const };
-    }
+    // The reducer above rejects null orders; retain this explicit guard for TypeScript and future
+    // changes to the decision table.
+    if (!order) throw new Error("CJ webhook mapping unexpectedly lost its persisted order");
     await ctx.db.patch(order._id, {
       trackingNumber: args.trackingNumber ?? order.trackingNumber,
       trackingUrl: args.trackingUrl ?? order.trackingUrl,

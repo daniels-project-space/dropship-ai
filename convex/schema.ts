@@ -63,10 +63,15 @@ export default defineSchema({
     siteId: v.id("sites"),
     title: v.string(),
     shopifyProductId: v.optional(v.string()),
+    // IDs returned by the approved DRAFT-only import. These are the authority for mapping
+    // signed Shopify order lines back to the immutable CJ sourcing lineage; merchant SKU text
+    // is intentionally never used as supplier identity.
+    shopifyVariantId: v.optional(v.string()),
     shopifyDraftImportStatus: v.optional(v.union(v.literal("creating"), v.literal("created"), v.literal("ambiguous"))),
     shopifyDraftImportTraceId: v.optional(v.string()),
     cjProductId: v.optional(v.string()),
     cjVariantId: v.optional(v.string()),          // exact sellable variant used for the verified quote
+    cjFromCountryCode: v.optional(v.string()),    // verified CJ inventory origin used for freight preflight
     cjEvidenceId: v.optional(v.id("cjEvidence")), // immutable parsed CJ read used to derive costs
     cjFromUsWarehouse: v.boolean(),               // §8.2 prefer US-warehouse (duty-paid bulk) only
     cogsUsd: v.number(),
@@ -96,6 +101,7 @@ export default defineSchema({
     shippingUsd: v.optional(v.number()),
     inventoryQty: v.number(),
     fromUsWarehouse: v.boolean(),
+    fromCountryCode: v.optional(v.string()),
     inventoryVerified: v.boolean(),
     sourceUrl: v.string(),
     traceId: v.string(),
@@ -204,9 +210,17 @@ export default defineSchema({
       shippingAddress: v.string(),
       shippingCustomerName: v.string(),
       shippingPhone: v.string(),
-      logisticName: v.optional(v.string()),
-      fromCountryCode: v.optional(v.string()),
+      logisticName: v.string(),
+      fromCountryCode: v.string(),
       products: v.array(v.object({ vid: v.string(), quantity: v.number() })),
+    })),
+    // Exact read-only freight quote used to select the required CJ logistics fields above.
+    // It contains no customer address and is never copied to jobs, traces, logs, or browsers.
+    cjLogisticsPreflight: v.optional(v.object({
+      logisticName: v.string(),
+      fromCountryCode: v.string(),
+      quotedAt: v.number(),
+      quotedPriceUsd: v.number(),
     })),
     cjOrderInputHash: v.optional(v.string()),
     cjDispatchAttempt: v.optional(v.number()),   // fenced reservation generation; never reused after a reconcile miss

@@ -11,6 +11,7 @@ export interface ParsedCjEvidence {
   shippingUsd?: number;
   inventoryQty: number;
   fromUsWarehouse: boolean;
+  fromCountryCode?: string;
   inventoryVerified: boolean;
   sourceUrl: string;
 }
@@ -91,6 +92,7 @@ export function parseCjEvidence(input: {
     ...(freeShipping ? { shippingUsd: 0 } : {}),
     inventoryQty,
     fromUsWarehouse: usInventory.length > 0,
+    ...(usInventory.length > 0 ? { fromCountryCode: "US" } : {}),
     inventoryVerified,
     sourceUrl: `https://developers.cjdropshipping.com/api2.0/v1/product/query?pid=${encodeURIComponent(input.productId)}`,
   };

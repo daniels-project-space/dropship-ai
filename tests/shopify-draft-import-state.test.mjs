@@ -7,7 +7,7 @@ function dependencies(overrides = {}) {
   return {
     preflight: async () => ({ product: { title: "Verified widget" }, config: { shop: "test" } }),
     reserve: async () => ({ status: "reserved" }),
-    createDraft: async () => ({ id: "gid://shopify/Product/1", title: "Verified widget" }),
+    createDraft: async () => ({ id: "gid://shopify/Product/1", variantId: "gid://shopify/ProductVariant/1", title: "Verified widget" }),
     complete: async () => {},
     markAmbiguous: async () => {},
     ...overrides,
@@ -52,7 +52,7 @@ test("an ambiguous provider response is reconciled only after reservation", asyn
 
 test("concurrent duplicate sees the internal draft lineage reuse and creates no second provider product", async () => {
   let creates = 0;
-  const once = dependencies({ createDraft: async () => ({ id: `gid://shopify/Product/${++creates}`, title: "Verified widget" }) });
+  const once = dependencies({ createDraft: async () => ({ id: `gid://shopify/Product/${++creates}`, variantId: "gid://shopify/ProductVariant/1", title: "Verified widget" }) });
   const first = await executeApprovedShopifyDraftImport(once);
   const duplicate = await executeApprovedShopifyDraftImport(dependencies({
     reserve: async () => ({ status: "already_created", shopifyProductId: "gid://shopify/Product/1" }),
@@ -75,7 +75,7 @@ test("a Shopify ID mirrored from the provider is never reported as this applicat
 test("successful completion is draft-only and has no publish, order, or customer operation", async () => {
   const calls = [];
   const result = await executeApprovedShopifyDraftImport(dependencies({
-    createDraft: async (_config, product) => { calls.push(["productCreate", product.title]); return { id: "gid://shopify/Product/1", title: product.title }; },
+    createDraft: async (_config, product) => { calls.push(["productCreate", product.title]); return { id: "gid://shopify/Product/1", variantId: "gid://shopify/ProductVariant/1", title: product.title }; },
     complete: async () => { calls.push(["complete"]); },
   }));
   assert.deepEqual(result, { ok: true, shopifyProductId: "gid://shopify/Product/1", title: "Verified widget", status: "DRAFT" });

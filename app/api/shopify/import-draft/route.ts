@@ -39,8 +39,8 @@ export async function POST(request: Request) {
     },
     reserve: () => convex.mutation(api.products.reserveApprovedShopifyDraftImport, { siteId, productId, actionId, traceId }),
     createDraft: (config, product) => productCreate(config, { title: product.title }),
-    complete: async (shopifyProductId) => {
-      await convex.mutation(api.products.completeApprovedShopifyDraftImport, { siteId, productId, actionId, traceId, shopifyProductId });
+    complete: async (shopifyProductId, shopifyVariantId) => {
+      await convex.mutation(api.products.completeApprovedShopifyDraftImport, { siteId, productId, actionId, traceId, shopifyProductId, shopifyVariantId });
     },
     markAmbiguous: async (error) => {
       await convex.mutation(api.products.markApprovedShopifyDraftImportAmbiguous, { siteId, productId, actionId, traceId, error });
