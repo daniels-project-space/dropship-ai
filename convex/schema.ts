@@ -371,7 +371,8 @@ export default defineSchema({
     generationFingerprint: v.string(),
     attempt: v.number(),
     triggerRunId: v.string(),
-    // A deterministic opaque digest of the Trigger run id. It is not an order/customer value.
+    // A keyed opaque per-Trigger-run capability. It is not an order/customer value and the
+    // HMAC key remains only in the Trigger worker environment.
     leaseToken: v.string(),
     leaseVersion: v.number(),
     providerMode: v.literal("sandbox"),

@@ -59,6 +59,7 @@ function convexExecutor(t, actionId, run, token, hooks = {}) {
   return {
     claim: async () => { const value = await claimDispatch(t, actionId, run, token); if (hooks.afterClaim) await hooks.afterClaim(value); return value; },
     beginProviderCall: async ({ orderId, receipt }) => { const value = await call("beginSandboxCjProviderCall", { actionId, orderId, receipt }); if (hooks.afterBegin) await hooks.afterBegin(value); return value; },
+    beginReconciliation: async ({ orderId, receipt }) => { const value = await call("beginSandboxCjDispatchReconciliation", { actionId, orderId, receipt }); if (hooks.afterBeginReconciliation) await hooks.afterBeginReconciliation(value); return value; },
     findByOrderNumber: async () => null,
     reconcile: ({ orderId, receipt, lookup }) => call("reconcileSandboxCjDispatchExecution", { actionId, orderId, receipt, ...(lookup ? { lookup } : {}) }),
     createSandboxOrder: async () => { hooks.creates.count++; return { orderId: "cj-real-1" }; },
@@ -158,6 +159,7 @@ test("execution receipt requires service/run/token and rejects stale writers", a
   const claim = await claimDispatch(t, actionId);
   assert.equal(claim.state, "prepared");
   assert.equal(claim.receipt.attempt, 1);
+  await assert.rejects(() => t.mutation(api.orders.beginSandboxCjDispatchReconciliation, { actionId, orderId, receipt: claim.receipt }), /UNAUTHENTICATED/);
   await service(t).mutation(api.orders.beginSandboxCjProviderCall, { actionId, orderId, receipt: claim.receipt });
   const stale = { ...claim.receipt, leaseVersion: 2 };
   const complete = await service(t).mutation(api.orders.completeSandboxCjDispatchExecution, { actionId, orderId, cjOrderId: "cj-old", receipt: stale });
@@ -227,6 +229,69 @@ test("actual executor and Convex handlers survive commit-then-response-loss with
   assert.equal(trace.status, "succeeded");
 });
 
+test("actual executor response-loss matrix never crosses CJ twice and terminal attention cannot re-arm", async () => {
+  for (const phase of ["begin", "complete", "ambiguous"]) {
+    const t = convexTest({ schema, modules });
+    const { orderId, actionId } = await seedApprovedDispatch(t);
+    const creates = { count: 0 };
+    let lost = true;
+    const hooks = phase === "begin"
+      ? { creates, afterBegin: async () => { if (lost) { lost = false; throw new Error("begin response lost after commit"); } } }
+      : phase === "complete"
+        ? { creates, afterComplete: async () => { if (lost) { lost = false; throw new Error("complete response lost after commit"); } } }
+        : { creates, afterBegin: async () => { if (lost) { lost = false; throw new Error("provider timeout after begin"); } } };
+    if (phase === "complete") {
+      await executeSandboxCjDispatch(convexExecutor(t, actionId, "run-1", "q".repeat(64), hooks));
+    } else {
+      await assert.rejects(() => executeSandboxCjDispatch(convexExecutor(t, actionId, "run-1", "q".repeat(64), hooks)), /response lost|timeout/);
+    }
+    const execution = await t.run((ctx) => ctx.db.query("cjDispatchExecutions").withIndex("by_order", (q) => q.eq("orderId", orderId)).first());
+    if (phase === "ambiguous") {
+      await service(t).mutation(api.orders.markSandboxCjDispatchAmbiguousExecution, { actionId, orderId, reason: "response_lost", receipt: { executionId: execution._id, actionId, orderId, inputHash: execution.inputHash, generation: execution.generation, generationFingerprint: execution.generationFingerprint, attempt: execution.attempt, triggerRunId: execution.triggerRunId, leaseToken: execution.leaseToken, leaseVersion: execution.leaseVersion, providerMode: "sandbox", providerIdentity: execution.providerIdentity } });
+    }
+    await executeSandboxCjDispatch(convexExecutor(t, actionId, "run-1", "q".repeat(64), { creates }));
+    assert.equal(creates.count, phase === "complete" ? 1 : 0, `${phase} response loss must not create twice`);
+  }
+
+  const t = convexTest({ schema, modules });
+  const { actionId, orderId } = await seedApprovedDispatch(t);
+  const claim = await claimDispatch(t, actionId);
+  await service(t).mutation(api.orders.beginSandboxCjProviderCall, { actionId, orderId, receipt: claim.receipt });
+  await service(t).mutation(api.orders.markSandboxCjDispatchAmbiguousExecution, { actionId, orderId, reason: "timeout", receipt: claim.receipt });
+  await t.run((ctx) => ctx.db.patch(claim.receipt.executionId, { reconciliationCount: 5, reconciliationMax: 5, phase: "needs_attention", nextReconcileAt: undefined }));
+  assert.equal((await claimDispatch(t, actionId, "new-run", "n".repeat(64))).state, "blocked");
+  assert.equal((await t.run((ctx) => ctx.db.query("cjDispatchExecutions").withIndex("by_order", (q) => q.eq("orderId", orderId)).collect())).length, 1);
+});
+
+test("reconciliation due fence rejects provider lookup before a durable lease is ready", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const claim = await claimDispatch(t, actionId);
+  await service(t).mutation(api.orders.beginSandboxCjProviderCall, { actionId, orderId, receipt: claim.receipt });
+  await service(t).mutation(api.orders.markSandboxCjDispatchAmbiguousExecution, { actionId, orderId, reason: "timeout", receipt: claim.receipt });
+  await t.run((ctx) => ctx.db.patch(claim.receipt.executionId, { nextReconcileAt: Date.now() + 60_000 }));
+  let lookups = 0;
+  const result = await executeSandboxCjDispatch({
+    ...convexExecutor(t, actionId, "run-1", "t".repeat(64), { creates: { count: 0 } }),
+    findByOrderNumber: async () => { lookups++; return null; },
+  });
+  assert.equal(result.reason, "reconciliation_not_due");
+  assert.equal(lookups, 0);
+});
+
+test("a live provider lease cannot be stolen; expiry transfers only a reconciliation receipt and fences the old run", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const first = await claimDispatch(t, actionId, "old-run", "o".repeat(64));
+  await service(t).mutation(api.orders.beginSandboxCjProviderCall, { actionId, orderId, receipt: first.receipt });
+  assert.equal((await claimDispatch(t, actionId, "new-run", "n".repeat(64))).state, "blocked");
+  await t.run((ctx) => ctx.db.patch(first.receipt.executionId, { leaseExpiresAt: Date.now() - 1 }));
+  const transferred = await claimDispatch(t, actionId, "new-run", "n".repeat(64));
+  assert.equal(transferred.state, "reconcile_required");
+  assert.equal(transferred.receipt.leaseVersion, first.receipt.leaseVersion + 1);
+  assert.equal((await service(t).mutation(api.orders.completeSandboxCjDispatchExecution, { actionId, orderId, cjOrderId: "stale-cj", receipt: first.receipt })).ignored, true);
+});
+
 test("read-only reconciliation backs off five times then reaches one terminal attention state", async () => {
   const t = convexTest({ schema, modules });
   const { orderId, actionId } = await seedApprovedDispatch(t);
@@ -267,12 +332,14 @@ test("provider intake and runtime primitives reject anonymous and operator ident
   const { siteId, orderId, actionId } = await seedApprovedDispatch(t);
   const operator = t.withIdentity({ subject: "dropship-ai:operator" });
   const order = await t.run((ctx) => ctx.db.get(orderId));
+  const claim = await claimDispatch(t, actionId);
   const calls = [
     () => operator.mutation(api.orders.upsertFromShopify, { siteId, orders: [] }),
     () => operator.mutation(api.products.upsertFromShopify, { siteId, products: [] }),
     () => operator.mutation(api.orders.record, { siteId, shopifyOrderId: "gid://shopify/Order/x", totalUsd: 1 }),
     () => operator.mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" }),
     () => operator.mutation(api.orders.claimSandboxCjDispatch, { actionId, triggerRunId: "run", leaseToken: "t".repeat(64) }),
+    () => operator.mutation(api.orders.beginSandboxCjDispatchReconciliation, { actionId, orderId, receipt: claim.receipt }),
     () => operator.mutation(api.ops.enqueue, { siteId, kind: "test", target: "target", idempotencyKey: "key", traceId: "trace", payload: {} }),
     () => operator.mutation(api.ops.claimTarget, { target: "target", owner: "owner" }),
   ];

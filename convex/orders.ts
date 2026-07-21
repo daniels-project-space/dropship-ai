@@ -579,12 +579,21 @@ export const claimSandboxCjDispatch = mutation({
     if (existing && ["prepared", "provider_calling", "reconciliation_required"].includes(existing.phase)) {
       if (existing.phase === "prepared" && existing.leaseExpiresAt <= now) {
         await settleExecution(ctx, existing, order, action, { phase: "pre_provider_failed", code: "prepared_lease_expired", event: "cj_sandbox_dispatch_pre_provider_failed" });
-      } else if (existing.phase === "provider_calling" || existing.phase === "reconciliation_required") {
-        // An old provider call can only be read, never recreated. Transfer a fresh fenced read lease.
+      } else if ((existing.phase === "provider_calling" && existing.leaseExpiresAt <= now)
+        || (existing.phase === "reconciliation_required" && (existing.leaseExpiresAt <= now || (existing.nextReconcileAt !== undefined && existing.nextReconcileAt <= now)))) {
+        // An expired provider call, or a due read reconciliation, can only be read, never
+        // recreated. Do not revoke a live provider-call lease merely because another Trigger
+        // run arrived: its old receipt remains valid until the durable fence says otherwise.
         await ctx.db.patch(existing._id, { phase: "reconciliation_required", triggerRunId: args.triggerRunId, leaseToken: args.leaseToken, leaseVersion: existing.leaseVersion + 1, leaseExpiresAt: now + CJ_DISPATCH_LEASE_MS, nextReconcileAt: existing.nextReconcileAt ?? now, updatedAt: now });
         const transferred = { ...existing, phase: "reconciliation_required", triggerRunId: args.triggerRunId, leaseToken: args.leaseToken, leaseVersion: existing.leaseVersion + 1 };
         return { state: "reconcile_required" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, receipt: receiptFor(transferred) };
       } else return { state: "blocked" as const, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber };
+    }
+    // Attention is a terminal human decision point. It is deliberately not a retryable
+    // pre-provider failure: creating a later execution here could turn an ambiguous provider
+    // consequence into a second supplier order.
+    if (existing?.phase === "needs_attention") {
+      return { state: "blocked" as const, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber };
     }
     const attempt = (order.cjDispatchAttempt ?? 0) + 1;
     const idempotencyKey = dispatchKey(order, args.actionId, attempt);
@@ -616,6 +625,28 @@ export const beginSandboxCjProviderCall = mutation({
     await ctx.db.patch(trace._id, { status: "started", detail: { executionId: execution._id, providerBoundary: "entered", isSandbox: 1 } });
     await appendAudit(ctx, { siteId: order.siteId, actionId: args.actionId, event: "cj_sandbox_provider_calling", detail: { orderId: order._id, executionId: execution._id } });
     return { ignored: false as const };
+  },
+});
+
+/**
+ * Fences the read-only reconciliation boundary before Trigger contacts CJ.  In particular, a
+ * delayed Trigger delivery must not perform a provider lookup before its exact receipt is due
+ * and leased.  This mutation has no provider side effect and is safe to replay after its
+ * response is lost.
+ */
+export const beginSandboxCjDispatchReconciliation = mutation({
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), receipt: dispatchReceipt },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const now = Date.now();
+    const loaded = await loadFencedExecution(ctx, args);
+    if (!loaded) return { ready: false as const };
+    const { execution, action } = loaded;
+    if (action.status !== "approved" || (execution.phase !== "provider_calling" && execution.phase !== "reconciliation_required")) return { ready: false as const };
+    if (execution.leaseExpiresAt <= now || (execution.nextReconcileAt !== undefined && execution.nextReconcileAt > now)) {
+      return { ready: false as const, ...(execution.nextReconcileAt !== undefined ? { nextReconcileAt: execution.nextReconcileAt } : {}) };
+    }
+    return { ready: true as const };
   },
 });
 

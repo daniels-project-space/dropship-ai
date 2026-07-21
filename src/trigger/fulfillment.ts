@@ -7,7 +7,7 @@ import { createSandboxOrder, getSandboxOrderByOrderNumber, isAmbiguousCjWriteErr
 import { fulfillmentTrackingInfoUpdate, type ShopifyClientConfig } from "../lib/shopify";
 import { assertLiveEffectsEnabled, type EffectMode } from "../lib/effects";
 import { executeSandboxCjDispatch } from "../lib/sandboxCjDispatchExecutor";
-import { stableSha256 } from "../lib/cjOrder";
+import { createHmac } from "node:crypto";
 import type { Id } from "../../convex/_generated/dataModel";
 
 export interface FulfillOrderPayload {
@@ -15,16 +15,24 @@ export interface FulfillOrderPayload {
   actionId: string;
 }
 
+/** A stable per-Trigger-run capability. The HMAC key never leaves the worker process. */
+export function opaqueDispatchLeaseToken(triggerRunId: string, secret = process.env.TRIGGER_CJ_DISPATCH_LEASE_SECRET): string {
+  if (!secret) throw new Error("CJ sandbox dispatch is blocked: TRIGGER_CJ_DISPATCH_LEASE_SECRET is not configured");
+  return createHmac("sha256", secret).update(`dropship-ai:cj-sandbox-lease:${triggerRunId}`).digest("hex");
+}
+
 export const fulfillOrder = task({
   id: "fulfill-order",
   run: async ({ actionId }: FulfillOrderPayload, { ctx }) => {
     const convex = convexClient();
     const triggerRunId = ctx.run.id;
-    // Stable across an automatic retry of this exact Trigger run, but opaque to Convex callers.
-    const leaseToken = stableSha256(`dropship-ai:cj-sandbox-lease:${triggerRunId}`);
+    // Stable across an automatic retry of this exact Trigger run without exposing a derivable
+    // capability to callers that know only a Trigger run id.
+    const leaseToken = opaqueDispatchLeaseToken(triggerRunId);
     const result = await executeSandboxCjDispatch({
       claim: () => convex.mutation(api.orders.claimSandboxCjDispatch, { actionId: actionId as Id<"actions">, triggerRunId, leaseToken }) as any,
       beginProviderCall: ({ orderId, receipt }) => convex.mutation(api.orders.beginSandboxCjProviderCall, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
+      beginReconciliation: ({ orderId, receipt }) => convex.mutation(api.orders.beginSandboxCjDispatchReconciliation, { actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders">, receipt: { ...receipt, executionId: receipt.executionId as Id<"cjDispatchExecutions">, actionId: actionId as Id<"actions">, orderId: orderId as Id<"orders"> } }) as any,
       findByOrderNumber: async (orderNumber) => {
         const found = await getSandboxOrderByOrderNumber(orderNumber);
         if (!found) return null;

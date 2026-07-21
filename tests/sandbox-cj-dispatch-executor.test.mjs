@@ -10,6 +10,7 @@ function harness(claims = [prepared], overrides = {}) {
   return { calls, deps: {
     claim: async () => { calls.push("claim"); return claims.shift() ?? prepared; },
     beginProviderCall: async (input) => { calls.push(["begin", input]); return {}; },
+    beginReconciliation: async (input) => { calls.push(["begin-reconciliation", input]); return { ready: true }; },
     findByOrderNumber: async (orderNumber) => { calls.push(["find", orderNumber]); return null; },
     reconcile: async (input) => { calls.push(["reconcile", input]); return { state: "scheduled", nextReconcileAt: 123 }; },
     createSandboxOrder: async (input) => { calls.push(["create", input]); return { orderId: "cj-1" }; },
@@ -37,6 +38,7 @@ test("lost claim and begin responses replay read-only rather than create", async
   const result = await executeSandboxCjDispatch(replay.deps);
   assert.deepEqual(result, { reconciled: "found", orderId: "order-1", orderNumber: "dsa-sb-1" });
   assert.equal(replay.calls.some((x) => Array.isArray(x) && x[0] === "create"), false);
+  assert.equal(replay.calls.find((x) => Array.isArray(x) && x[0] === "begin-reconciliation") !== undefined, true);
   assert.deepEqual(replay.calls.find((x) => Array.isArray(x) && x[0] === "reconcile")[1].lookup, { orderId: "cj-1", orderNumber: "dsa-sb-1", isSandbox: 1 });
 });
 
@@ -62,4 +64,13 @@ test("a pre-boundary fence rejection never calls CJ", async () => {
   const result = await executeSandboxCjDispatch(run.deps);
   assert.equal(result.reason, "provider_fence_rejected");
   assert.equal(run.calls.some((x) => Array.isArray(x) && x[0] === "create"), false);
+});
+
+test("a reconciliation lookup is impossible until Convex grants its due lease", async () => {
+  const run = harness([{ state: "reconcile_required", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1", receipt }], {
+    beginReconciliation: async () => ({ ready: false, nextReconcileAt: 999 }),
+  });
+  const result = await executeSandboxCjDispatch(run.deps);
+  assert.equal(result.reason, "reconciliation_not_due");
+  assert.equal(run.calls.some((x) => Array.isArray(x) && (x[0] === "find" || x[0] === "reconcile" || x[0] === "create")), false);
 });

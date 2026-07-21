@@ -16,6 +16,7 @@ export type ClaimedSandboxDispatch =
 export interface SandboxCjDispatchDependencies {
   claim(): Promise<ClaimedSandboxDispatch>;
   beginProviderCall(input: { orderId: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ignored?: boolean }>;
+  beginReconciliation(input: { orderId: string; receipt: SandboxCjDispatchReceipt }): Promise<{ ready: boolean; nextReconcileAt?: number }>;
   findByOrderNumber(orderNumber: string): Promise<{ orderId: string; orderNumber: string; isSandbox: 1 | true } | null>;
   reconcile(input: { orderId: string; receipt: SandboxCjDispatchReceipt; lookup?: { orderId: string; orderNumber: string; isSandbox: 1 | true } }): Promise<{ state: "found" | "scheduled" | "needs_attention" | "ignored"; nextReconcileAt?: number }>;
   createSandboxOrder(input: unknown): Promise<{ orderId: string }>;
@@ -31,6 +32,10 @@ export async function executeSandboxCjDispatch(deps: SandboxCjDispatchDependenci
   if (claimed.state === "reused") return { skipped: true as const, reason: "already_dispatched", orderId: claimed.orderId, cjOrderId: claimed.cjOrderId };
   if (claimed.state === "blocked") return { skipped: true as const, reason: "dispatch_blocked", orderId: claimed.orderId };
   if (claimed.state === "reconcile_required") {
+    // Convex must grant this exact, due read lease before the provider lookup. This keeps a
+    // delayed task and a stale run entirely inside Convex rather than touching CJ.
+    const reconciliation = await deps.beginReconciliation({ orderId: claimed.orderId, receipt: claimed.receipt });
+    if (!reconciliation.ready) return { skipped: true as const, reason: "reconciliation_not_due", orderId: claimed.orderId };
     const lookup = await deps.findByOrderNumber(claimed.orderNumber);
     const result = await deps.reconcile({ orderId: claimed.orderId, receipt: claimed.receipt, ...(lookup ? { lookup } : {}) });
     if (result.state === "scheduled" && result.nextReconcileAt) await deps.scheduleReconciliation?.({ actionId: claimed.receipt.actionId, nextReconcileAt: result.nextReconcileAt });
