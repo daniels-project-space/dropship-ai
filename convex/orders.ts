@@ -182,7 +182,7 @@ export const claimCjStagingPreflight = mutation({
     await requireServiceIdentity(ctx);
     const intent = await ctx.db.get(intentId);
     if (!intent) throw new Error("CJ staging intent not found");
-    if (intent.status === "quoted") return { state: "quoted" as const, intentId, quote: intent.quote };
+    if (intent.status === "quoted") return { state: "quoted" as const, intentId, quote: intent.quote, attempt: intent.attempt, leaseGeneration: intent.leaseGeneration ?? 0 };
     // Stage and approval-dispatch are independently durable boundaries.  A lost worker must
     // resume the persisted action/key, not declare it complete before the waitpoint is armed.
     if (intent.status === "staged" || intent.status === "approval_dispatching") return { state: "staged" as const, intentId };
@@ -190,10 +190,10 @@ export const claimCjStagingPreflight = mutation({
     const now = Date.now();
     if (intent.status === "preflighting" && (intent.leaseExpiresAt ?? 0) > now) return { state: "busy" as const, intentId };
     if (intent.status !== "pending" && intent.status !== "preflighting" && intent.status !== "preflight_required") throw new Error("CJ staging intent is not eligible for preflight");
-    const workerAttempt = (intent.workerAttempt ?? 0) + 1;
-    if (workerAttempt > CJ_STAGING_MAX_ATTEMPTS) {
+    const failureCount = intent.failureCount ?? intent.workerAttempt ?? 0;
+    if (failureCount >= CJ_STAGING_MAX_ATTEMPTS) {
       await ctx.db.patch(intentId, { status: "needs_attention", runnableAt: undefined, leaseExpiresAt: undefined, lastError: { code: "worker_attempts_exhausted" }, updatedAt: now });
-      return { state: "complete" as const, intentId };
+      return { state: "needs_attention" as const, intentId };
     }
     const order = await ctx.db.get(intent.orderId);
     if (!order || order.siteId !== intent.siteId) throw new Error("CJ staging intent order binding is invalid");
@@ -205,27 +205,28 @@ export const claimCjStagingPreflight = mutation({
       providerEndpoint: CJ_FREIGHT_ENDPOINT, providerVersion: CJ_FREIGHT_VERSION,
     });
     const attempt = intent.attempt + 1;
+    const leaseGeneration = (intent.leaseGeneration ?? 0) + 1;
     const leaseExpiresAt = now + 5 * 60_000;
-    await ctx.db.patch(intentId, { status: "preflighting", attempt, workerAttempt, leaseExpiresAt, runnableAt: leaseExpiresAt, lastError: undefined, quoteInputDigest, quoteProvider: { endpoint: CJ_FREIGHT_ENDPOINT, version: CJ_FREIGHT_VERSION }, updatedAt: now });
-    return { state: "preflight" as const, intentId, attempt, quoteInputDigest, fromCountryCode: lineage.fromCountryCode, destinationCountryCode: intent.shipping.shippingCountryCode, shippingZip: intent.shipping.shippingZip, products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })) };
+    await ctx.db.patch(intentId, { status: "preflighting", attempt, leaseGeneration, failureCount, leaseExpiresAt, runnableAt: leaseExpiresAt, lastError: undefined, quoteInputDigest, quoteProvider: { endpoint: CJ_FREIGHT_ENDPOINT, version: CJ_FREIGHT_VERSION }, updatedAt: now });
+    return { state: "preflight" as const, intentId, attempt, leaseGeneration, quoteInputDigest, fromCountryCode: lineage.fromCountryCode, destinationCountryCode: intent.shipping.shippingCountryCode, shippingZip: intent.shipping.shippingZip, products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })) };
   },
 });
 
 /** Persist exactly one selected provider response, bound to the preflight generation and digest. */
 export const recordCjStagingQuote = mutation({
-  args: { intentId: v.id("cjStagingIntents"), attempt: v.number(), quoteInputDigest: v.string(), logisticName: v.string(), logisticPriceUsd: v.number(), fromCountryCode: v.string() },
+  args: { intentId: v.id("cjStagingIntents"), attempt: v.number(), leaseGeneration: v.number(), quoteInputDigest: v.string(), logisticName: v.string(), logisticPriceUsd: v.number(), fromCountryCode: v.string() },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const intent = await ctx.db.get(args.intentId);
     if (!intent) throw new Error("CJ staging intent not found");
-    if (intent.status === "quoted" && intent.quote && intent.quoteInputDigest === args.quoteInputDigest) return { reused: true as const, quote: intent.quote };
-    if (intent.status !== "preflighting" || intent.attempt !== args.attempt || intent.quoteInputDigest !== args.quoteInputDigest) throw new Error("CJ freight result was not claimed by this preflight generation");
+    if (intent.status === "quoted" && intent.quote && intent.quoteInputDigest === args.quoteInputDigest && intent.attempt === args.attempt && intent.leaseGeneration === args.leaseGeneration) return { reused: true as const, quote: intent.quote };
+    if (intent.status !== "preflighting" || intent.attempt !== args.attempt || intent.leaseGeneration !== args.leaseGeneration || intent.quoteInputDigest !== args.quoteInputDigest) return { ignored: true as const };
     if (!args.logisticName.trim() || !Number.isFinite(args.logisticPriceUsd) || args.logisticPriceUsd < 0 || !/^[A-Z]{2}$/.test(args.fromCountryCode)) throw new Error("CJ freight result is invalid");
     const now = Date.now();
     // The service assigns quote time; a worker clock cannot extend approval freshness.
     const quote = { logisticName: args.logisticName.trim(), logisticPriceUsd: args.logisticPriceUsd, fromCountryCode: args.fromCountryCode, quotedAt: now };
     await ctx.db.patch(args.intentId, { status: "quoted", quote, leaseExpiresAt: undefined, runnableAt: now, updatedAt: now });
-    return { reused: false as const, quote };
+    return { reused: false as const, ignored: false as const, quote };
   },
 });
 
@@ -311,31 +312,35 @@ export const claimCjStagingApprovalDispatch = mutation({
     const now = Date.now();
     if (intent.status === "approval_dispatching" && (intent.leaseExpiresAt ?? 0) > now) return { state: "busy" as const };
     if (intent.status !== "staged" && intent.status !== "approval_dispatching") throw new Error("CJ staging approval is not ready");
-    const workerAttempt = (intent.workerAttempt ?? 0) + 1;
-    if (workerAttempt > CJ_STAGING_MAX_ATTEMPTS) {
+    const failureCount = intent.failureCount ?? intent.workerAttempt ?? 0;
+    if (failureCount >= CJ_STAGING_MAX_ATTEMPTS) {
       await ctx.db.patch(intentId, { status: "needs_attention", runnableAt: undefined, leaseExpiresAt: undefined, lastError: { code: "worker_attempts_exhausted" }, updatedAt: now });
-      return { state: "reused" as const, actionId: intent.actionId };
+      return { state: "needs_attention" as const, actionId: intent.actionId };
     }
     const action = await ctx.db.get(intent.actionId);
     if (!action || action.type !== "dispatch_cj_sandbox_order" || action.siteId !== intent.siteId || !action.approvalDispatchKey) throw new Error("CJ staging approval binding is invalid");
     const leaseExpiresAt = now + 5 * 60_000;
+    const leaseGeneration = (intent.leaseGeneration ?? 0) + 1;
     const order = await ctx.db.get(intent.orderId);
     const params = action?.params as Record<string, unknown> | undefined;
     if (!order || action?.status !== "pending_approval" || params?.generation !== order.cjDispatchGeneration || params?.generationFingerprint !== order.cjDispatchGenerationFingerprint || params?.quoteInputDigest !== order.cjQuoteInputDigest) throw new Error("CJ staging approval generation is stale");
-    await ctx.db.patch(intentId, { status: "approval_dispatching", workerAttempt, leaseExpiresAt, runnableAt: leaseExpiresAt, updatedAt: now });
-    return { state: "dispatch" as const, actionId: intent.actionId, approvalDispatchKey: action.approvalDispatchKey };
+    await ctx.db.patch(intentId, { status: "approval_dispatching", failureCount, leaseGeneration, leaseExpiresAt, runnableAt: leaseExpiresAt, updatedAt: now });
+    return { state: "dispatch" as const, actionId: intent.actionId, approvalDispatchKey: action.approvalDispatchKey, leaseGeneration, attempt: intent.attempt };
   },
 });
 
 export const recordCjStagingApprovalDispatch = mutation({
-  args: { intentId: v.id("cjStagingIntents"), actionId: v.id("actions") },
-  handler: async (ctx, { intentId, actionId }) => {
+  args: { intentId: v.id("cjStagingIntents"), actionId: v.id("actions"), approvalDispatchKey: v.string(), approvalRunId: v.string(), leaseGeneration: v.number() },
+  handler: async (ctx, { intentId, actionId, approvalDispatchKey, approvalRunId, leaseGeneration }) => {
     await requireServiceIdentity(ctx);
     const intent = await ctx.db.get(intentId);
     const action = await ctx.db.get(actionId);
-    if (!intent || !action || intent.actionId !== actionId || intent.status !== "approval_dispatching" || action.status !== "pending_approval" || action.approvalDispatchStatus !== "dispatched") throw new Error("CJ staging approval completion is not authorized");
+    if (!intent || !action || intent.actionId !== actionId || intent.status !== "approval_dispatching" || intent.leaseGeneration !== leaseGeneration) return { ignored: true as const };
+    // A human may resolve the exact action between Trigger accepting the run and this durable
+    // acknowledgement. Same action/key/run is a successful reconciliation, never a new wait.
+    if (action.approvalDispatchKey !== approvalDispatchKey || action.approvalRunId !== approvalRunId || action.approvalDispatchStatus !== "dispatched") throw new Error("CJ staging approval completion is not authorized");
     await ctx.db.patch(intentId, { status: "approval_dispatched", leaseExpiresAt: undefined, runnableAt: undefined, updatedAt: Date.now() });
-    return { ok: true };
+    return { ok: true, ignored: false as const };
   },
 });
 
@@ -349,46 +354,60 @@ export const listDueCjStagingIntents = query({
       .withIndex("by_runnable_at", (q: any) => q.gt("runnableAt", 0).lte("runnableAt", now))
       .order("asc")
       .take(Math.max(1, Math.min(limit ?? 25, 100)));
-    return rows.map(({ _id }) => ({ _id }));
+    return rows.filter((intent) => ["pending", "preflight_required", "quoted", "staged", "preflighting", "approval_dispatching"].includes(intent.status)).map(({ _id }) => ({ _id }));
   },
 });
 
 /** Classify a worker failure without serializing provider text or customer fields. */
 export const recordCjStagingFailure = mutation({
-  args: { intentId: v.id("cjStagingIntents"), errorCode: v.union(v.literal("invalid_or_unbound_input"), v.literal("provider_unavailable"), v.literal("unexpected_runtime_failure")), kind: v.union(v.literal("retryable"), v.literal("permanent")) },
+  args: { intentId: v.id("cjStagingIntents"), expectedPhase: v.union(v.literal("preflighting"), v.literal("quoted"), v.literal("approval_dispatching")), expectedAttempt: v.number(), leaseGeneration: v.number(), errorCode: v.union(v.literal("invalid_or_unbound_input"), v.literal("invalid_verified_lineage"), v.literal("configuration_unavailable"), v.literal("provider_rate_limited"), v.literal("provider_unavailable"), v.literal("network_unavailable"), v.literal("unexpected_runtime_failure")), kind: v.union(v.literal("retryable"), v.literal("permanent")) },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const intent = await ctx.db.get(args.intentId);
-    if (!intent || ["approval_dispatched", "needs_attention", "failed"].includes(intent.status)) return { ignored: true };
+    if (!intent || ["approval_dispatched", "needs_attention", "failed"].includes(intent.status) || intent.status !== args.expectedPhase || intent.attempt !== args.expectedAttempt || intent.leaseGeneration !== args.leaseGeneration) return { ignored: true as const };
     const now = Date.now();
-    const workerAttempt = (intent.workerAttempt ?? 0) + 1;
-    const transition = cjStagingFailureTransition(now, workerAttempt, args.kind, intent.status as CjStagingPhase);
-    await ctx.db.patch(args.intentId, { status: transition.status, workerAttempt, runnableAt: transition.runnableAt, leaseExpiresAt: undefined, lastError: { code: args.errorCode }, updatedAt: now });
-    await appendAudit(ctx, { siteId: intent.siteId, event: "cj_staging_failed", detail: { intentId: intent._id, code: args.errorCode, terminal: transition.status === "needs_attention", workerAttempts: workerAttempt, maxAttempts: CJ_STAGING_MAX_ATTEMPTS } });
+    const failureCount = (intent.failureCount ?? intent.workerAttempt ?? 0) + 1;
+    const transition = cjStagingFailureTransition(now, failureCount, args.kind, intent.status as CjStagingPhase);
+    await ctx.db.patch(args.intentId, { status: transition.status, failureCount, runnableAt: transition.runnableAt, leaseExpiresAt: undefined, lastError: { code: args.errorCode }, updatedAt: now });
+    await appendAudit(ctx, { siteId: intent.siteId, event: "cj_staging_failed", detail: { intentId: intent._id, code: args.errorCode, terminal: transition.status === "needs_attention", failureCount, maxAttempts: CJ_STAGING_MAX_ATTEMPTS } });
     return { ignored: false, status: transition.status, runnableAt: transition.runnableAt };
   },
 });
 
-/** Bounded optional-field rollout; this is invoked before sweeps and never sits on the hot due query. */
+const CJ_STAGING_ROLLOUT_VERSION = "lease-fencing-v1";
+const CJ_STAGING_ROLLOUT_PHASES = ["pending", "preflight_required", "quoted", "staged", "preflighting", "approval_dispatching"] as const;
+
+/** Bounded, resumable optional-field rollout. Completed versions perform no status-index reads. */
 export const reconcileLegacyCjStagingIntents = mutation({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
     await requireServiceIdentity(ctx);
     const now = Date.now();
-    let remaining = Math.max(1, Math.min(limit ?? 25, 100));
-    let repaired = 0;
-    for (const status of ["pending", "preflight_required", "quoted", "staged", "preflighting", "approval_dispatching"] as const) {
-      if (!remaining) break;
-      const rows = await ctx.db.query("cjStagingIntents")
-        .withIndex("by_status_runnable_at", (q: any) => q.eq("status", status).eq("runnableAt", undefined))
-        .take(remaining);
-      for (const intent of rows) {
-        const runnableAt = legacyCjStagingRunnableAt(status, intent.leaseExpiresAt, now);
-        await ctx.db.patch(intent._id, { runnableAt, workerAttempt: intent.workerAttempt ?? 0, updatedAt: now });
-        repaired++; remaining--;
-      }
+    const cap = Math.max(1, Math.min(limit ?? 25, 100));
+    let marker = await ctx.db.query("cjStagingRollouts").withIndex("by_version", (q: any) => q.eq("version", CJ_STAGING_ROLLOUT_VERSION)).first();
+    if (!marker) {
+      const markerId = await ctx.db.insert("cjStagingRollouts", { version: CJ_STAGING_ROLLOUT_VERSION, phase: 0, completed: false, updatedAt: now });
+      marker = await ctx.db.get(markerId);
     }
-    return { repaired };
+    if (!marker || marker.completed) return { repaired: 0, completed: true as const };
+    const status = CJ_STAGING_ROLLOUT_PHASES[marker.phase];
+    if (!status) {
+      await ctx.db.patch(marker._id, { completed: true, updatedAt: now });
+      return { repaired: 0, completed: true as const };
+    }
+    const page = await ctx.db.query("cjStagingIntents").withIndex("by_status", (q: any) => q.eq("status", status)).paginate({ cursor: marker.cursor ?? null, numItems: cap });
+    const rows = page.page.filter((intent) => intent.runnableAt === undefined);
+    for (const intent of rows) {
+      const runnableAt = legacyCjStagingRunnableAt(status, intent.leaseExpiresAt, now);
+      await ctx.db.patch(intent._id, { runnableAt, leaseGeneration: intent.leaseGeneration ?? 0, failureCount: intent.failureCount ?? intent.workerAttempt ?? 0, updatedAt: now });
+    }
+    if (page.isDone) {
+      const nextPhase = marker.phase + 1;
+      await ctx.db.patch(marker._id, { phase: nextPhase, cursor: undefined, completed: nextPhase >= CJ_STAGING_ROLLOUT_PHASES.length, updatedAt: now });
+    } else {
+      await ctx.db.patch(marker._id, { cursor: page.continueCursor, updatedAt: now });
+    }
+    return { repaired: rows.length, completed: false as const, phase: marker.phase };
   },
 });
 

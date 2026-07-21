@@ -2,6 +2,7 @@
 // read-only. The only write-capable function remains createOrder(), which deliberately uses
 // payType:3 (create-only) and is isolated in the fulfilment worker.
 import { getKey } from "./vault";
+import { CjStagingFailureError } from "./cjStagingState";
 
 const CJ_BASE = "https://developers.cjdropshipping.com/api2.0/v1";
 
@@ -25,7 +26,7 @@ export async function getAccessToken(): Promise<string> {
   return activeTokens.accessToken;
 }
 
-class CjApiError extends Error {
+export class CjApiError extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
     this.name = "CjApiError";
@@ -190,23 +191,35 @@ export async function quoteCjFreight(input: CjFreightPreflightInput, token?: str
   const fromCountryCode = input.fromCountryCode.trim().toUpperCase();
   const destinationCountryCode = input.destinationCountryCode.trim().toUpperCase();
   if (!/^[A-Z]{2}$/.test(fromCountryCode) || !/^[A-Z]{2}$/.test(destinationCountryCode) || !input.products.length) {
-    throw new Error("CJ freight preflight requires verified two-letter origin/destination and products");
+    throw new CjStagingFailureError("permanent", "invalid_verified_lineage");
   }
-  const data = await cjFetch<Array<{ logisticName?: unknown; logisticPrice?: unknown }>>("/logistic/freightCalculate", {
-    body: { startCountryCode: fromCountryCode, endCountryCode: destinationCountryCode, zip: input.shippingZip || undefined, products: input.products },
-    token,
-  });
-  return data.flatMap((candidate) => {
-    const logisticName = typeof candidate.logisticName === "string" ? candidate.logisticName.trim() : "";
-    const logisticPriceUsd = typeof candidate.logisticPrice === "number" ? candidate.logisticPrice : Number(candidate.logisticPrice);
-    return logisticName && Number.isFinite(logisticPriceUsd) && logisticPriceUsd >= 0 ? [{ logisticName, logisticPriceUsd }] : [];
-  });
+  try {
+    const data = await cjFetch<Array<{ logisticName?: unknown; logisticPrice?: unknown }>>("/logistic/freightCalculate", {
+      body: { startCountryCode: fromCountryCode, endCountryCode: destinationCountryCode, zip: input.shippingZip || undefined, products: input.products },
+      token,
+    });
+    return data.flatMap((candidate) => {
+      const logisticName = typeof candidate.logisticName === "string" ? candidate.logisticName.trim() : "";
+      const logisticPriceUsd = typeof candidate.logisticPrice === "number" ? candidate.logisticPrice : Number(candidate.logisticPrice);
+      return logisticName && Number.isFinite(logisticPriceUsd) && logisticPriceUsd >= 0 ? [{ logisticName, logisticPriceUsd }] : [];
+    });
+  } catch (error) {
+    // Classify only typed local/provider status, never an untrusted provider message.
+    if (error instanceof CjStagingFailureError) throw error;
+    if (error instanceof CjApiError) {
+      if (error.status === 429) throw new CjStagingFailureError("retryable", "provider_rate_limited");
+      if (error.status >= 500) throw new CjStagingFailureError("retryable", "provider_unavailable");
+      throw new CjStagingFailureError("permanent", "invalid_or_unbound_input");
+    }
+    if (error instanceof TypeError) throw new CjStagingFailureError("retryable", "network_unavailable");
+    throw new CjStagingFailureError("permanent", "configuration_unavailable");
+  }
 }
 
 /** Deterministic policy over actual CJ quote rows; it never invents a carrier or warehouse. */
 export function selectVerifiedCjFreight(quotes: CjFreightQuote[]): CjFreightQuote {
   const valid = quotes.filter((quote) => quote.logisticName.trim() && Number.isFinite(quote.logisticPriceUsd) && quote.logisticPriceUsd >= 0);
-  if (!valid.length) throw new Error("CJ freight preflight found no valid logistics route; refresh sourcing or resolve warehouse/logistics with an operator");
+  if (!valid.length) throw new CjStagingFailureError("permanent", "invalid_or_unbound_input");
   return [...valid].sort((a, b) => a.logisticPriceUsd - b.logisticPriceUsd || a.logisticName.localeCompare(b.logisticName))[0];
 }
 

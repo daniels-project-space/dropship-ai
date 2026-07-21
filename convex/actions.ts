@@ -124,12 +124,16 @@ export const recordApprovalDispatch = mutation({
     await requireServiceIdentity(ctx);
     const action = await ctx.db.get(args.actionId);
     if (!action) throw new Error(`action ${args.actionId} not found`);
-    if (action.status !== "pending_approval" || action.approvalDispatchKey !== args.approvalDispatchKey) throw new Error("approval action is no longer pending for this dispatch");
+    if (action.approvalDispatchKey !== args.approvalDispatchKey) throw new Error("approval action is no longer pending for this dispatch");
     if (action.approvalRunId && action.approvalRunId !== args.approvalRunId) throw new Error("approval dispatch already has a different Trigger run");
+    // Trigger can accept the deterministic run just before the human resolves the exact action.
+    // Persist that same run/key lineage for reconciliation, but never revive the action or arm a
+    // replacement waitpoint. A mismatched key/run still fails closed above.
+    if (action.status !== "pending_approval" && action.status !== "approved" && action.status !== "rejected") throw new Error("approval action is no longer reconcilable for this dispatch");
     await ctx.db.patch(args.actionId, { approvalRunId: args.approvalRunId, approvalDispatchStatus: "dispatched" });
     const selection = await ctx.db.query("sourceSelections").withIndex("by_action", (q) => q.eq("actionId", args.actionId)).first();
     if (selection) await ctx.db.patch(selection._id, { approvalRunId: args.approvalRunId, approvalDispatchStatus: "dispatched" });
-    return { status: "dispatched" as const, approvalRunId: args.approvalRunId };
+    return { status: action.status === "pending_approval" ? "dispatched" as const : "resolved" as const, approvalRunId: args.approvalRunId };
   },
 });
 

@@ -12,33 +12,52 @@ export interface CjStagingPayload { intentId: string }
 
 export async function processCjStagingIntent({ intentId }: CjStagingPayload) {
   const convex = convexClient();
+  let failureFence: { expectedPhase: "preflighting" | "quoted" | "approval_dispatching"; expectedAttempt: number; leaseGeneration: number } | null = null;
   try {
     const result = await executeCjStaging({
-    claimPreflight: () => convex.mutation(api.orders.claimCjStagingPreflight, { intentId: intentId as Id<"cjStagingIntents"> }) as any,
+    claimPreflight: async () => {
+      const claim: any = await convex.mutation(api.orders.claimCjStagingPreflight, { intentId: intentId as Id<"cjStagingIntents"> });
+      if (claim.state === "preflight") failureFence = { expectedPhase: "preflighting", expectedAttempt: claim.attempt, leaseGeneration: claim.leaseGeneration };
+      if (claim.state === "quoted") failureFence = { expectedPhase: "quoted", expectedAttempt: claim.attempt, leaseGeneration: claim.leaseGeneration };
+      return claim;
+    },
     // `claimed` is a service-to-service response and may temporarily contain PII. This function
     // does not log it or put it into a task payload, trace, audit row, or outbox.
     quote: async (input) => selectVerifiedCjFreight(await quoteCjFreight(input)),
-    recordQuote: async (quote) => { await convex.mutation(api.orders.recordCjStagingQuote, { intentId: intentId as Id<"cjStagingIntents">, ...quote }); },
+    recordQuote: async (quote) => {
+      await convex.mutation(api.orders.recordCjStagingQuote, { intentId: intentId as Id<"cjStagingIntents">, ...quote });
+      failureFence = { expectedPhase: "quoted", expectedAttempt: quote.attempt, leaseGeneration: quote.leaseGeneration };
+    },
     stage: () => convex.mutation(api.orders.stageQuotedCjStagingIntent, { intentId: intentId as Id<"cjStagingIntents"> }) as any,
-    claimApproval: () => convex.mutation(api.orders.claimCjStagingApprovalDispatch, { intentId: intentId as Id<"cjStagingIntents"> }) as any,
+    claimApproval: async () => {
+      const claim: any = await convex.mutation(api.orders.claimCjStagingApprovalDispatch, { intentId: intentId as Id<"cjStagingIntents"> });
+      if (claim.state === "dispatch") failureFence = { expectedPhase: "approval_dispatching", expectedAttempt: claim.attempt, leaseGeneration: claim.leaseGeneration };
+      return claim;
+    },
     beginApproval: (input) => convex.mutation(api.actions.beginApprovalDispatch, input as any) as any,
     triggerApproval: async ({ actionId, approvalDispatchKey }) => {
       try {
         const handle = await tasks.trigger<typeof approvalGate>("approval-gate", { actionId, approvalDispatchKey }, { idempotencyKey: approvalDispatchKey, idempotencyKeyTTL: "24w" });
         await convex.mutation(api.actions.recordApprovalDispatch, { actionId: actionId as Id<"actions">, approvalDispatchKey, approvalRunId: handle.id });
+        return handle.id;
       } catch (error) {
         // A lost Trigger response is reconciled by the deterministic key, never treated as sent.
         await convex.mutation(api.actions.markApprovalDispatchAmbiguous, { actionId: actionId as Id<"actions">, approvalDispatchKey, error: "trigger_response_ambiguous" });
         throw error;
       }
     },
-    recordApproval: async ({ actionId }) => { await convex.mutation(api.orders.recordCjStagingApprovalDispatch, { intentId: intentId as Id<"cjStagingIntents">, actionId: actionId as Id<"actions"> }); },
+    recordApproval: async ({ actionId, approvalDispatchKey, approvalRunId, leaseGeneration }) => { await convex.mutation(api.orders.recordCjStagingApprovalDispatch, { intentId: intentId as Id<"cjStagingIntents">, actionId: actionId as Id<"actions">, approvalDispatchKey, approvalRunId, leaseGeneration }); },
     });
     if (result.state === "approval_dispatched") logger.info("CJ staging intent processed", { intentId, actionId: result.actionId });
     return { intentId, ...result };
   } catch (error) {
     const failure = classifyCjStagingFailure(error);
-    const recorded = await convex.mutation(api.orders.recordCjStagingFailure, { intentId: intentId as Id<"cjStagingIntents">, kind: failure.kind, errorCode: failure.code });
+    const fence = failureFence as { expectedPhase: "preflighting" | "quoted" | "approval_dispatching"; expectedAttempt: number; leaseGeneration: number } | null;
+    if (!fence) {
+      logger.warn("CJ staging failed before a durable lease was claimed", { intentId, code: failure.code });
+      return { intentId, state: "needs_attention" as const };
+    }
+    const recorded = await convex.mutation(api.orders.recordCjStagingFailure, { intentId: intentId as Id<"cjStagingIntents">, ...fence, kind: failure.kind, errorCode: failure.code });
     // No provider error text reaches Trigger logs; the durable mutation stores only a code.
     logger.warn("CJ staging attempt deferred or stopped", { intentId, code: failure.code, status: recorded.status });
     return { intentId, state: recorded.status };

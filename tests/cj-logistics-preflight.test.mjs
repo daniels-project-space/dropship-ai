@@ -15,7 +15,7 @@ test("CJ logistics preflight is read-only, binds the verified origin, and never 
     assert.equal(call.options.method, "POST");
     assert.deepEqual(JSON.parse(call.options.body), { startCountryCode: "US", endCountryCode: "US", zip: "90210", products: [{ vid: "cj-v1", quantity: 1 }] });
     assert.deepEqual(selectVerifiedCjFreight(quotes), { logisticName: "Route A", logisticPriceUsd: 4.5 });
-    assert.throws(() => selectVerifiedCjFreight([]), /no valid logistics route/);
+    assert.throws(() => selectVerifiedCjFreight([]), /invalid_or_unbound_input/);
   } finally {
     globalThis.fetch = originalFetch;
   }

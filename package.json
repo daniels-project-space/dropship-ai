@@ -24,6 +24,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "convex-test": "0.0.54",
     "tailwindcss": "^4",
     "tsx": "^4.20.6",
     "typescript": "^5"

@@ -7,13 +7,13 @@ import { CJ_STAGING_MAX_ATTEMPTS, CjStagingFailureError, classifyCjStagingFailur
 function worker(overrides = {}) {
   const calls = { quote: 0, recordQuote: 0, stage: 0, trigger: 0, recordApproval: 0 };
   const deps = {
-    claimPreflight: async () => ({ state: "preflight", attempt: 1, quoteInputDigest: "digest", fromCountryCode: "US", destinationCountryCode: "US", shippingZip: "90210", products: [{ vid: "v1", quantity: 1 }] }),
+    claimPreflight: async () => ({ state: "preflight", attempt: 1, leaseGeneration: 1, quoteInputDigest: "digest", fromCountryCode: "US", destinationCountryCode: "US", shippingZip: "90210", products: [{ vid: "v1", quantity: 1 }] }),
     quote: async () => { calls.quote++; return { logisticName: "USPS", logisticPriceUsd: 5 }; },
     recordQuote: async () => { calls.recordQuote++; },
     stage: async () => { calls.stage++; return { state: "staged", actionId: "action-1" }; },
-    claimApproval: async () => ({ state: "dispatch", actionId: "action-1", approvalDispatchKey: "approval-1" }),
+    claimApproval: async () => ({ state: "dispatch", actionId: "action-1", approvalDispatchKey: "approval-1", leaseGeneration: 2, attempt: 1 }),
     beginApproval: async () => ({ status: "dispatching" }),
-    triggerApproval: async () => { calls.trigger++; },
+    triggerApproval: async () => { calls.trigger++; return "run-1"; },
     recordApproval: async () => { calls.recordApproval++; },
     now: () => 1,
     ...overrides,
@@ -47,7 +47,7 @@ test("failure after durable intake retries in the worker, and a persisted quote 
   const failed = worker({ quote: async () => { throw new Error("temporary CJ failure"); } });
   await assert.rejects(() => executeCjStaging(failed.deps), /temporary CJ failure/);
   assert.equal(failed.calls.trigger, 0);
-  const retried = worker({ claimPreflight: async () => ({ state: "quoted" }) });
+  const retried = worker({ claimPreflight: async () => ({ state: "quoted", attempt: 1, leaseGeneration: 1 }) });
   await executeCjStaging(retried.deps);
   assert.equal(retried.calls.quote, 0, "a quote already persisted by the first attempt is never re-quoted");
   assert.equal(retried.calls.trigger, 1);
@@ -95,7 +95,7 @@ test("crash boundaries resume the persisted stage/action rather than re-quoting 
   await assert.rejects(() => executeCjStaging(triggerAcceptedResponseLost.deps), /lost response/);
   assert.equal(triggerAcceptedResponseLost.calls.recordApproval, 0);
 
-  const afterDispatchRecorded = worker({ claimPreflight: async () => ({ state: "staged" }), beginApproval: async () => ({ status: "dispatched" }) });
+  const afterDispatchRecorded = worker({ claimPreflight: async () => ({ state: "staged" }), beginApproval: async () => ({ status: "dispatched", approvalRunId: "run-1" }) });
   await executeCjStaging(afterDispatchRecorded.deps);
   assert.equal(afterDispatchRecorded.calls.trigger, 0);
   assert.equal(afterDispatchRecorded.calls.recordApproval, 1);

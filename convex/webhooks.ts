@@ -30,9 +30,28 @@ export const recordShopifyOrder = mutation({
     if (receiptDecision === "duplicate") {
       // A provider delivery ID is immutable. Accepting changed content could bind an existing
       // approval to another address or line set, so this must fail closed rather than retry.
-      const intent = prior!.cjStagingIntentId
+      let intent = prior!.cjStagingIntentId
         ? await ctx.db.get(prior!.cjStagingIntentId)
         : await ctx.db.query("cjStagingIntents").withIndex("by_site_delivery", (q) => q.eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
+      // Pre-link receipts from the first rollout did not carry an intent ID. A semantically
+      // identical second Shopify delivery therefore cannot rely on delivery ID alone: resolve
+      // through this request's exact site/order, verify the durable input binding, then repair
+      // the receipt in the same transaction so all later replays have the direct lineage.
+      if (!intent && args.stagingInput) {
+        const order = await ctx.db.query("orders").withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
+        if (order?.siteId === args.siteId) {
+          const candidate = await ctx.db.query("cjStagingIntents").withIndex("by_order", (q) => q.eq("orderId", order._id)).first();
+          const incomingDigest = cjStagingInputDigest(args.stagingInput);
+          const candidateDigest = candidate?.stagingInputDigest ?? (candidate ? cjStagingInputDigest({ shipping: candidate.shipping, shopifyLines: candidate.shopifyLines }) : undefined);
+          if (candidate && candidate.siteId === args.siteId && candidate.orderId === order._id && candidateDigest === incomingDigest) {
+            intent = candidate;
+            await ctx.db.patch(prior!._id, { cjStagingIntentId: candidate._id });
+          }
+        }
+      }
+      if (intent && !prior!.cjStagingIntentId && intent.siteId === args.siteId) {
+        await ctx.db.patch(prior!._id, { cjStagingIntentId: intent._id });
+      }
       return { duplicate: true, outcome: prior!.outcome, intentId: intent?._id ?? null };
     }
 

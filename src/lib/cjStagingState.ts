@@ -3,7 +3,7 @@ import { stableSha256 } from "./cjOrder";
 export const CJ_STAGING_MAX_ATTEMPTS = 5;
 
 export type CjStagingFailure = "retryable" | "permanent";
-export type CjStagingErrorCode = "invalid_or_unbound_input" | "provider_unavailable" | "unexpected_runtime_failure";
+export type CjStagingErrorCode = "invalid_or_unbound_input" | "invalid_verified_lineage" | "configuration_unavailable" | "provider_rate_limited" | "provider_unavailable" | "network_unavailable" | "unexpected_runtime_failure";
 export type CjStagingPhase = "pending" | "preflighting" | "quoted" | "preflight_required" | "staged" | "approval_dispatching";
 
 /** Typed, redacted worker failure. Provider text is never a state-machine input. */
