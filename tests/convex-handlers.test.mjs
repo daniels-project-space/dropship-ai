@@ -5,6 +5,7 @@ import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";
 import { cjOrderInputHash, cjStagingInputDigest } from "../src/lib/cjOrder.ts";
 import { cjStagingGenerationFingerprint } from "../src/lib/cjStagingState.ts";
+import { executeSandboxCjDispatch } from "../src/lib/sandboxCjDispatchExecutor.ts";
 
 const modules = {
   "../convex/orders.ts": () => import("../convex/orders.ts"),
@@ -49,6 +50,21 @@ async function seedApprovedDispatch(t) {
 
 async function claimDispatch(t, actionId, run = "run-1", token = "t".repeat(64)) {
   return service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId, triggerRunId: run, leaseToken: token });
+}
+
+function convexExecutor(t, actionId, run, token, hooks = {}) {
+  const call = (name, args) => service(t).mutation(api.orders[name], args);
+  return {
+    claim: async () => { const value = await claimDispatch(t, actionId, run, token); if (hooks.afterClaim) await hooks.afterClaim(value); return value; },
+    beginProviderCall: async ({ orderId, receipt }) => { const value = await call("beginSandboxCjProviderCall", { actionId, orderId, receipt }); if (hooks.afterBegin) await hooks.afterBegin(value); return value; },
+    findByOrderNumber: async () => null,
+    reconcile: ({ orderId, receipt, lookup }) => call("reconcileSandboxCjDispatchExecution", { actionId, orderId, receipt, ...(lookup ? { lookup } : {}) }),
+    createSandboxOrder: async () => { hooks.creates.count++; return { orderId: "cj-real-1" }; },
+    complete: async ({ orderId, cjOrderId, receipt }) => { const value = await call("completeSandboxCjDispatchExecution", { actionId, orderId, cjOrderId, receipt }); if (hooks.afterComplete) await hooks.afterComplete(value); return value; },
+    ambiguous: ({ orderId, reason, receipt }) => call("markSandboxCjDispatchAmbiguousExecution", { actionId, orderId, reason, receipt }),
+    failBeforeProvider: ({ orderId, reason, receipt }) => call("failSandboxCjDispatchBeforeProvider", { actionId, orderId, reason, receipt }),
+    isAmbiguousWriteError: () => true,
+  };
 }
 
 test("Convex handlers reject anonymous service calls and due index returns only oldest due rows", async () => {
@@ -168,6 +184,25 @@ test("lost prepare replay is exact; a pre-provider failure creates a newer execu
   const retry = await claimDispatch(t, actionId, "run-2", "u".repeat(64));
   assert.equal(retry.state, "prepared");
   assert.equal(retry.receipt.attempt, 2);
+});
+
+test("actual executor and Convex handlers survive commit-then-response-loss without a second provider create", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  const creates = { count: 0 };
+  let lost = true;
+  await assert.rejects(() => executeSandboxCjDispatch(convexExecutor(t, actionId, "trigger-run", "z".repeat(64), { creates, afterClaim: async () => { if (lost) { lost = false; throw new Error("claim response lost after commit"); } } })), /response lost/);
+  assert.equal(creates.count, 0);
+  await executeSandboxCjDispatch(convexExecutor(t, actionId, "trigger-run", "z".repeat(64), { creates }));
+  assert.equal(creates.count, 1);
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  const execution = await t.run((ctx) => ctx.db.query("cjDispatchExecutions").withIndex("by_order", (q) => q.eq("orderId", orderId)).first());
+  const outbox = await t.run((ctx) => ctx.db.get(execution.outboxId));
+  const trace = await t.run((ctx) => ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", execution.traceId)).first());
+  assert.equal(order.cjOrderId, "cj-real-1");
+  assert.equal(execution.phase, "sent");
+  assert.equal(outbox.status, "delivered");
+  assert.equal(trace.status, "succeeded");
 });
 
 test("read-only reconciliation backs off five times then reaches one terminal attention state", async () => {
