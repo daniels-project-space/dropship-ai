@@ -4,6 +4,7 @@ import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { evaluatePersistedCjEvidence } from "../src/lib/sourcingPolicy";
 import { hasVerifiedInternalShopifyDraftLineage } from "../src/lib/shopifyDraftLineage";
+import { sourceSelectionDecision } from "../src/lib/sourceSelectionState";
 
 const productStatus = v.union(
   v.literal("draft"),
@@ -90,6 +91,19 @@ export const createSourcedDraft = mutation({
       .filter((q) => q.eq(q.field("cjProductId"), evidence.cjProductId))
       .filter((q) => q.eq(q.field("cjVariantId"), evidence.cjVariantId))
       .first();
+    if (existing?.shopifyDraftImportStatus) {
+      return denied(`source selection is blocked while Shopify draft import is ${existing.shopifyDraftImportStatus}`,
+        { productId: existing._id, shopifyDraftImportStatus: existing.shopifyDraftImportStatus });
+    }
+    const existingSelection = await ctx.db.query("sourceSelections")
+      .withIndex("by_site_candidate", (q) => q.eq("siteId", args.siteId).eq("cjProductId", evidence.cjProductId).eq("cjVariantId", evidence.cjVariantId))
+      .order("desc").first();
+    if (existingSelection?.actionId) {
+      const action = await ctx.db.get(existingSelection.actionId);
+      if (action && sourceSelectionDecision({ sameRequestExists: false, existingApprovalStatus: action.status }) === "block_approval") {
+        return denied(`source selection is blocked while approval ${action.status}`, { productId: existing?._id, actionId: action._id });
+      }
+    }
     if (existing && existing.status !== "draft") return denied("source is already catalogued", { productId: existing._id, status: existing.status });
 
     const record = {
@@ -179,6 +193,132 @@ export const recordCjEvidence = mutation({
   },
 });
 
+/**
+ * Atomically turn one stable operator selection into its immutable CJ evidence, local draft and
+ * (when eligible) its one human-gated Shopify-DRAFT action. The HTTP layer may repeat its CJ
+ * reads, but it must pass the same requestId on retry; this transition then returns the original
+ * lineage without refreshing a protected draft or orphaning a waitpoint.
+ */
+export const stageSourcedDraftSelection = mutation({
+  args: {
+    siteId: v.id("sites"),
+    requestId: v.string(),
+    priceUsd: v.number(),
+    cjProductId: v.string(),
+    cjVariantId: v.string(),
+    title: v.string(),
+    cogsUsd: v.optional(v.number()),
+    shippingUsd: v.optional(v.number()),
+    inventoryQty: v.number(),
+    fromUsWarehouse: v.boolean(),
+    inventoryVerified: v.boolean(),
+    sourceUrl: v.string(),
+    traceId: v.string(),
+    readAt: v.number(),
+  },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    if (!args.requestId.trim()) throw new Error("source selection requestId is required");
+    if (!Number.isFinite(args.priceUsd) || args.priceUsd <= 0) throw new Error("source selection price must be positive");
+    const prior = await ctx.db.query("sourceSelections")
+      .withIndex("by_site_request", (q) => q.eq("siteId", args.siteId).eq("requestId", args.requestId)).first();
+    if (prior) {
+      if (prior.cjProductId !== args.cjProductId || prior.cjVariantId !== args.cjVariantId || prior.priceUsd !== args.priceUsd) {
+        throw new Error("source selection requestId was already used for different candidate facts");
+      }
+      const priorEvidence = await ctx.db.get(prior.evidenceId);
+      return {
+        status: prior.status,
+        reused: true as const,
+        evidenceId: prior.evidenceId,
+        traceId: priorEvidence?.traceId,
+        productId: prior.productId,
+        actionId: prior.actionId,
+        approvalDispatchKey: prior.approvalDispatchKey,
+        approvalRunId: prior.approvalRunId,
+        approvalDispatchStatus: prior.approvalDispatchStatus,
+      };
+    }
+    const site = await ctx.db.get(args.siteId);
+    if (!site) throw new Error(`site ${args.siteId} not found`);
+    const existing = await ctx.db.query("products").withIndex("by_site", (q) => q.eq("siteId", args.siteId))
+      .filter((q) => q.eq(q.field("cjProductId"), args.cjProductId))
+      .filter((q) => q.eq(q.field("cjVariantId"), args.cjVariantId)).first();
+    if (sourceSelectionDecision({ sameRequestExists: false, shopifyDraftImportStatus: existing?.shopifyDraftImportStatus }) === "block_import") {
+      throw new Error(`source selection is blocked while Shopify draft import is ${existing?.shopifyDraftImportStatus}; reconcile before refreshing`);
+    }
+    const previousSelection = await ctx.db.query("sourceSelections")
+      .withIndex("by_site_candidate", (q) => q.eq("siteId", args.siteId).eq("cjProductId", args.cjProductId).eq("cjVariantId", args.cjVariantId))
+      .order("desc").first();
+    if (previousSelection?.actionId) {
+      const previousAction = await ctx.db.get(previousSelection.actionId);
+      if (previousAction && sourceSelectionDecision({ sameRequestExists: false, existingApprovalStatus: previousAction.status }) === "block_approval") {
+        throw new Error(`source selection is blocked while approval ${previousAction.status}; resolve the existing workflow before refreshing`);
+      }
+    }
+    const evidence = {
+      siteId: args.siteId,
+      cjProductId: args.cjProductId,
+      cjVariantId: args.cjVariantId,
+      title: args.title,
+      ...(args.cogsUsd !== undefined ? { cogsUsd: args.cogsUsd } : {}),
+      ...(args.shippingUsd !== undefined ? { shippingUsd: args.shippingUsd } : {}),
+      inventoryQty: args.inventoryQty,
+      fromUsWarehouse: args.fromUsWarehouse,
+      inventoryVerified: args.inventoryVerified,
+      sourceUrl: args.sourceUrl,
+      traceId: args.traceId,
+      readAt: args.readAt,
+    };
+    const gate = evaluatePersistedCjEvidence(evidence, {
+      priceUsd: args.priceUsd,
+      minimumPriceUsd: site.minKitPriceUsd,
+      minimumMarginPct: site.minBlendedMarginPct,
+    });
+    const evidenceId = await ctx.db.insert("cjEvidence", evidence);
+    await ctx.db.insert("traces", {
+      traceId: args.traceId,
+      siteId: args.siteId,
+      operation: "cj.catalog.read",
+      target: `cj:${args.cjProductId}:${args.cjVariantId}`,
+      idempotencyKey: `cj:selection:${args.siteId}:${args.requestId}`,
+      status: "succeeded",
+      detail: { evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, sourceUrl: args.sourceUrl, costsKnown: args.cogsUsd !== undefined && args.shippingUsd !== undefined, published: false },
+      startedAt: args.readAt,
+      finishedAt: args.readAt,
+    });
+    if (!gate.eligible || (existing && existing.status !== "draft")) {
+      const reason = !gate.eligible ? gate.reason : "source is already catalogued";
+      await ctx.db.insert("sourceSelections", {
+        siteId: args.siteId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId,
+        priceUsd: args.priceUsd, evidenceId, status: "denied", createdAt: Date.now(),
+      });
+      await appendAudit(ctx, { siteId: args.siteId, event: "product_sourced_draft_denied", detail: { evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, reason, published: false } });
+      return { status: "denied" as const, reused: false as const, evidenceId, traceId: args.traceId, reason };
+    }
+    const economics = gate.economics!;
+    const record = {
+      title: args.title, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, cjEvidenceId: evidenceId,
+      cjFromUsWarehouse: true, sourceUrl: args.sourceUrl, sourceVerifiedAt: args.readAt,
+      cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, dutyUsd: economics.dutyUsd,
+      paymentFeeUsd: economics.paymentFeeUsd, refundReserveUsd: economics.refundReserveUsd, contentCostUsd: economics.contentCostUsd,
+      landedCostUsd: economics.landedCostUsd, priceUsd: args.priceUsd, contributionMarginPct: economics.contributionMarginPct,
+      status: "draft" as const, sample: false,
+    };
+    const productId = existing ? (await ctx.db.patch(existing._id, record), existing._id) : await ctx.db.insert("products", { siteId: args.siteId, ...record, createdAt: Date.now() });
+    const approvalDispatchKey = `approval-gate:${args.siteId}:${args.requestId}`;
+    const actionId = await ctx.db.insert("actions", {
+      siteId: args.siteId, type: "import_sourced_product", riskTier: "human_gated", status: "pending_approval",
+      selectionRequestId: args.requestId, approvalDispatchKey, approvalDispatchStatus: "pending",
+      params: { productId, evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, title: args.title, inventoryQty: args.inventoryQty, evidenceReadAt: args.readAt, priceUsd: args.priceUsd, cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, landedCostUsd: economics.landedCostUsd, contributionMarginPct: economics.contributionMarginPct, published: false },
+      rationale: "Verified CJ evidence and server-derived contribution economics cleared the sourcing policy. Human approval can create one Shopify DRAFT only.", proposedAt: Date.now(),
+    });
+    await ctx.db.insert("sourceSelections", { siteId: args.siteId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, priceUsd: args.priceUsd, evidenceId, productId, actionId, status: "pending_approval", approvalDispatchKey, approvalDispatchStatus: "pending", createdAt: Date.now() });
+    await appendAudit(ctx, { siteId: args.siteId, actionId, event: "sourced_draft_import_proposed", detail: { productId, evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, title: args.title, inventoryQty: args.inventoryQty, cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, landedCostUsd: economics.landedCostUsd, priceUsd: args.priceUsd, contributionMarginPct: economics.contributionMarginPct, published: false } });
+    return { status: "pending_approval" as const, reused: false as const, evidenceId, traceId: args.traceId, productId, actionId, approvalDispatchKey, approvalDispatchStatus: "pending" as const };
+  },
+});
+
 function actionMatchesApprovedDraftImport(action: { siteId: unknown; type: string; riskTier: string; status: string; params: unknown }, product: { siteId: unknown; _id: unknown; cjEvidenceId?: unknown; cjProductId?: unknown; cjVariantId?: unknown; priceUsd: number; cogsUsd: number; shippingUsd: number; landedCostUsd?: number; contributionMarginPct?: number; sourceVerifiedAt?: number }): boolean {
   if (action.siteId !== product.siteId || action.type !== "import_sourced_product" || action.riskTier !== "human_gated" || action.status !== "approved") return false;
   const params = action.params;
@@ -262,7 +402,8 @@ export const completeApprovedShopifyDraftImport = mutation({
     const now = Date.now();
     await ctx.db.patch(args.productId, { shopifyProductId: args.shopifyProductId, shopifyDraftImportStatus: "created" });
     await ctx.db.patch(args.actionId, { status: "executed", resolvedAt: now });
-    await ctx.db.patch(trace._id, { status: "succeeded", detail: { shopifyProductId: args.shopifyProductId, published: false }, finishedAt: now });
+    const traceDetail = typeof trace.detail === "object" && trace.detail !== null ? trace.detail as Record<string, unknown> : {};
+    await ctx.db.patch(trace._id, { status: "succeeded", detail: { ...traceDetail, productId: args.productId, actionId: args.actionId, evidenceId: product.cjEvidenceId, shopifyProductId: args.shopifyProductId, published: false }, finishedAt: now });
     await appendAudit(ctx, { siteId: args.siteId, actionId: args.actionId, event: "shopify_draft_imported", detail: { productId: args.productId, shopifyProductId: args.shopifyProductId, traceId: args.traceId, published: false } });
     return args.productId;
   },
@@ -280,7 +421,10 @@ export const markApprovedShopifyDraftImportAmbiguous = mutation({
     const trace = await ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", args.traceId)).first();
     const now = Date.now();
     await ctx.db.patch(args.productId, { shopifyDraftImportStatus: "ambiguous" });
-    if (trace) await ctx.db.patch(trace._id, { status: "failed", detail: { error: args.error, reconcileRequired: true }, finishedAt: now });
+    if (trace) {
+      const traceDetail = typeof trace.detail === "object" && trace.detail !== null ? trace.detail as Record<string, unknown> : {};
+      await ctx.db.patch(trace._id, { status: "failed", detail: { ...traceDetail, productId: args.productId, actionId: args.actionId, evidenceId: product.cjEvidenceId, error: args.error, reconcileRequired: true, published: false }, finishedAt: now });
+    }
     await appendAudit(ctx, { siteId: args.siteId, actionId: args.actionId, event: "shopify_draft_import_ambiguous", detail: { productId: args.productId, traceId: args.traceId, reconcileRequired: true } });
     return args.productId;
   },

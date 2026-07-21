@@ -11,6 +11,7 @@
 import { task, wait, logger } from "@trigger.dev/sdk/v3";
 import { convexClient, api } from "../lib/convexClient";
 import type { Id } from "../../convex/_generated/dataModel";
+import { approvalWaitpointKey } from "../lib/sourceSelectionState";
 
 const TIMEOUT = "4w" as const; // Trigger waitpoint max window
 const MAX_CYCLES = 6; // 6 × 4w ≈ 24 weeks before escalation
@@ -23,16 +24,25 @@ interface ApprovalDecision {
 
 export const approvalGate = task({
   id: "approval-gate",
-  run: async (payload: { actionId: string }) => {
+  run: async (payload: { actionId: string; approvalDispatchKey: string }) => {
     const convex = convexClient();
     const actionId = payload.actionId as Id<"actions">;
 
     for (let cycle = 0; cycle < MAX_CYCLES; cycle++) {
+      const canArm = await convex.mutation(api.actions.canArmApprovalWaitpoint, {
+        actionId,
+        approvalDispatchKey: payload.approvalDispatchKey,
+      });
+      if (!canArm) {
+        logger.info("approval-gate stopped; action is no longer pending", { actionId, cycle });
+        return { status: "no_longer_pending" as const, actionId };
+      }
       // Fresh waitpoint each cycle (re-arm).
-      const token = await wait.createToken({ timeout: TIMEOUT });
+      const token = await wait.createToken({ timeout: TIMEOUT, idempotencyKey: approvalWaitpointKey(actionId, cycle), idempotencyKeyTTL: "24w" });
       await convex.mutation(api.actions.setWaitpointToken, {
         actionId,
         waitpointToken: token.id,
+        approvalDispatchKey: payload.approvalDispatchKey,
       });
       logger.info("approval-gate armed", { actionId, cycle, tokenId: token.id });
 
@@ -68,12 +78,15 @@ export const approvalGate = task({
     }
 
     // Exhausted all cycles → escalate, leave action pending for manual handling.
-    await convex.mutation(api.audit.append, {
-      siteId: (await convex.query(api.actions.get, { actionId }))?.siteId as Id<"sites">,
-      actionId,
-      event: "approval_escalated",
-      detail: { reason: "max waitpoint re-arm cycles exhausted", cycles: MAX_CYCLES },
-    });
+    const action = await convex.query(api.actions.get, { actionId });
+    if (action?.status === "pending_approval" && action.approvalDispatchKey === payload.approvalDispatchKey) {
+      await convex.mutation(api.audit.append, {
+        siteId: action.siteId,
+        actionId,
+        event: "approval_escalated",
+        detail: { reason: "max waitpoint re-arm cycles exhausted", cycles: MAX_CYCLES, approvalDispatchKey: payload.approvalDispatchKey },
+      });
+    }
     logger.error("approval-gate escalated — no decision after max cycles", { actionId });
     return { status: "escalated" as const, actionId };
   },

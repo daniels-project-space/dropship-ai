@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Id } from "@/convex/_generated/dataModel";
 import { StatusDot } from "./StatusDot";
 import { RISK_TIER, type RiskTier } from "./tokens";
+import { sourcedDraftApprovalFacts } from "@/src/lib/sourcedDraftApprovalFacts";
 
 export type PendingAction = {
   _id: Id<"actions">;
@@ -45,6 +46,7 @@ export function ActionCard({
   const tier = RISK_TIER[action.riskTier];
   const confidencePct =
     action.confidence != null ? Math.round(action.confidence * 100) : null;
+  const sourceFacts = sourcedDraftApprovalFacts(action.type, action.params);
 
   async function run(kind: "approve" | "reject") {
     setError(null);
@@ -109,6 +111,14 @@ export function ActionCard({
           <p className="mt-4 max-w-2xl text-[14px] leading-relaxed text-ink-dim">
             {action.rationale}
           </p>
+
+          {sourceFacts && (
+            <div className="mt-4 max-w-2xl rounded-xl border border-signal/25 bg-signal/[0.04] p-3 text-[12px] text-ink-dim">
+              <p className="font-medium text-ink">{sourceFacts.title} · Shopify DRAFT only — unpublished</p>
+              <p className="mt-1 font-mono text-[10px] text-ink-faint">CJ product {sourceFacts.cjProductId} · exact variant {sourceFacts.cjVariantId} · evidence {timeAgo(sourceFacts.evidenceReadAt)} · US inventory {sourceFacts.inventoryQty}</p>
+              <p className="mt-1 font-mono text-[10px] text-ink-faint">COGS ${sourceFacts.cogsUsd.toFixed(2)} · shipping ${sourceFacts.shippingUsd.toFixed(2)} · landed ${sourceFacts.landedCostUsd.toFixed(2)} · retail ${sourceFacts.priceUsd.toFixed(2)} · contribution {sourceFacts.contributionMarginPct.toFixed(1)}%</p>
+            </div>
+          )}
 
           {confidencePct != null && (
             <div className="mt-4 h-1 w-full max-w-xs overflow-hidden rounded-full bg-line">

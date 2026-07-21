@@ -21,7 +21,7 @@ export async function POST(request: Request) {
   if (typeof body.actionId !== "string" || typeof body.approved !== "boolean" || (body.reason !== undefined && typeof body.reason !== "string")) {
     return NextResponse.json({ error: "actionId and approved are required" }, { status: 400 });
   }
-  if (!process.env.TRIGGER_SECRET_KEY && !process.env.TRIGGER_ACCESS_TOKEN) {
+  if (!process.env.TRIGGER_SECRET_KEY) {
     return NextResponse.json({ error: "approval waitpoint is not configured" }, { status: 503 });
   }
   try {
