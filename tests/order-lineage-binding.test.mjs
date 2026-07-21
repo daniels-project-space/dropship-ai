@@ -16,12 +16,13 @@ test("Convex order-lineage reducer rejects wrong Shopify site, product, variant,
 });
 
 test("Convex approval reducer rejects wrong action, order, site, logistics, and sandbox binding", () => {
-  const order = { _id: "order-a", siteId: "site-a", cjApprovalActionId: "action-a", cjDispatchGeneration: 2, cjOrderInputHash: "hash-a", cjOrderInput: { orderNumber: "dsa-sb-a", logisticName: "Quoted route", fromCountryCode: "US" }, cjLogisticsPreflight: { logisticName: "Quoted route" } };
-  const action = { _id: "action-a", siteId: "site-a", type: "dispatch_cj_sandbox_order", status: "approved", params: { orderId: "order-a", orderNumber: "dsa-sb-a", inputHash: "hash-a", generation: 2, generationFingerprint: "a".repeat(64), isSandbox: 1, payType: 3, logisticName: "Quoted route", fromCountryCode: "US" } };
+  const order = { _id: "order-a", siteId: "site-a", cjApprovalActionId: "action-a", cjDispatchGeneration: 2, cjDispatchGenerationFingerprint: "a".repeat(64), cjQuoteInputDigest: "quote-a", cjOrderInputHash: "hash-a", cjOrderInput: { orderNumber: "dsa-sb-a", logisticName: "Quoted route", fromCountryCode: "US" }, cjLogisticsPreflight: { logisticName: "Quoted route" } };
+  const action = { _id: "action-a", siteId: "site-a", type: "dispatch_cj_sandbox_order", status: "approved", params: { orderId: "order-a", orderNumber: "dsa-sb-a", inputHash: "hash-a", generation: 2, generationFingerprint: "a".repeat(64), quoteInputDigest: "quote-a", isSandbox: 1, payType: 3, logisticName: "Quoted route", fromCountryCode: "US" } };
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action, order }), true);
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-b", action, order }), false);
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, orderId: "order-b" } }, order }), false);
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, siteId: "site-b" }, order }), false);
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, logisticName: "unverified" } }, order }), false);
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, generation: 1 } }, order }), false);
+  assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, quoteInputDigest: "quote-b" } }, order }), false);
 });

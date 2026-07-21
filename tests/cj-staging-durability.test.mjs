@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { executeCjStaging } from "../src/lib/cjStagingExecutor.ts";
 import { cjFreightQuoteDigest } from "../src/lib/cjOrder.ts";
-import { CJ_STAGING_MAX_ATTEMPTS, cjStagingFailureTransition, cjStagingRetryAt, stagingInputDuplicateDecision } from "../src/lib/cjStagingState.ts";
+import { CJ_STAGING_MAX_ATTEMPTS, CjStagingFailureError, classifyCjStagingFailure, cjStagingFailureTransition, cjStagingGenerationFingerprint, cjStagingRetryAt, hasExactCjStagingGeneration, legacyCjStagingRunnableAt, stagingInputDuplicateDecision } from "../src/lib/cjStagingState.ts";
 
 function worker(overrides = {}) {
   const calls = { quote: 0, recordQuote: 0, stage: 0, trigger: 0, recordApproval: 0 };
@@ -33,8 +33,14 @@ test("durable semantic duplicate intake has no CJ or Trigger surface", async () 
 test("bounded retry transitions are due once, then terminal; permanent inputs need attention", () => {
   assert.equal(cjStagingRetryAt(1000, 1), 61_000);
   assert.deepEqual(cjStagingFailureTransition(1000, 1, "retryable"), { status: "pending", runnableAt: 61_000 });
-  assert.deepEqual(cjStagingFailureTransition(1000, CJ_STAGING_MAX_ATTEMPTS, "retryable"), { status: "failed", runnableAt: undefined });
+  assert.deepEqual(cjStagingFailureTransition(1000, CJ_STAGING_MAX_ATTEMPTS, "retryable", "approval_dispatching"), { status: "needs_attention", runnableAt: undefined });
   assert.deepEqual(cjStagingFailureTransition(1000, 1, "permanent"), { status: "needs_attention", runnableAt: undefined });
+  assert.deepEqual(cjStagingFailureTransition(1000, 2, "retryable", "approval_dispatching"), { status: "approval_dispatching", runnableAt: 121_000 });
+});
+
+test("only typed errors can be permanent; free-form provider text is bounded retryable", () => {
+  assert.deepEqual(classifyCjStagingFailure(new CjStagingFailureError("permanent", "invalid_or_unbound_input")), { kind: "permanent", code: "invalid_or_unbound_input" });
+  assert.deepEqual(classifyCjStagingFailure(new Error("not found: customer address should never classify state")), { kind: "retryable", code: "unexpected_runtime_failure" });
 });
 
 test("failure after durable intake retries in the worker, and a persisted quote is reused", async () => {
@@ -72,6 +78,52 @@ test("an ambiguous Trigger response cannot mark the intent dispatched", async ()
   const { calls, deps } = worker({ triggerApproval: async () => { calls.trigger++; throw new Error("response lost"); } });
   await assert.rejects(() => executeCjStaging(deps), /response lost/);
   assert.equal(calls.recordApproval, 0);
+});
+
+test("crash boundaries resume the persisted stage/action rather than re-quoting or replacing it", async () => {
+  const afterStage = worker({ claimPreflight: async () => ({ state: "staged" }) });
+  await executeCjStaging(afterStage.deps);
+  assert.equal(afterStage.calls.quote, 0);
+  assert.equal(afterStage.calls.stage, 0);
+  assert.equal(afterStage.calls.trigger, 1);
+
+  const afterApprovalClaim = worker({ claimPreflight: async () => ({ state: "staged" }), claimApproval: async () => ({ state: "busy" }) });
+  assert.deepEqual(await executeCjStaging(afterApprovalClaim.deps), { state: "busy" });
+  assert.equal(afterApprovalClaim.calls.trigger, 0);
+
+  const triggerAcceptedResponseLost = worker({ claimPreflight: async () => ({ state: "staged" }), triggerApproval: async () => { triggerAcceptedResponseLost.calls.trigger++; throw new Error("lost response"); } });
+  await assert.rejects(() => executeCjStaging(triggerAcceptedResponseLost.deps), /lost response/);
+  assert.equal(triggerAcceptedResponseLost.calls.recordApproval, 0);
+
+  const afterDispatchRecorded = worker({ claimPreflight: async () => ({ state: "staged" }), beginApproval: async () => ({ status: "dispatched" }) });
+  await executeCjStaging(afterDispatchRecorded.deps);
+  assert.equal(afterDispatchRecorded.calls.trigger, 0);
+  assert.equal(afterDispatchRecorded.calls.recordApproval, 1);
+});
+
+test("generation fingerprint changes for a new quote time even when route and price match", () => {
+  const base = { generation: 4, inputHash: "input", quoteInputDigest: "quote", logisticName: "USPS", fromCountryCode: "US", quotedPriceUsd: 5 };
+  assert.notEqual(cjStagingGenerationFingerprint({ ...base, quotedAt: 1 }), cjStagingGenerationFingerprint({ ...base, quotedAt: 2 }));
+  assert.notEqual(cjStagingGenerationFingerprint({ ...base, quotedAt: 1 }), cjStagingGenerationFingerprint({ ...base, quotedAt: 1, quotedPriceUsd: 6 }));
+});
+
+test("staging only reuses a fully current pending/approved action generation", () => {
+  const quote = { quoteInputDigest: "quote", logisticName: "USPS", fromCountryCode: "US", quotedPriceUsd: 5, quotedAt: 10 };
+  const fingerprint = cjStagingGenerationFingerprint({ generation: 3, inputHash: "input", ...quote });
+  const order = { cjOrderInputHash: "input", cjDispatchGeneration: 3, cjDispatchGenerationFingerprint: fingerprint, cjQuoteInputDigest: "quote" };
+  const params = { generation: 3, generationFingerprint: fingerprint, quoteInputDigest: "quote", logisticName: "USPS", fromCountryCode: "US", logisticsQuotedPriceUsd: 5, logisticsQuotedAt: 10 };
+  assert.equal(hasExactCjStagingGeneration({ actionStatus: "pending_approval", actionParams: params, order, quote }), true);
+  assert.equal(hasExactCjStagingGeneration({ actionStatus: "approved", actionParams: params, order, quote: { ...quote, quotedAt: 11 } }), false, "same route/price with a new quote time requires approval");
+  assert.equal(hasExactCjStagingGeneration({ actionStatus: "pending_approval", actionParams: params, order, quote: { ...quote, quotedPriceUsd: 6 } }), false);
+  assert.equal(hasExactCjStagingGeneration({ actionStatus: "superseded", actionParams: params, order, quote }), false);
+});
+
+test("legacy scheduler repair is phase-aware and never revives terminal rows", () => {
+  assert.equal(legacyCjStagingRunnableAt("pending", undefined, 100), 100);
+  assert.equal(legacyCjStagingRunnableAt("quoted", undefined, 100), 100);
+  assert.equal(legacyCjStagingRunnableAt("staged", undefined, 100), 100);
+  assert.equal(legacyCjStagingRunnableAt("preflighting", 200, 100), 200);
+  assert.equal(legacyCjStagingRunnableAt("approval_dispatching", undefined, 100), 100);
 });
 
 test("quote digest binds exact lineage/provider inputs while keeping zip out of durable metadata", () => {

@@ -30,7 +30,9 @@ export const recordShopifyOrder = mutation({
     if (receiptDecision === "duplicate") {
       // A provider delivery ID is immutable. Accepting changed content could bind an existing
       // approval to another address or line set, so this must fail closed rather than retry.
-      const intent = await ctx.db.query("cjStagingIntents").withIndex("by_site_delivery", (q) => q.eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
+      const intent = prior!.cjStagingIntentId
+        ? await ctx.db.get(prior!.cjStagingIntentId)
+        : await ctx.db.query("cjStagingIntents").withIndex("by_site_delivery", (q) => q.eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
       return { duplicate: true, outcome: prior!.outcome, intentId: intent?._id ?? null };
     }
 
@@ -76,7 +78,7 @@ export const recordShopifyOrder = mutation({
     }
     await ctx.db.insert("webhookReceipts", {
       provider: "shopify", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
-      payloadHash: args.payloadHash, outcome: "applied", receivedAt: Date.now(),
+      payloadHash: args.payloadHash, outcome: "applied", cjStagingIntentId: intentId ?? undefined, receivedAt: Date.now(),
     });
     // `applied` means intake/mirroring completed, never that CJ quote, staging, or approval did.
     return { duplicate: false, outcome: "applied" as const, intentId, intentNeedsAttention };

@@ -19,6 +19,7 @@ const actionStatus = v.union(
   v.literal("executing"),
   v.literal("executed"),
   v.literal("failed"),
+  v.literal("superseded"),
 );
 const platform = v.union(
   v.literal("tiktok"),
@@ -226,6 +227,8 @@ export default defineSchema({
     // Each fresh freight quote is an immutable approval generation. Provider lineage is never
     // rewritten once a create has been reserved, ambiguous, or sent.
     cjDispatchGeneration: v.optional(v.number()),
+    cjDispatchGenerationFingerprint: v.optional(v.string()),
+    cjQuoteInputDigest: v.optional(v.string()),
     cjDispatchAttempt: v.optional(v.number()),   // fenced reservation generation; never reused after a reconcile miss
     cjApprovalActionId: v.optional(v.id("actions")),
     cjDispatchStatus: v.optional(v.union(v.literal("staged"), v.literal("reserved"), v.literal("ambiguous"), v.literal("sent"), v.literal("failed"))),
@@ -242,6 +245,7 @@ export default defineSchema({
     payloadHash: v.string(),
     status: v.union(v.literal("pending"), v.literal("preflighting"), v.literal("quoted"), v.literal("preflight_required"), v.literal("staged"), v.literal("approval_dispatching"), v.literal("approval_dispatched"), v.literal("needs_attention"), v.literal("failed")),
     attempt: v.number(),
+    workerAttempt: v.optional(v.number()),
     leaseExpiresAt: v.optional(v.number()),
     // The only scheduler index. Ready rows are due now; leased rows are due at their fence.
     runnableAt: v.optional(v.number()),
@@ -258,7 +262,7 @@ export default defineSchema({
     actionId: v.optional(v.id("actions")),
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_site_status", ["siteId", "status"]).index("by_runnable_at", ["runnableAt"]).index("by_order", ["orderId"]).index("by_site_delivery", ["siteId", "deliveryId"]),
+  }).index("by_site_status", ["siteId", "status"]).index("by_runnable_at", ["runnableAt"]).index("by_status_runnable_at", ["status", "runnableAt"]).index("by_order", ["orderId"]).index("by_site_delivery", ["siteId", "deliveryId"]),
 
   // ── the brain: proposed actions + risk-tiered approval ────────────────────
   actions: defineTable({
@@ -334,6 +338,7 @@ export default defineSchema({
     siteId: v.id("sites"),
     payloadHash: v.string(),
     outcome: v.union(v.literal("applied"), v.literal("ignored")),
+    cjStagingIntentId: v.optional(v.id("cjStagingIntents")),
     receivedAt: v.number(),
   }).index("by_provider_site_delivery", ["provider", "siteId", "deliveryId"]).index("by_site_received_at", ["siteId", "receivedAt"]),
 

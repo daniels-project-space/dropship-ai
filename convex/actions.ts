@@ -200,6 +200,7 @@ export const listBySite = query({
         v.literal("executing"),
         v.literal("executed"),
         v.literal("failed"),
+        v.literal("superseded"),
       ),
     ),
     limit: v.optional(v.number()),

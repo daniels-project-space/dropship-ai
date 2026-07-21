@@ -54,6 +54,9 @@ export const cjStagingSweep = schedules.task({
   cron: "*/1 * * * *",
   run: async () => {
     const convex = convexClient();
+    // Optional rollout fields are repaired in small indexed batches before the due read.  This
+    // makes legacy rows runnable without adding a full-table scan to the steady-state path.
+    await convex.mutation(api.orders.reconcileLegacyCjStagingIntents, { limit: 25 });
     const intents = await convex.query(api.orders.listDueCjStagingIntents, { limit: 25 }) as Array<{ _id: string }>;
     for (const intent of intents) {
       await tasks.trigger<typeof cjStaging>("cj-staging", { intentId: intent._id }, { idempotencyKey: `cj-staging:${intent._id}`, idempotencyKeyTTL: "1m" });
