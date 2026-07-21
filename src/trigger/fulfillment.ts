@@ -31,7 +31,7 @@ export const fulfillOrder = task({
       releaseTarget: async ({ target, owner }) => { await convex.mutation(api.ops.releaseTarget, { target, owner }); },
       isAmbiguousWriteError: isAmbiguousCjWriteError,
     });
-    if (!result.skipped && !("reconciled" in result)) logger.info("CJ sandbox order created", { actionId, ...result });
+    if (!result.skipped && !("reconciled" in result)) logger.info("CJ sandbox order created", { actionId });
     return result;
   },
 });
@@ -55,5 +55,6 @@ export async function handleCjTrackingWebhook(args: CjWebhookHandlerArgs) {
     assertLiveEffectsEnabled(args.mode ?? "sandbox");
     await fulfillmentTrackingInfoUpdate(args.shopify.cfg, args.shopify.fulfillmentId, { number: tracking.trackNumber, url: tracking.trackingUrl, company: tracking.logisticName }, false);
   }
-  return { applied: true, orderNumber: tracking.orderNumber, trackNumber: tracking.trackNumber };
+  // Tracking values remain in private Convex order state; Trigger results are not a PII channel.
+  return { applied: true, orderNumber: tracking.orderNumber };
 }

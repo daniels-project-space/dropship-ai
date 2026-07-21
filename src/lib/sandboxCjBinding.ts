@@ -58,18 +58,19 @@ export function hasCurrentSandboxCjDispatchReceipt(input: {
   receipt: SandboxCjDispatchReceipt;
   actionId: unknown;
   orderId: unknown;
-  action?: { _id: unknown; params: unknown } | null;
-  order?: { _id: unknown; cjOrderInputHash?: unknown; cjDispatchGeneration?: unknown; cjDispatchGenerationFingerprint?: unknown; cjDispatchAttempt?: unknown } | null;
+  action?: { _id: unknown; siteId: unknown; type: string; status: string; params: unknown } | null;
+  // This is a private Convex document at every caller. `any` here avoids widening a receipt
+  // validator into a lossy RPC DTO; hasValidSandboxCjApprovalBinding verifies its full shape.
+  order?: any | null;
 }): boolean {
   const { receipt, actionId, orderId, action, order } = input;
-  const params = typeof action?.params === "object" && action.params !== null ? action.params as Record<string, unknown> : null;
-  return !!order && !!action && receipt.actionId === actionId && receipt.orderId === orderId
+  return !!order && !!action && hasValidSandboxCjApprovalBinding({ actionId, action, order }) && receipt.actionId === actionId && receipt.orderId === orderId
     && order._id === orderId && action._id === actionId
-    && receipt.inputHash === order.cjOrderInputHash
+    // Recompute these values from private persisted input/quote; stored copies alone are not a
+    // provider fence because a corrupted copy could otherwise bless the wrong receipt.
+    && receipt.inputHash === cjOrderInputHash(order.cjOrderInput)
     && receipt.generation === order.cjDispatchGeneration
-    && receipt.generationFingerprint === order.cjDispatchGenerationFingerprint
+    && receipt.generationFingerprint === cjStagingGenerationFingerprint({ generation: order.cjDispatchGeneration as number, inputHash: cjOrderInputHash(order.cjOrderInput), quoteInputDigest: order.cjQuoteInputDigest as string, logisticName: order.cjLogisticsPreflight.logisticName, fromCountryCode: order.cjLogisticsPreflight.fromCountryCode, quotedPriceUsd: order.cjLogisticsPreflight.quotedPriceUsd, quotedAt: order.cjLogisticsPreflight.quotedAt })
     && receipt.attempt === order.cjDispatchAttempt
-    && params?.inputHash === receipt.inputHash
-    && params?.generation === receipt.generation
-    && params?.generationFingerprint === receipt.generationFingerprint;
+    && receipt.generationFingerprint === order.cjDispatchGenerationFingerprint;
 }

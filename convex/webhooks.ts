@@ -74,7 +74,7 @@ export const recordShopifyOrder = mutation({
         siteId: args.siteId, shopifyOrderId: args.shopifyOrderId, totalUsd: args.totalUsd,
         fulfillmentStatus: args.fulfillmentStatus, createdAt: args.createdAt, sample: false,
       });
-      await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { shopifyOrderId: args.shopifyOrderId, source: "shopify_webhook" } });
+      await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { source: "shopify_webhook" } });
     }
     let intentId: any = null;
     let intentNeedsAttention = false;
@@ -138,7 +138,7 @@ export const recordCjTracking = mutation({
       cjOrderId: args.cjOrderId ?? order.cjOrderId,
       fulfillmentStatus: args.trackingNumber ? "shipped" : order.fulfillmentStatus,
     });
-    await appendAudit(ctx, { siteId: args.siteId, event: "order_tracking_applied", detail: { orderId: order._id, trackingNumber: args.trackingNumber, source: "cj_webhook" } });
+    await appendAudit(ctx, { siteId: args.siteId, event: "order_tracking_applied", detail: { orderId: order._id, source: "cj_webhook" } });
     await ctx.db.insert("webhookReceipts", {
       provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
       payloadHash: args.payloadHash, outcome: "applied", receivedAt: Date.now(),

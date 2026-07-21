@@ -27,7 +27,7 @@ export async function executeCjStaging(deps: CjStagingDependencies) {
   // `staged` is a durable crash boundary.  Do not restage/rewrite its generation; resume its
   // exact approval-dispatch key instead.
   const staged = claimed.state === "staged" ? { state: "staged" as const, actionId: undefined } : await deps.stage();
-  if (staged.state === "preflight_required") return { state: staged.state };
+  if (staged.state === "preflight_required" || staged.state === "needs_attention") return { state: staged.state };
   const approval = await deps.claimApproval();
   if (approval.state !== "dispatch" || !approval.actionId || !approval.approvalDispatchKey || approval.leaseGeneration === undefined) return { state: approval.state };
   const began = await deps.beginApproval({ actionId: approval.actionId, approvalDispatchKey: approval.approvalDispatchKey });

@@ -48,14 +48,14 @@ test("ambiguous CJ response requires a read reconciliation; found completes with
   assert.deepEqual(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "reconcile")[0][1], { orderId: "order-1", cjOrderId: "cj-1", receipt });
 });
 
-test("reconciliation absent fences exactly one new continuation before the only create", async () => {
-  const resumed = { ...reserved, attempt: 2 };
-  const run = harness([{ state: "reconcile_required", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1", receipt }, resumed]);
-  await executeSandboxCjDispatch(run.deps);
-  assert.equal(run.calls.filter((entry) => entry === "claim").length, 2);
-  const enqueue = run.calls.find((entry) => Array.isArray(entry) && entry[0] === "enqueue")[1];
-  assert.match(enqueue.idempotencyKey, /:2$/);
-  assert.equal(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "create").length, 1);
+test("an absent reconciliation never creates again while provider reads can be eventually consistent", async () => {
+  const run = harness([{ state: "reconcile_required", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1", receipt }]);
+  const result = await executeSandboxCjDispatch(run.deps);
+  assert.equal(result.reason, "reconciliation_required");
+  assert.equal(run.calls.filter((entry) => entry === "claim").length, 1);
+  assert.equal(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "create").length, 0);
+  assert.equal(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "lock").length, 1);
+  assert.equal(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "release").length, 1);
 });
 
 test("post-completion outbox failure does not regress the completed dispatch or issue another provider call", async () => {

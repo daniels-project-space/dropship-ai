@@ -10,6 +10,8 @@ const modules = {
   "../convex/orders.ts": () => import("../convex/orders.ts"),
   "../convex/webhooks.ts": () => import("../convex/webhooks.ts"),
   "../convex/actions.ts": () => import("../convex/actions.ts"),
+  "../convex/ops.ts": () => import("../convex/ops.ts"),
+  "../convex/products.ts": () => import("../convex/products.ts"),
   "../convex/audit.ts": () => import("../convex/audit.ts"),
   "../convex/_generated/api.js": () => import("../convex/_generated/api.js"),
 };
@@ -51,7 +53,8 @@ test("Convex handlers reject anonymous service calls and due index returns only 
   const a = await seed(t, "pending", 1);
   const b = await seed(t, "pending", Date.now() + 60_000);
   await t.run(async (ctx) => {
-    await ctx.db.patch(b.intentId, { status: "needs_attention", runnableAt: 1 });
+    // Terminal state invariants clear the only runnable projection.
+    await ctx.db.patch(b.intentId, { status: "needs_attention", runnableAt: undefined });
     await ctx.db.insert("cjStagingIntents", { siteId: a.siteId, orderId: a.orderId, deliveryId: "delivery-no-due", payloadHash: "hash-none", status: "pending", attempt: 0, shipping, shopifyLines: lines, createdAt: 1, updatedAt: 1 });
   });
   const due = await service(t).query(api.orders.listDueCjStagingIntents, { limit: 999 });
@@ -133,6 +136,60 @@ test("provider intake and tracking handlers require the service identity", async
   const order = await t.run((ctx) => ctx.db.get(orderId));
   await assert.rejects(() => t.mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" }), /UNAUTHENTICATED/);
   await assert.rejects(() => t.mutation(api.webhooks.recordCjTracking, { siteId: order.siteId, deliveryId: "d", topic: "ORDER", payloadHash: "h", cjOrderNumber: order.cjOrderNumber }), /UNAUTHENTICATED/);
+});
+
+test("provider intake and runtime primitives reject anonymous and operator identities", async () => {
+  const t = convexTest({ schema, modules });
+  const { siteId, orderId, actionId } = await seedApprovedDispatch(t);
+  const operator = t.withIdentity({ subject: "dropship-ai:operator" });
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  const calls = [
+    () => operator.mutation(api.orders.upsertFromShopify, { siteId, orders: [] }),
+    () => operator.mutation(api.products.upsertFromShopify, { siteId, products: [] }),
+    () => operator.mutation(api.orders.record, { siteId, shopifyOrderId: "gid://shopify/Order/x", totalUsd: 1 }),
+    () => operator.mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" }),
+    () => operator.mutation(api.orders.claimSandboxCjDispatch, { actionId }),
+    () => operator.mutation(api.ops.enqueue, { siteId, kind: "test", target: "target", idempotencyKey: "key", traceId: "trace", payload: {} }),
+    () => operator.mutation(api.ops.claimTarget, { target: "target", owner: "owner" }),
+  ];
+  for (const call of calls) await assert.rejects(call, /UNAUTHENTICATED/);
+  const queued = await service(t).mutation(api.ops.enqueue, { siteId, kind: "test", target: "target", idempotencyKey: "key", traceId: "trace", payload: {} });
+  await assert.rejects(() => operator.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed" }), /UNAUTHENTICATED/);
+  await assert.rejects(() => operator.mutation(api.ops.releaseTarget, { target: "target", owner: "owner" }), /UNAUTHENTICATED/);
+  assert.equal((await service(t).mutation(api.ops.claimTarget, { target: "target", owner: "owner" })).acquired, true);
+});
+
+test("atomic reservation fences concurrent deliveries before either can reach CJ", async () => {
+  const t = convexTest({ schema, modules });
+  const { actionId, orderId } = await seedApprovedDispatch(t);
+  const [first, second] = await Promise.all([
+    service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId }),
+    service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId }),
+  ]);
+  assert.deepEqual([first.state, second.state].sort(), ["blocked", "reserved"]);
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  assert.equal(order.cjDispatchAttempt, 1);
+  const locks = await t.run((ctx) => ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", `cj:sandbox:${orderId}`)).collect());
+  assert.equal(locks.length, 1);
+});
+
+test("tracking and audit boundaries never copy sentinel customer or tracking values", async () => {
+  const t = convexTest({ schema, modules });
+  const { siteId, orderId } = await seedApprovedDispatch(t);
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  const sentinel = "PII-SENTINEL-DO-NOT-LEAK";
+  await t.run((ctx) => ctx.db.patch(orderId, {
+    cjOrderInput: { ...order.cjOrderInput, shippingAddress: sentinel, shippingCustomerName: sentinel, shippingPhone: sentinel, shippingZip: sentinel },
+  }));
+  await service(t).mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, trackingNumber: sentinel, trackingUrl: `https://example.test/${sentinel}`, status: "shipped" });
+  const privateOrder = await t.run((ctx) => ctx.db.get(orderId));
+  assert.match(JSON.stringify(privateOrder.cjOrderInput), new RegExp(sentinel));
+  const audit = await t.run((ctx) => ctx.db.query("auditLog").collect());
+  const outbox = await t.run((ctx) => ctx.db.query("outbox").collect());
+  const traces = await t.run((ctx) => ctx.db.query("traces").collect());
+  assert.equal(JSON.stringify({ audit, outbox, traces }).includes(sentinel), false);
+  assert.equal(JSON.stringify(await service(t).mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" })).includes(sentinel), false);
+  assert.equal(siteId !== undefined, true);
 });
 
 test("approval resolution races close the same claimed intent without re-arming it", async () => {

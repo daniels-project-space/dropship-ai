@@ -5,14 +5,24 @@ import { v } from "convex/values";
 
 const outboxStatus = v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed"));
 
+async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }) {
+  if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: operations runtime requires the service identity");
+}
+
 export const claimTarget = mutation({
   args: { target: v.string(), owner: v.string(), leaseMs: v.optional(v.number()) },
   handler: async (ctx, { target, owner, leaseMs }) => {
+    await requireServiceIdentity(ctx);
     const now = Date.now();
     const existing = await ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", target)).first();
     // A duplicate Trigger delivery has the same owner. It must not replace its own live lease,
     // otherwise two retrying runs can both cross the same provider boundary.
-    if (existing && existing.expiresAt > now) return { acquired: false, owner: existing.owner, expiresAt: existing.expiresAt };
+    if (existing && existing.expiresAt > now) {
+      // Reservation owns the CJ fence before Trigger runs. Its one matching executor may enter;
+      // duplicate deliveries are stopped by claimSandboxCjDispatch before they reach here.
+      if (existing.owner === owner) return { acquired: true, reused: true, expiresAt: existing.expiresAt };
+      return { acquired: false, owner: existing.owner, expiresAt: existing.expiresAt };
+    }
     if (existing) await ctx.db.delete(existing._id);
     const expiresAt = now + Math.min(Math.max(leaseMs ?? 5 * 60_000, 1_000), 15 * 60_000);
     await ctx.db.insert("targetLocks", { target, owner, expiresAt, createdAt: now });
@@ -23,6 +33,7 @@ export const claimTarget = mutation({
 export const releaseTarget = mutation({
   args: { target: v.string(), owner: v.string() },
   handler: async (ctx, { target, owner }) => {
+    await requireServiceIdentity(ctx);
     const existing = await ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", target)).first();
     if (!existing || existing.owner !== owner) return { released: false };
     await ctx.db.delete(existing._id);
@@ -35,6 +46,7 @@ export const enqueue = mutation({
     siteId: v.id("sites"), kind: v.string(), target: v.string(), idempotencyKey: v.string(), traceId: v.string(), payload: v.any(),
   },
   handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
     const existing = await ctx.db.query("outbox").withIndex("by_idempotency_key", (q) => q.eq("idempotencyKey", args.idempotencyKey)).first();
     if (existing) return { outboxId: existing._id, duplicate: true, status: existing.status };
     const now = Date.now();
@@ -47,6 +59,7 @@ export const enqueue = mutation({
 export const markOutbox = mutation({
   args: { outboxId: v.id("outbox"), status: outboxStatus, detail: v.optional(v.any()), error: v.optional(v.string()), retryAt: v.optional(v.number()) },
   handler: async (ctx, { outboxId, status, detail, error, retryAt }) => {
+    await requireServiceIdentity(ctx);
     const row = await ctx.db.get(outboxId);
     if (!row) throw new Error(`outbox ${outboxId} not found`);
     const now = Date.now();

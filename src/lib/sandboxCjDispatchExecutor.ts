@@ -14,7 +14,7 @@ export type SandboxCjDispatchReceipt = { actionId: string; orderId: string; inpu
 export interface SandboxCjDispatchDependencies {
   claim(): Promise<ClaimedSandboxDispatch>;
   findByOrderNumber(orderNumber: string): Promise<{ orderId: string } | null>;
-  reconcile(input: { orderId: string; cjOrderId?: string; receipt: SandboxCjDispatchReceipt }): Promise<{ state: "found" | "absent" | "ignored" }>;
+  reconcile(input: { orderId: string; cjOrderId?: string; receipt: SandboxCjDispatchReceipt }): Promise<{ state: "found" | "ignored" }>;
   enqueue(input: { siteId: string; target: string; idempotencyKey: string; orderId: string; orderNumber: string; inputHash: string; attempt: number }): Promise<{ outboxId: string }>;
   claimTarget(input: { target: string; owner: string }): Promise<{ acquired: boolean }>;
   markOutbox(input: { outboxId: string; status: "processing" | "delivered" | "failed"; error?: string; detail?: Record<string, unknown> }): Promise<void>;
@@ -31,12 +31,20 @@ export async function executeSandboxCjDispatch(deps: SandboxCjDispatchDependenci
   if (claimed.state === "blocked") return { skipped: true as const, reason: "dispatch_blocked", orderId: claimed.orderId };
 
   if (claimed.state === "reconcile_required") {
-    const existing = await deps.findByOrderNumber(claimed.orderNumber);
-    const reconciled = await deps.reconcile({ orderId: claimed.orderId, cjOrderId: existing?.orderId, receipt: claimed.receipt });
-    if (reconciled.state === "found") return { reconciled: "found" as const, orderId: claimed.orderId, orderNumber: claimed.orderNumber };
-    if (reconciled.state === "ignored") return { skipped: true as const, reason: "stale_dispatch_receipt", orderId: claimed.orderId };
-    claimed = await deps.claim();
-    if (claimed.state !== "reserved") throw new Error("CJ reconciliation continuation could not reserve the next generation");
+    const target = `cj:sandbox:${claimed.orderId}`;
+    const owner = `cj:sandbox:create:${claimed.orderId}:${claimed.receipt.inputHash}:${claimed.receipt.attempt}`;
+    // Hold the same target fence across provider lookup and reconciliation. A concurrent
+    // delivery cannot turn a still-active or eventually-consistent request into a new create.
+    const lock = await deps.claimTarget({ target, owner });
+    if (!lock.acquired) return { skipped: true as const, reason: "dispatch_locked", orderId: claimed.orderId };
+    try {
+      const existing = await deps.findByOrderNumber(claimed.orderNumber);
+      const reconciled = await deps.reconcile({ orderId: claimed.orderId, cjOrderId: existing?.orderId, receipt: claimed.receipt });
+      if (reconciled.state === "found") return { reconciled: "found" as const, orderId: claimed.orderId, orderNumber: claimed.orderNumber };
+      return { skipped: true as const, reason: "reconciliation_required", orderId: claimed.orderId };
+    } finally {
+      await deps.releaseTarget({ target, owner });
+    }
   }
 
   const target = `cj:sandbox:${claimed.orderId}`;
@@ -55,15 +63,15 @@ export async function executeSandboxCjDispatch(deps: SandboxCjDispatchDependenci
     await deps.markOutbox({ outboxId: queued.outboxId, status: "delivered", detail: { orderId: claimed.orderId, cjOrderId: result.orderId, isSandbox: 1, payType: 3, zeroCharge: true } });
     return { orderId: claimed.orderId, cjOrderId: result.orderId, orderNumber: claimed.orderNumber, isSandbox: 1 as const, payType: 3 as const, zeroCharge: true as const };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "CJ sandbox write failed";
     // Once Convex recorded provider success, an outbox write failure must never turn a completed
     // order back into ambiguity. A retry's claim is replay-safe and only repairs delivery state.
     if (!providerCompleted && deps.isAmbiguousWriteError(error)) {
-      const marked = await deps.markAmbiguous({ orderId: claimed.orderId, reason: message, receipt: claimed.receipt });
+      const marked = await deps.markAmbiguous({ orderId: claimed.orderId, reason: "provider_response_ambiguous", receipt: claimed.receipt });
       if (marked && marked.ignored) throw new Error("CJ dispatch receipt is stale after ambiguous provider response; reconciliation is required");
       await deps.markOutbox({ outboxId: queued.outboxId, status: "failed", error: "CJ response ambiguous; reconciliation required before retry" });
     } else if (!providerCompleted) {
-      await deps.markOutbox({ outboxId: queued.outboxId, status: "failed", error: message.slice(0, 500) });
+      // Provider errors are untrusted and may contain customer data. Persist a stable code only.
+      await deps.markOutbox({ outboxId: queued.outboxId, status: "failed", error: "provider_write_failed" });
     }
     throw error;
   } finally {

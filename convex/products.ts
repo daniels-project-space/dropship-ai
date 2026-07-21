@@ -443,6 +443,7 @@ export const upsertFromShopify = mutation({
     ),
   },
   handler: async (ctx, { siteId, products }) => {
+    await requireServiceIdentity(ctx);
     let inserted = 0;
     let updated = 0;
     for (const p of products) {
