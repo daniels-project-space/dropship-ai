@@ -25,7 +25,7 @@ export type CreativeForPublish = {
 };
 
 export type DistributeResult =
-  | { mode: "ayrshare"; ok: true; platforms: Platform[]; postIds: Record<string, string>; aiFlagSet: true }
+  | { mode: "ayrshare"; ok: true; platforms: Platform[]; postIds: Record<string, string>; missingPlatforms: Platform[]; providerReceiptId?: string; providerErrors?: unknown; aiFlagSet: true }
   | { mode: "semi_manual"; ok: true; reason: string }
   | { mode: "blocked"; ok: false; reason: string };
 
@@ -54,7 +54,7 @@ export async function ayrshareAvailable(): Promise<boolean> {
  */
 export async function distribute(
   c: CreativeForPublish,
-  options: { distributionMode: "semi_manual" | "automated" },
+  options: { distributionMode: "semi_manual" | "automated"; idempotencyKey?: string },
 ): Promise<DistributeResult> {
   assertLabelGate(c); // throws on any unlabeled AI asset — hard stop
 
@@ -81,6 +81,9 @@ export async function distribute(
       post: c.caption,
       platforms: [...PLATFORMS],
       mediaUrls: [c.mediaUrl],
+      // Ayrshare deduplicates this key. Our durable target lock prevents concurrent submissions,
+      // and this provider fence protects a later retry of the exact immutable distribution intent.
+      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey, notes: options.idempotencyKey } : {}),
       // AI-content disclosure flags (platform + Ayrshare meta) — set because the asset is AI-made.
       isVideo: true,
       tiktokOptions: { aiGeneratedContent: true },
@@ -92,10 +95,13 @@ export async function distribute(
   });
   const json = (await res.json().catch(() => ({}))) as {
     status?: string;
+    id?: string;
     postIds?: Array<{ platform: string; id?: string; postUrl?: string }>;
     errors?: unknown;
   };
-  if (!res.ok || json.status === "error") {
+  // Ayrshare may return successful receipts for only some platforms with top-level status=error.
+  // Preserve those receipts; callers must reconcile the missing platforms and never rebroadcast.
+  if (!res.ok && !(json.postIds?.some((post) => typeof post.id === "string" && post.id.trim()))) {
     return {
       mode: "blocked",
       ok: false,
@@ -107,5 +113,29 @@ export async function distribute(
   for (const p of json.postIds ?? []) {
     if (p.id) postIds[p.platform] = p.id;
   }
-  return { mode: "ayrshare", ok: true, platforms: [...PLATFORMS], postIds, aiFlagSet: true };
+  const missingPlatforms = PLATFORMS.filter((platform) => !postIds[platform]);
+  return {
+    mode: "ayrshare",
+    ok: true,
+    platforms: [...PLATFORMS],
+    postIds,
+    missingPlatforms,
+    providerReceiptId: typeof json.id === "string" && json.id.trim() ? json.id : undefined,
+    providerErrors: json.errors,
+    aiFlagSet: true,
+  };
+}
+
+/** Read-only receipt reconciliation. It intentionally has no POST fallback. */
+export async function reconcileAyrsharePost(providerReceiptId: string): Promise<{ postIds: Record<string, string>; missingPlatforms: Platform[]; providerErrors?: unknown }> {
+  const key = await getKey("ayrshare", "AYRSHARE_API_KEY");
+  if (!key) throw new Error("AYRSHARE_API_KEY absent; provider receipt cannot be reconciled");
+  const res = await fetch(`${AYRSHARE_BASE}/post/${encodeURIComponent(providerReceiptId)}`, {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  const json = (await res.json().catch(() => ({}))) as { postIds?: Array<{ platform: string; id?: string }>; errors?: unknown };
+  if (!res.ok) throw new Error(`ayrshare receipt reconciliation failed: HTTP ${res.status}`);
+  const postIds: Record<string, string> = {};
+  for (const post of json.postIds ?? []) if (post.id?.trim()) postIds[post.platform] = post.id;
+  return { postIds, missingPlatforms: PLATFORMS.filter((platform) => !postIds[platform]), providerErrors: json.errors };
 }

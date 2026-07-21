@@ -3,7 +3,7 @@
 import { mutation, query } from "./authz";
 import { v } from "convex/values";
 
-const outboxStatus = v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed"));
+const outboxStatus = v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed"), v.literal("ambiguous"));
 
 /** Compare an idempotent request by value, not by its caller-controlled key alone. */
 function canonicalValue(value: unknown): string {
@@ -41,13 +41,10 @@ export const claimTarget = mutation({
     await requireServiceIdentity(ctx);
     const now = Date.now();
     const existing = await ctx.db.query("targetLocks").withIndex("by_target", (q) => q.eq("target", target)).first();
-    // A duplicate Trigger delivery has the same owner. It must not replace its own live lease,
-    // otherwise two retrying runs can both cross the same provider boundary.
+    // A duplicate Trigger delivery must not enter a live lease, even with the same owner:
+    // the provider idempotency key alone cannot protect simultaneous submissions.
     if (existing && existing.expiresAt > now) {
-      // Reservation owns the CJ fence before Trigger runs. Its one matching executor may enter;
-      // duplicate deliveries are stopped by claimSandboxCjDispatch before they reach here.
-      if (existing.owner === owner) return { acquired: true, reused: true, expiresAt: existing.expiresAt };
-      return { acquired: false, owner: existing.owner, expiresAt: existing.expiresAt };
+      return { acquired: false, owner: existing.owner, expiresAt: existing.expiresAt, reused: existing.owner === owner };
     }
     if (existing) await ctx.db.delete(existing._id);
     const expiresAt = now + Math.min(Math.max(leaseMs ?? 5 * 60_000, 1_000), 15 * 60_000);
@@ -87,16 +84,25 @@ export const enqueue = mutation({
 });
 
 export const markOutbox = mutation({
-  args: { outboxId: v.id("outbox"), status: outboxStatus, detail: v.optional(v.any()), error: v.optional(v.string()), retryAt: v.optional(v.number()) },
-  handler: async (ctx, { outboxId, status, detail, error, retryAt }) => {
+  args: { outboxId: v.id("outbox"), status: outboxStatus, detail: v.optional(v.any()), error: v.optional(v.string()), retryAt: v.optional(v.number()), providerReceiptId: v.optional(v.string()) },
+  handler: async (ctx, { outboxId, status, detail, error, retryAt, providerReceiptId }) => {
     await requireServiceIdentity(ctx);
     const row = await ctx.db.get(outboxId);
     if (!row) throw new Error(`outbox ${outboxId} not found`);
     const now = Date.now();
-    await ctx.db.patch(outboxId, { status, attempts: row.attempts + (status === "processing" ? 1 : 0), availableAt: retryAt ?? row.availableAt, deliveredAt: status === "delivered" ? now : row.deliveredAt, lastError: error });
+    if (row.status === "delivered" && status !== "delivered") throw new Error("delivered outbox cannot be reopened");
+    if (providerReceiptId && row.providerReceiptId && row.providerReceiptId !== providerReceiptId) throw new Error("outbox already has a different provider receipt");
+    await ctx.db.patch(outboxId, {
+      status,
+      attempts: row.attempts + (status === "processing" ? 1 : 0),
+      availableAt: retryAt ?? row.availableAt,
+      deliveredAt: status === "delivered" ? now : row.deliveredAt,
+      lastError: error,
+      providerReceiptId: providerReceiptId ?? row.providerReceiptId,
+    });
     const trace = await ctx.db.query("traces").withIndex("by_trace_id", (q) => q.eq("traceId", row.traceId)).first();
-    if (trace && (status === "delivered" || status === "failed")) {
-      await ctx.db.patch(trace._id, { status: status === "delivered" ? "succeeded" : "failed", detail: detail ?? (error ? { error } : {}), finishedAt: now });
+    if (trace && (status === "delivered" || status === "failed" || status === "ambiguous")) {
+      await ctx.db.patch(trace._id, { status: status === "delivered" ? "succeeded" : status === "ambiguous" ? "skipped" : "failed", detail: detail ?? (error ? { error } : {}), finishedAt: now });
     }
     return outboxId;
   },

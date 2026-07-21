@@ -93,6 +93,7 @@ export const contentFitGate = query({
       for (const p of published) {
         const at = p.publishedAt ?? p._creationTime;
         if (at < since) continue;
+        if (!hasProviderObservedPostMetrics(p)) continue;
         totalPublished++;
         const views = p.views ?? 0;
         if (!best || views > best.views) {
@@ -159,6 +160,10 @@ function dayKey(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
+function hasProviderObservedPostMetrics(post: { metricsProvider?: string; metricsObservedAt?: number }): boolean {
+  return post.metricsProvider === "ayrshare" && Number.isFinite(post.metricsObservedAt);
+}
+
 // Resolve the scope to a concrete, bounded site list.
 async function resolveSites(ctx: QueryCtx, scope: string | undefined, dataMode: DataMode = "live") {
   if (scope && scope !== "all") {
@@ -207,6 +212,7 @@ export const timeseries = query({
           .take(2000);
         for (const p of posts) {
           if (platform && platform !== "all" && p.platform !== platform) continue;
+          if (!hasProviderObservedPostMetrics(p)) continue;
           const at = p.publishedAt ?? p._creationTime;
           if (at < since) continue;
           const k = dayKey(at);
@@ -251,6 +257,7 @@ export const platformBreakdown = query({
       for (const p of posts) {
         const at = p.publishedAt ?? p._creationTime;
         if (at < since) continue;
+        if (!hasProviderObservedPostMetrics(p)) continue;
         const a = acc[p.platform];
         if (!a) continue;
         a.views += p.views ?? 0;
@@ -263,9 +270,8 @@ export const platformBreakdown = query({
   },
 });
 
-// Conversion funnel: views → add-to-cart → checkout → purchase. Top of funnel is
-// organic post views; the lower stages derive from the latest conversionMetrics
-// rollups (addToCartRate, cvr) and order count.
+// Conversion funnel: only direct provider observations are eligible. In particular, checkout is
+// never inferred from an add-to-cart ratio and a missing provider counter stays zero/unknown.
 export const funnel = query({
   args: { scope: v.optional(v.string()), days: v.optional(v.number()), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
   handler: async (ctx, { scope, days, dataMode }) => {
@@ -286,7 +292,7 @@ export const funnel = query({
         .take(2000);
       for (const p of posts) {
         const at = p.publishedAt ?? p._creationTime;
-        if (at >= since) views += p.views ?? 0;
+        if (at >= since && hasProviderObservedPostMetrics(p)) views += p.views ?? 0;
       }
 
       const metrics = await ctx.db
@@ -295,24 +301,21 @@ export const funnel = query({
         .order("desc")
         .take(window);
       for (const m of metrics) {
+        if (m.provider !== "shopify" || !Number.isFinite(m.observedAt)) continue;
         pageviews += m.pageviews;
-        atc += Math.round(m.pageviews * m.addToCartRate);
-        purchases += Math.round(m.pageviews * m.cvr);
+        atc += m.addToCartCount ?? 0;
+        checkout += m.checkoutCount ?? 0;
+        purchases += m.purchaseCount ?? 0;
       }
-      // checkout-initiated sits between ATC and purchase (~62% of ATC reach checkout)
-      checkout += 0;
     }
-    checkout = Math.round(atc * 0.62 + purchases * 0.38);
-
-    // top stage: organic reach (views) if larger than measured pageviews, else pageviews
-    const top = Math.max(views, pageviews, 1);
     const stages = [
-      { label: "Organic reach", value: top },
-      { label: "Add-to-cart", value: atc },
-      { label: "Checkout", value: checkout },
-      { label: "Purchase", value: purchases },
+      { label: "Provider-observed reach", value: views },
+      { label: "Shopify pageviews", value: pageviews },
+      { label: "Shopify add-to-cart", value: atc },
+      { label: "Shopify checkout", value: checkout },
+      { label: "Shopify purchase", value: purchases },
     ];
-    return { stages, days: window };
+    return { stages, days: window, providerObservedOnly: true };
   },
 });
 
@@ -346,8 +349,10 @@ export const topProducts = query({
           .withIndex("by_product_day", (q) => q.eq("productId", p._id))
           .order("desc")
           .take(14);
-        const views = metrics.reduce((sum, m) => sum + m.pageviews, 0);
-        const latestCvr = metrics[0]?.cvr ?? 0;
+        const observed = metrics.filter((m) => m.provider === "shopify" && Number.isFinite(m.observedAt));
+        const views = observed.reduce((sum, m) => sum + m.pageviews, 0);
+        const latest = observed[0];
+        const latestCvr = latest && latest.pageviews > 0 ? (latest.purchaseCount ?? 0) / latest.pageviews : 0;
         // No fallback arithmetic: synced Shopify rows have unknown supplier costs until a
         // verified CJ evidence/quote record creates contributionMarginPct.
         const margin = p.contributionMarginPct ?? null;
@@ -359,7 +364,7 @@ export const topProducts = query({
           cvr: latestCvr * 100,
           marginPct: margin,
           priceUsd: p.priceUsd,
-          trend: metrics.map((m) => m.pageviews).reverse(),
+          trend: observed.map((m) => m.pageviews).reverse(),
           status: p.status,
         });
       }
@@ -429,7 +434,7 @@ export const brandDetail = query({
         ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", siteId).eq("status", "review")).take(500),
       ]);
 
-    const totalViews = publishedPosts.reduce((s, p) => s + (p.views ?? 0), 0);
+    const totalViews = publishedPosts.reduce((s, p) => s + (hasProviderObservedPostMetrics(p) ? p.views ?? 0 : 0), 0);
     const revenueUsd = allOrders.reduce((s, o) => s + (o.totalUsd ?? 0), 0);
 
     return {

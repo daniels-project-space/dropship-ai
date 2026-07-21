@@ -7,6 +7,13 @@
 import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
+import { dispatchTriggerDecision } from "../src/lib/distributionState";
+
+async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
+  if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") {
+    throw new Error("UNAUTHENTICATED: distribution dispatch requires the service runtime");
+  }
+}
 
 const platform = v.union(
   v.literal("tiktok"),
@@ -31,6 +38,7 @@ export const schedule = mutation({
     scheduledFor: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
     const creative = await ctx.db.get(args.creativeId);
     if (!creative) throw new Error(`creative ${args.creativeId} not found`);
     if (creative.siteId !== args.siteId) throw new Error("creative does not belong to this site");
@@ -68,6 +76,7 @@ export const schedule = mutation({
 export const markPublished = mutation({
   args: { postId: v.id("posts"), externalPostId: v.string() },
   handler: async (ctx, { postId, externalPostId }) => {
+    await requireServiceIdentity(ctx);
     const p = await ctx.db.get(postId);
     if (!p) throw new Error(`post ${postId} not found`);
     if (p.status !== "scheduled" && p.status !== "awaiting_manual_publish") {
@@ -80,9 +89,24 @@ export const markPublished = mutation({
   },
 });
 
+/** Semi-manual is a durable directive, not a provider publication. */
+export const markAwaitingManualPublish = mutation({
+  args: { postId: v.id("posts") },
+  handler: async (ctx, { postId }) => {
+    await requireServiceIdentity(ctx);
+    const post = await ctx.db.get(postId);
+    if (!post) throw new Error(`post ${postId} not found`);
+    if (post.status === "awaiting_manual_publish") return postId;
+    if (post.status !== "scheduled") throw new Error(`post ${postId} is ${post.status}, not schedulable for manual publication`);
+    await ctx.db.patch(postId, { status: "awaiting_manual_publish" });
+    return postId;
+  },
+});
+
 export const recordEngagement = mutation({
-  args: { postId: v.id("posts"), views: v.number(), engagement: v.number(), observedAt: v.number() },
-  handler: async (ctx, { postId, views, engagement, observedAt }) => {
+  args: { postId: v.id("posts"), views: v.number(), engagement: v.number(), observedAt: v.number(), provider: v.literal("ayrshare") },
+  handler: async (ctx, { postId, views, engagement, observedAt, provider }) => {
+    await requireServiceIdentity(ctx);
     const p = await ctx.db.get(postId);
     if (!p) throw new Error(`post ${postId} not found`);
     if (p.status !== "published" || !p.externalPostId) {
@@ -91,8 +115,67 @@ export const recordEngagement = mutation({
     if (!Number.isFinite(views) || !Number.isFinite(engagement) || views < 0 || engagement < 0 || !Number.isFinite(observedAt)) {
       throw new Error("provider metrics must be finite non-negative observations");
     }
-    await ctx.db.patch(postId, { views, engagement, metricsObservedAt: observedAt });
+    await ctx.db.patch(postId, { views, engagement, metricsObservedAt: observedAt, metricsProvider: provider });
     return postId;
+  },
+});
+
+/** Atomically claim the Trigger dispatch created alongside creative approval. */
+export const beginDistributionDispatch = mutation({
+  args: { creativeId: v.id("creatives"), dispatchKey: v.string() },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const row = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", args.creativeId)).first();
+    if (!row) throw new Error("approved creative has no durable distribution dispatch");
+    if (row.dispatchKey !== args.dispatchKey) throw new Error("distribution dispatch key does not match creative");
+    const now = Date.now();
+    if (row.status === "dispatching") {
+      if ((row.triggerLeaseExpiresAt ?? 0) > now) return { status: "busy" as const, triggerRunId: row.triggerRunId };
+      await ctx.db.patch(row._id, { triggerLeaseExpiresAt: now + 5 * 60_000, updatedAt: now });
+      return { status: "dispatching" as const };
+    }
+    const decision = dispatchTriggerDecision(row.status);
+    if (decision === "reconcile_required") return { status: "reconcile_required" as const, triggerRunId: row.triggerRunId };
+    if (decision === "already_dispatched") return { status: row.status, triggerRunId: row.triggerRunId, reused: true as const };
+    await ctx.db.patch(row._id, { status: "dispatching", triggerLeaseExpiresAt: now + 5 * 60_000, updatedAt: now });
+    return { status: "dispatching" as const };
+  },
+});
+
+export const recordDistributionDispatch = mutation({
+  args: { creativeId: v.id("creatives"), dispatchKey: v.string(), triggerRunId: v.string() },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const row = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", args.creativeId)).first();
+    if (!row || row.dispatchKey !== args.dispatchKey) throw new Error("distribution dispatch no longer matches creative");
+    if (row.triggerRunId && row.triggerRunId !== args.triggerRunId) throw new Error("distribution dispatch already has a different Trigger run");
+    if (row.status === "reconcile_required") return { status: "reconcile_required" as const, triggerRunId: row.triggerRunId };
+    await ctx.db.patch(row._id, { status: "dispatched", triggerRunId: args.triggerRunId, triggerLeaseExpiresAt: undefined, updatedAt: Date.now() });
+    return { status: "dispatched" as const, triggerRunId: args.triggerRunId };
+  },
+});
+
+export const completeDistributionDispatch = mutation({
+  args: { creativeId: v.id("creatives"), dispatchKey: v.string(), reconciliationRequired: v.optional(v.boolean()), error: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const row = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", args.creativeId)).first();
+    if (!row || row.dispatchKey !== args.dispatchKey) throw new Error("distribution dispatch no longer matches creative");
+    const status = args.reconciliationRequired ? "reconcile_required" as const : "delivered" as const;
+    await ctx.db.patch(row._id, { status, lastError: args.error, triggerLeaseExpiresAt: undefined, updatedAt: Date.now() });
+    return { status };
+  },
+});
+
+export const listDispatchesNeedingTrigger = query({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, { limit }) => {
+    const pending = await ctx.db.query("distributionDispatches").withIndex("by_status", (q) => q.eq("status", "pending")).take(limit ?? 100);
+    const remaining = Math.max(0, (limit ?? 100) - pending.length);
+    const dispatching = remaining
+      ? await ctx.db.query("distributionDispatches").withIndex("by_status", (q) => q.eq("status", "dispatching")).take(remaining)
+      : [];
+    return [...pending, ...dispatching];
   },
 });
 

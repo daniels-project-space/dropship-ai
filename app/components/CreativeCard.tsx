@@ -58,12 +58,16 @@ export function CreativeCard({
     try {
       if (kind === "approve") {
         await approve({ creativeId: creative._id, approver: "Daniel" });
-        // fire-and-forget: enqueue distribution of the freshly approved creative
-        fetch("/api/schedule", {
+        // Approval has already created a durable Convex dispatch record. Await the handoff so the
+        // operator can see a deferred Trigger configuration instead of silently losing work.
+        const response = await fetch("/api/schedule", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ creativeId: creative._id }),
-        }).catch(() => {});
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok && !result.deferred) throw new Error(result.error ?? "distribution scheduling failed");
+        if (result.reconciliationRequired) throw new Error(result.reason ?? "provider receipt reconciliation is required");
         onScheduled?.(creative._id);
       } else {
         await reject({ creativeId: creative._id, approver: "Daniel" });

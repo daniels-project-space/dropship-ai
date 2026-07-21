@@ -17,7 +17,8 @@ import type { Id } from "../../convex/_generated/dataModel";
 import { falProductImage, falProductClip } from "../lib/gen/fal";
 import { tts } from "../lib/gen/tts";
 import { assemble } from "../lib/assemble";
-import { distribute, type CreativeForPublish } from "../lib/distribute";
+import { distribute, reconcileAyrsharePost, type CreativeForPublish } from "../lib/distribute";
+import { providerDeliveryDecision } from "../lib/distributionState";
 import { getSignedUrl } from "../lib/storage";
 
 type Brief = {
@@ -100,7 +101,7 @@ export const contentFactory = task({
 // On approval → distribute. Caller (UI approve action or a webhook) triggers this with the id.
 export const scheduleApprovedCreative = task({
   id: "schedule-approved-creative",
-  run: async (payload: { creativeId: string; caption?: string }) => {
+  run: async (payload: { creativeId: string; caption?: string; dispatchKey?: string }) => {
     const convex = convexClient();
     const creativeId = payload.creativeId as Id<"creatives">;
     const creative = await convex.query(api.creatives.get, { creativeId });
@@ -117,7 +118,7 @@ export const scheduleApprovedCreative = task({
       return { skipped: true, reason: "sample or missing site cannot distribute", creativeId };
     }
 
-    const idempotencyKey = `distribution:${creativeId}`;
+    const idempotencyKey = payload.dispatchKey ?? `distribution:${creativeId}`;
     const target = `creative-distribution:${creativeId}`;
     const queued = await convex.mutation(api.ops.enqueue, {
       siteId: creative.siteId as Id<"sites">, kind: "creative.distribute", target, idempotencyKey, traceId: idempotencyKey,
@@ -128,6 +129,39 @@ export const scheduleApprovedCreative = task({
     if (!lock.acquired) return { skipped: true, reason: "target locked", creativeId };
 
     try {
+      // Create the local schedule before marking the external attempt. A crash at any point
+      // therefore leaves a durable post ledger entry, while a crash after `processing` can only
+      // move to receipt reconciliation and can never issue a second provider POST.
+      const scheduledPosts: Record<string, Id<"posts">> = {};
+      for (const platform of ["tiktok", "instagram", "youtube"] as const) {
+        const post = await convex.mutation(api.posts.schedule, {
+          siteId: creative.siteId as Id<"sites">, creativeId, platform, status: "scheduled",
+        });
+        scheduledPosts[platform] = post.postId;
+      }
+
+      const outbox = queued.duplicate ? await convex.query(api.ops.getOutboxByKey, { idempotencyKey }) : undefined;
+      const deliveryDecision = providerDeliveryDecision((outbox?.status ?? queued.status) as "pending" | "processing" | "delivered" | "failed" | "ambiguous");
+      if (deliveryDecision === "already_delivered") return { skipped: true, reason: "already distributed", creativeId };
+      if (deliveryDecision === "reconcile_required") {
+        if (!outbox?.providerReceiptId) {
+          await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey, reconciliationRequired: true, error: "provider_receipt_missing" });
+          return { mode: "reconcile_required", creativeId, reason: "provider attempt has no receipt; automatic repost is forbidden" };
+        }
+        const reconciliation = await reconcileAyrsharePost(outbox.providerReceiptId);
+        for (const [platform, externalPostId] of Object.entries(reconciliation.postIds)) {
+          const postId = scheduledPosts[platform];
+          if (postId) await convex.mutation(api.posts.markPublished, { postId, externalPostId });
+        }
+        if (reconciliation.missingPlatforms.length) {
+          await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey, reconciliationRequired: true, error: "provider_receipt_incomplete" });
+          return { mode: "reconcile_required", creativeId, reason: "provider receipt is incomplete; automatic repost is forbidden" };
+        }
+        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { mode: "ayrshare", reconciled: true } });
+        await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey });
+        return { mode: "ayrshare", posts: Object.keys(reconciliation.postIds).length, reconciled: true };
+      }
+
       await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "processing" });
       const mediaUrl = await getSignedUrl(creative.r2Key, 3600);
       const forPublish: CreativeForPublish = {
@@ -139,34 +173,41 @@ export const scheduleApprovedCreative = task({
       };
 
       // distribute() runs assertLabelGate() first — hard stop on any unlabeled AI asset.
-      const result = await distribute(forPublish, { distributionMode: site.distributionMode });
+      const result = await distribute(forPublish, { distributionMode: site.distributionMode, idempotencyKey });
 
       if (result.mode === "ayrshare" && result.ok) {
-        for (const platform of result.platforms) {
-          const post = await convex.mutation(api.posts.schedule, {
-            siteId: creative.siteId as Id<"sites">, creativeId, platform, status: "scheduled",
-          });
-          await convex.mutation(api.posts.markPublished, { postId: post.postId, externalPostId: result.postIds[platform] });
+        for (const [platform, externalPostId] of Object.entries(result.postIds)) {
+          const postId = scheduledPosts[platform];
+          if (postId) await convex.mutation(api.posts.markPublished, { postId, externalPostId });
         }
-        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { mode: "ayrshare", platforms: result.platforms } });
+        if (result.missingPlatforms.length) {
+          await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "ambiguous", providerReceiptId: result.providerReceiptId, error: "provider_receipt_missing", detail: { mode: "ayrshare", missingPlatforms: result.missingPlatforms, providerErrors: result.providerErrors ?? null } });
+          await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey, reconciliationRequired: true, error: "provider_receipt_missing" });
+          return { mode: "reconcile_required", creativeId, reason: "provider response omitted one or more post receipts; automatic repost is forbidden" };
+        }
+        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", providerReceiptId: result.providerReceiptId, detail: { mode: "ayrshare", platforms: result.platforms } });
+        await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey });
         return { mode: "ayrshare", posts: result.platforms.length };
       }
 
       if (result.mode === "semi_manual") {
-        // cold-start: one awaiting_manual_publish row per platform for Daniel to tap.
-        for (const platform of ["tiktok", "instagram", "youtube"] as const) {
-          await convex.mutation(api.posts.schedule, { siteId: creative.siteId as Id<"sites">, creativeId, platform, status: "awaiting_manual_publish" });
-        }
+        // cold-start: convert the pre-created rows to an explicit manual directive.
+        for (const postId of Object.values(scheduledPosts)) await convex.mutation(api.posts.markAwaitingManualPublish, { postId: postId as Id<"posts"> });
         await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { mode: "semi_manual" } });
+        await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey });
         return { mode: "semi_manual", posts: 3, reason: result.reason };
       }
 
       logger.error("schedule-approved-creative: distribution blocked", { creativeId, result });
       await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: result.ok ? "unknown" : result.reason });
+      await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey, reconciliationRequired: true, error: result.ok ? "unknown" : result.reason });
       return { mode: "blocked", reason: result.ok ? "unknown" : result.reason };
     } catch (error) {
-      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: String(error).slice(0, 500) });
-      throw error;
+      // Once processing was durably recorded, the network call may have reached Ayrshare. Do not
+      // let Trigger retry it as a fresh post; preserve reconciliation instead.
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "ambiguous", error: String(error).slice(0, 500) });
+      await convex.mutation(api.posts.completeDistributionDispatch, { creativeId, dispatchKey: idempotencyKey, reconciliationRequired: true, error: "provider_response_ambiguous" });
+      return { mode: "reconcile_required", creativeId, reason: "provider response was ambiguous; automatic repost is forbidden" };
     } finally {
       await convex.mutation(api.ops.releaseTarget, { target, owner: idempotencyKey });
     }

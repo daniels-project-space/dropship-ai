@@ -14,6 +14,8 @@ const modules = {
   "../convex/ops.ts": () => import("../convex/ops.ts"),
   "../convex/products.ts": () => import("../convex/products.ts"),
   "../convex/audit.ts": () => import("../convex/audit.ts"),
+  "../convex/creatives.ts": () => import("../convex/creatives.ts"),
+  "../convex/posts.ts": () => import("../convex/posts.ts"),
   "../convex/_generated/api.js": () => import("../convex/_generated/api.js"),
 };
 const { api } = apiModule;
@@ -79,6 +81,26 @@ test("Convex handlers reject anonymous service calls and due index returns only 
   });
   const due = await service(t).query(api.orders.listDueCjStagingIntents, { limit: 999 });
   assert.deepEqual(due.map((row) => row._id), [a.intentId]);
+});
+
+test("creative approval persists one distribution intent and concurrent Trigger claims fence to one handoff", async () => {
+  const t = convexTest({ schema, modules });
+  const { siteId, creativeId } = await t.run(async (ctx) => {
+    const siteId = await ctx.db.insert("sites", { name: "Content", niche: "test", status: "active", minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual", createdAt: 1 });
+    const creativeId = await ctx.db.insert("creatives", { siteId, kind: "product_demo", r2Key: "creatives/content/final.mp4", aiGenerated: true, aiLabelRequired: true, labelBurned: true, status: "review", createdAt: 1 });
+    return { siteId, creativeId };
+  });
+  const approved = await service(t).mutation(api.creatives.approve, { creativeId, approver: "test" });
+  assert.equal(approved.dispatchKey, `distribution:${creativeId}`);
+  const dispatches = await t.run((ctx) => ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", creativeId)).collect());
+  assert.equal(dispatches.length, 1, "approval cannot lose or duplicate its durable distribution intent");
+  assert.equal(dispatches[0].siteId, siteId);
+
+  const [first, second] = await Promise.all([
+    service(t).mutation(api.posts.beginDistributionDispatch, { creativeId, dispatchKey: approved.dispatchKey }),
+    service(t).mutation(api.posts.beginDistributionDispatch, { creativeId, dispatchKey: approved.dispatchKey }),
+  ]);
+  assert.deepEqual([first.status, second.status].sort(), ["busy", "dispatching"], "only one concurrent caller may submit Trigger work");
 });
 
 test("Convex receipt handler links order and intent atomically, including repaired legacy duplicate receipts", async () => {

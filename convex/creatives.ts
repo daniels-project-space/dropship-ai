@@ -92,13 +92,25 @@ export const approve = mutation({
     if (c.aiLabelRequired && c.labelBurned !== true) {
       throw new Error(`creative ${creativeId} requires verified burned-in AI disclosure before approval`);
     }
+    const dispatchKey = `distribution:${creativeId}`;
+    const existingDispatch = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", creativeId)).first();
+    if (existingDispatch) throw new Error(`creative ${creativeId} already has a distribution dispatch`);
+    const now = Date.now();
     await ctx.db.patch(creativeId, { status: "approved" });
+    await ctx.db.insert("distributionDispatches", {
+      siteId: c.siteId,
+      creativeId,
+      dispatchKey,
+      status: "pending",
+      createdAt: now,
+      updatedAt: now,
+    });
     await appendAudit(ctx, {
       siteId: c.siteId,
       event: "creative_approved",
       detail: { creativeId, approver: approver ?? "human" },
     });
-    return creativeId;
+    return { creativeId, dispatchKey };
   },
 });
 

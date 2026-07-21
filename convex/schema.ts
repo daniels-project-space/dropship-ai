@@ -152,6 +152,13 @@ export default defineSchema({
     cvr: v.number(),
     aovUsd: v.number(),
     refundRate: v.number(),
+    // Direct provider counters only. Legacy rate-only rows remain readable for historical sample
+    // views but are intentionally excluded from live funnels.
+    provider: v.optional(v.literal("shopify")),
+    observedAt: v.optional(v.number()),
+    addToCartCount: v.optional(v.number()),
+    checkoutCount: v.optional(v.number()),
+    purchaseCount: v.optional(v.number()),
     sample: v.optional(v.boolean()),
   }).index("by_site_day", ["siteId", "day"]).index("by_product_day", ["productId", "day"]),
 
@@ -183,9 +190,24 @@ export default defineSchema({
     views: v.optional(v.number()),
     engagement: v.optional(v.number()),
     metricsObservedAt: v.optional(v.number()),    // provider observation time, never a UI estimate
+    metricsProvider: v.optional(v.literal("ayrshare")), // only a provider ingestion worker may set metrics
     sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]).index("by_site_platform", ["siteId", "platform"])
     .index("by_creative_platform", ["creativeId", "platform"]),
+
+  // Approval creates this durable intent atomically with the creative transition. Browser/route
+  // failures can delay Trigger dispatch but cannot silently lose the distribution work.
+  distributionDispatches: defineTable({
+    siteId: v.id("sites"),
+    creativeId: v.id("creatives"),
+    dispatchKey: v.string(),
+    status: v.union(v.literal("pending"), v.literal("dispatching"), v.literal("dispatched"), v.literal("delivered"), v.literal("reconcile_required")),
+    triggerRunId: v.optional(v.string()),
+    triggerLeaseExpiresAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_creative", ["creativeId"]).index("by_status", ["status"]),
 
   // ── orders + CJ fulfillment loop ──────────────────────────────────────────
   orders: defineTable({
@@ -327,10 +349,11 @@ export default defineSchema({
     idempotencyKey: v.string(),
     traceId: v.string(),
     payload: v.any(),
-    status: v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed")),
+    status: v.union(v.literal("pending"), v.literal("processing"), v.literal("delivered"), v.literal("failed"), v.literal("ambiguous")),
     attempts: v.number(),
     availableAt: v.number(),
     deliveredAt: v.optional(v.number()),
+    providerReceiptId: v.optional(v.string()), // Ayrshare post id; enables read-only reconciliation
     lastError: v.optional(v.string()),
     createdAt: v.number(),
   }).index("by_idempotency_key", ["idempotencyKey"]).index("by_status_available_at", ["status", "availableAt"]).index("by_site_created_at", ["siteId", "createdAt"]),
