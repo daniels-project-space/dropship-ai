@@ -88,7 +88,7 @@ export default defineSchema({
     status: v.union(v.literal("draft"), v.literal("active"), v.literal("archived"), v.literal("killed")),
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
-  }).index("by_site", ["siteId"]).index("by_site_status", ["siteId", "status"]),
+  }).index("by_site", ["siteId"]).index("by_site_status", ["siteId", "status"]).index("by_site_shopify_product_variant", ["siteId", "shopifyProductId", "shopifyVariantId"]),
 
   // Parsed, server-read CJ evidence. Optional costs mean "unknown", never zero; candidates
   // using them fail closed. This row is the lineage anchor for a sourced product and its trace.
@@ -229,6 +229,28 @@ export default defineSchema({
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
   }).index("by_site", ["siteId"]).index("by_shopify_order", ["shopifyOrderId"]).index("by_cj_order_number", ["cjOrderNumber"]).index("by_site_status", ["siteId", "fulfillmentStatus"]),
+
+  // A Shopify delivery has a durable, separate CJ preflight intent. The raw shipping fields are
+  // intentionally confined to Convex; Trigger receives only this row's stable ID.
+  cjStagingIntents: defineTable({
+    siteId: v.id("sites"),
+    orderId: v.id("orders"),
+    deliveryId: v.string(),
+    payloadHash: v.string(),
+    status: v.union(v.literal("pending"), v.literal("preflighting"), v.literal("quoted"), v.literal("preflight_required"), v.literal("staged"), v.literal("approval_dispatching"), v.literal("approval_dispatched"), v.literal("failed")),
+    attempt: v.number(),
+    leaseExpiresAt: v.optional(v.number()),
+    // PII is durable only here and in the immutable CJ order snapshot. It must never enter an
+    // outbox, trace, audit detail, Trigger payload, or logger context.
+    shipping: v.object({ shippingZip: v.string(), shippingCountryCode: v.string(), shippingCountry: v.string(), shippingProvince: v.string(), shippingCity: v.string(), shippingAddress: v.string(), shippingCustomerName: v.string(), shippingPhone: v.string() }),
+    shopifyLines: v.array(v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() })),
+    quoteInputDigest: v.optional(v.string()),
+    quoteProvider: v.optional(v.object({ endpoint: v.string(), version: v.string() })),
+    quote: v.optional(v.object({ logisticName: v.string(), logisticPriceUsd: v.number(), fromCountryCode: v.string(), quotedAt: v.number() })),
+    actionId: v.optional(v.id("actions")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_site_status", ["siteId", "status"]).index("by_status", ["status"]).index("by_order", ["orderId"]).index("by_site_delivery", ["siteId", "deliveryId"]),
 
   // ── the brain: proposed actions + risk-tiered approval ────────────────────
   actions: defineTable({

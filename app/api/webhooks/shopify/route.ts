@@ -1,13 +1,10 @@
-// POST /api/webhooks/shopify — signed Shopify order mirror. The delivery receipt and order
-// update are atomic in Convex, so retries are idempotent. It never triggers CJ automatically.
+// POST /api/webhooks/shopify — signed, bounded Shopify intake. The receipt, mirror and optional
+// CJ staging intent are one Convex transaction; provider work runs later in a scheduled worker.
 import { NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { getKey } from "@/src/lib/vault";
 import { convexClient, api } from "@/src/lib/convexClient";
 import type { Id } from "@/convex/_generated/dataModel";
-import { tasks } from "@trigger.dev/sdk/v3";
-import type { approvalGate } from "@/src/trigger/approval-gate";
-import { quoteCjFreight, selectVerifiedCjFreight } from "@/src/lib/cj";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -111,48 +108,14 @@ export async function POST(req: Request) {
       totalUsd: Number(payload.total_price ?? 0) || 0,
       fulfillmentStatus: mapTopicToStatus(topic, payload),
       createdAt: Number.isFinite(parsedCreatedAt) ? parsedCreatedAt : Date.now(),
+      // PII remains in Convex's intent row. It never becomes part of the webhook response or a
+      // Trigger/task payload; the scheduled worker receives the intent ID from its own query.
+      stagingInput: topic === "orders/create" ? cjStagingInputFromShopify(payload) ?? undefined : undefined,
     });
-    // The supplier input is persisted only from Shopify's signed server-to-server payload.
-    // It is not sent to Trigger, the browser, outbox/traces, or an audit record.
-    const stagingInput = topic === "orders/create" ? cjStagingInputFromShopify(payload) : null;
-    if (!stagingInput) {
-      return NextResponse.json({ ok: true, topic, duplicate: result.duplicate, fulfillment: "not-eligible-for-cj-staging" });
-    }
-    if (!process.env.TRIGGER_SECRET_KEY) {
-      return NextResponse.json({ error: "CJ-eligible order persisted but approval runtime is unavailable; retry required" }, { status: 503 });
-    }
-    // This Convex read is the first mapping pass. stageSandboxCjDispatch repeats it atomically
-    // before persisting PII so a Shopify payload never gets to assert CJ IDs or another site's
-    // product identity. The freight request below is read-only and is not made by Trigger.
-    const lineage = await convex.query(api.orders.resolveShopifyCjLineage, { siteId: site._id as Id<"sites">, lines: stagingInput.shopifyLines });
-    const quote = selectVerifiedCjFreight(await quoteCjFreight({
-      fromCountryCode: lineage.fromCountryCode,
-      destinationCountryCode: stagingInput.shipping.shippingCountryCode,
-      shippingZip: stagingInput.shipping.shippingZip,
-      products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })),
-    }));
-    const staged = await convex.mutation(api.orders.stageSandboxCjDispatch, {
-      siteId: site._id as Id<"sites">, shopifyOrderId, totalUsd: Number(payload.total_price ?? 0) || 0,
-      shipping: stagingInput.shipping, shopifyLines: stagingInput.shopifyLines,
-      logistics: { logisticName: quote.logisticName, fromCountryCode: lineage.fromCountryCode, quotedAt: Date.now(), quotedPriceUsd: quote.logisticPriceUsd },
-    });
-    const dispatch = await convex.mutation(api.actions.beginApprovalDispatch, {
-      actionId: staged.actionId, approvalDispatchKey: `approval-gate:cj:${site._id}:${staged.orderNumber}`,
-    });
-    if (dispatch.status === "dispatching") {
-      const key = `approval-gate:cj:${site._id}:${staged.orderNumber}`;
-      try {
-        const handle = await tasks.trigger<typeof approvalGate>("approval-gate", { actionId: staged.actionId, approvalDispatchKey: key }, { idempotencyKey: key, idempotencyKeyTTL: "24w" });
-        await convex.mutation(api.actions.recordApprovalDispatch, { actionId: staged.actionId, approvalDispatchKey: key, approvalRunId: handle.id });
-      } catch (error) {
-        // A request can reach Trigger while its response is lost. Preserve the exact deterministic
-        // key and report reconciliation rather than falsely claiming a waitpoint was armed.
-        const message = error instanceof Error ? error.message : "approval dispatch response was lost";
-        await convex.mutation(api.actions.markApprovalDispatchAmbiguous, { actionId: staged.actionId, approvalDispatchKey: key, error: message });
-        return NextResponse.json({ ok: true, topic, duplicate: result.duplicate, status: "dispatch_reconciliation_required", actionId: staged.actionId, isSandbox: 1, payType: 3 }, { status: 202 });
-      }
-    }
-    return NextResponse.json({ ok: true, topic, duplicate: result.duplicate, fulfillment: "pending_exact_human_approval", actionId: staged.actionId, isSandbox: 1, payType: 3 });
+    // Shopify gets a 2xx as soon as its signed delivery is durable. Do not make CJ, Trigger, or
+    // approval-waitpoint calls here: Shopify retries transport failures and expects this path to
+    // finish quickly.
+    return NextResponse.json({ ok: true, topic, duplicate: result.duplicate, intake: "durable", cjStaging: result.intentId ? "queued" : "not-eligible" });
   } catch {
     // A non-2xx tells Shopify to retry an uncommitted local mutation. No supplier call exists here.
     return NextResponse.json({ error: "local webhook processing failed" }, { status: 503 });

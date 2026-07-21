@@ -3,7 +3,7 @@
 import { mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
-import { webhookDeliveryDecision, cjTrackingMappingDecision } from "../src/lib/webhookReceiptState";
+import { webhookDeliveryDecision, cjTrackingMappingDecision, shopifyReceiptDecision } from "../src/lib/webhookReceiptState";
 
 const fulfillmentStatus = v.union(
   v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
@@ -16,30 +16,61 @@ export const recordShopifyOrder = mutation({
   args: {
     siteId: v.id("sites"), deliveryId: v.string(), topic: v.string(), payloadHash: v.string(),
     shopifyOrderId: v.string(), totalUsd: v.number(), fulfillmentStatus, createdAt: v.number(),
+    stagingInput: v.optional(v.object({
+      shipping: v.object({ shippingZip: v.string(), shippingCountryCode: v.string(), shippingCountry: v.string(), shippingProvince: v.string(), shippingCity: v.string(), shippingAddress: v.string(), shippingCustomerName: v.string(), shippingPhone: v.string() }),
+      shopifyLines: v.array(v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() })),
+    })),
   },
   handler: async (ctx, args) => {
     const prior = await ctx.db.query("webhookReceipts")
       .withIndex("by_provider_site_delivery", (q) => q.eq("provider", "shopify").eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
-    if (webhookDeliveryDecision(prior) === "duplicate") return { duplicate: true, outcome: prior!.outcome };
+    const receiptDecision = shopifyReceiptDecision(prior, args);
+    if (receiptDecision === "reject_changed") throw new Error("Shopify delivery ID was replayed with a changed payload");
+    if (receiptDecision === "duplicate") {
+      // A provider delivery ID is immutable. Accepting changed content could bind an existing
+      // approval to another address or line set, so this must fail closed rather than retry.
+      const intent = await ctx.db.query("cjStagingIntents").withIndex("by_site_delivery", (q) => q.eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
+      return { duplicate: true, outcome: prior!.outcome, intentId: intent?._id ?? null };
+    }
 
     const existing = await ctx.db.query("orders")
       .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
+    let orderId: any;
     if (existing) {
+      if (existing.siteId !== args.siteId) throw new Error("Shopify order belongs to another site");
       const next = RANK[args.fulfillmentStatus] > RANK[existing.fulfillmentStatus as FulfillmentStatus]
         ? args.fulfillmentStatus : existing.fulfillmentStatus;
       await ctx.db.patch(existing._id, { totalUsd: args.totalUsd, fulfillmentStatus: next, sample: false });
+      orderId = existing._id;
     } else {
-      await ctx.db.insert("orders", {
+      orderId = await ctx.db.insert("orders", {
         siteId: args.siteId, shopifyOrderId: args.shopifyOrderId, totalUsd: args.totalUsd,
         fulfillmentStatus: args.fulfillmentStatus, createdAt: args.createdAt, sample: false,
       });
       await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { shopifyOrderId: args.shopifyOrderId, source: "shopify_webhook" } });
     }
+    let intentId: any = null;
+    if (args.stagingInput) {
+      // Deterministic on the mirrored order, not merely delivery ID: Shopify can redeliver a
+      // semantically identical create as a distinct delivery and it still gets one CJ intent.
+      const existingIntent = await ctx.db.query("cjStagingIntents").withIndex("by_order", (q) => q.eq("orderId", orderId)).first();
+      if (existingIntent) {
+        intentId = existingIntent._id;
+      } else {
+        const now = Date.now();
+        intentId = await ctx.db.insert("cjStagingIntents", {
+          siteId: args.siteId, orderId, deliveryId: args.deliveryId, payloadHash: args.payloadHash,
+          status: "pending", attempt: 0, shipping: args.stagingInput.shipping,
+          shopifyLines: args.stagingInput.shopifyLines, createdAt: now, updatedAt: now,
+        });
+      }
+    }
     await ctx.db.insert("webhookReceipts", {
       provider: "shopify", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
       payloadHash: args.payloadHash, outcome: "applied", receivedAt: Date.now(),
     });
-    return { duplicate: false, outcome: "applied" as const };
+    // `applied` means intake/mirroring completed, never that CJ quote, staging, or approval did.
+    return { duplicate: false, outcome: "applied" as const, intentId };
   },
 });
 

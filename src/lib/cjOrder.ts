@@ -8,7 +8,7 @@ import type { CreateOrderInput } from "./cj";
 // module, so Node's crypto module and async WebCrypto are deliberately not dependencies here.
 // The 128-bit prefix used for CJ's <=50-char order number gives collision resistance that the
 // previous 32-bit FNV identity did not have.
-function sha256(value: string): string {
+export function stableSha256(value: string): string {
   const bytes = new TextEncoder().encode(value);
   const bitLength = bytes.length * 8;
   const length = ((bytes.length + 9 + 63) >> 6) << 6;
@@ -34,7 +34,7 @@ export function sandboxOrderNumber(siteId: string, shopifyOrderId: string): stri
   if (!siteId || !shopifyOrderId) throw new Error("siteId and shopifyOrderId are required");
   // CJ caps orderNumber at 50 characters. This contains no customer data and remains stable
   // across webhook redelivery and Trigger retries.
-  return `dsa-sb-${sha256(`${siteId}\u0000${shopifyOrderId}`).slice(0, 32)}`;
+  return `dsa-sb-${stableSha256(`${siteId}\u0000${shopifyOrderId}`).slice(0, 32)}`;
 }
 
 export function normalizeCjOrderInput(input: CreateOrderInput, orderNumber: string): CreateOrderInput {
@@ -64,7 +64,7 @@ export function normalizeCjOrderInput(input: CreateOrderInput, orderNumber: stri
 
 /** Stable fingerprint used to bind one approval to the persisted, immutable input snapshot. */
 export function cjOrderInputHash(input: CreateOrderInput): string {
-  return sha256(JSON.stringify({
+  return stableSha256(JSON.stringify({
     orderNumber: input.orderNumber,
     shippingZip: input.shippingZip,
     shippingCountryCode: input.shippingCountryCode,
@@ -77,6 +77,29 @@ export function cjOrderInputHash(input: CreateOrderInput): string {
     logisticName: input.logisticName,
     fromCountryCode: input.fromCountryCode,
     products: input.products.map((line) => ({ vid: line.vid, quantity: line.quantity })),
+  }));
+}
+
+/**
+ * Bind a freight response to the exact verified source and quote inputs without putting a
+ * customer address or postal code into a worker payload, trace, audit row, or provider key.
+ */
+export function cjFreightQuoteDigest(input: {
+  siteId: string; shopifyOrderId: string; fromCountryCode: string;
+  destinationCountryCode: string; shippingZip: string;
+  products: Array<{ vid: string; quantity: number }>;
+  providerEndpoint: string; providerVersion: string;
+}): string {
+  return stableSha256(JSON.stringify({
+    siteId: input.siteId,
+    shopifyOrderId: input.shopifyOrderId,
+    fromCountryCode: input.fromCountryCode.toUpperCase(),
+    destinationCountryCode: input.destinationCountryCode.toUpperCase(),
+    // PII-adjacent zip is hashed before it becomes part of any durable non-PII metadata.
+    shippingZipHash: stableSha256(input.shippingZip),
+    products: input.products.map(({ vid, quantity }) => ({ vid, quantity })),
+    providerEndpoint: input.providerEndpoint,
+    providerVersion: input.providerVersion,
   }));
 }
 
