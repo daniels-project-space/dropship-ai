@@ -4,7 +4,8 @@ import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { evaluatePersistedCjEvidence } from "../src/lib/sourcingPolicy";
 import { hasVerifiedInternalShopifyDraftLineage } from "../src/lib/shopifyDraftLineage";
-import { sourceSelectionDecision } from "../src/lib/sourceSelectionState";
+import { reuseSourceSelectionLineage, sourceSelectionDecision } from "../src/lib/sourceSelectionState";
+import { actionMatchesApprovedDraftImport, shopifyDraftTraceDetail } from "../src/lib/draftImportLineage";
 
 const productStatus = v.union(
   v.literal("draft"),
@@ -222,21 +223,19 @@ export const stageSourcedDraftSelection = mutation({
     if (!Number.isFinite(args.priceUsd) || args.priceUsd <= 0) throw new Error("source selection price must be positive");
     const prior = await ctx.db.query("sourceSelections")
       .withIndex("by_site_request", (q) => q.eq("siteId", args.siteId).eq("requestId", args.requestId)).first();
-    if (prior) {
-      if (prior.cjProductId !== args.cjProductId || prior.cjVariantId !== args.cjVariantId || prior.priceUsd !== args.priceUsd) {
-        throw new Error("source selection requestId was already used for different candidate facts");
-      }
-      const priorEvidence = await ctx.db.get(prior.evidenceId);
+    if (sourceSelectionDecision({ sameRequestExists: !!prior }) === "reuse" && prior) {
+      const reused = reuseSourceSelectionLineage(prior, args);
+      const priorEvidence = await ctx.db.get(reused.evidenceId);
       return {
-        status: prior.status,
+        status: reused.status,
         reused: true as const,
-        evidenceId: prior.evidenceId,
+        evidenceId: reused.evidenceId,
         traceId: priorEvidence?.traceId,
-        productId: prior.productId,
-        actionId: prior.actionId,
-        approvalDispatchKey: prior.approvalDispatchKey,
-        approvalRunId: prior.approvalRunId,
-        approvalDispatchStatus: prior.approvalDispatchStatus,
+        productId: reused.productId,
+        actionId: reused.actionId,
+        approvalDispatchKey: reused.approvalDispatchKey,
+        approvalRunId: reused.approvalRunId,
+        approvalDispatchStatus: reused.approvalDispatchStatus,
       };
     }
     const site = await ctx.db.get(args.siteId);
@@ -319,22 +318,6 @@ export const stageSourcedDraftSelection = mutation({
   },
 });
 
-function actionMatchesApprovedDraftImport(action: { siteId: unknown; type: string; riskTier: string; status: string; params: unknown }, product: { siteId: unknown; _id: unknown; cjEvidenceId?: unknown; cjProductId?: unknown; cjVariantId?: unknown; priceUsd: number; cogsUsd: number; shippingUsd: number; landedCostUsd?: number; contributionMarginPct?: number; sourceVerifiedAt?: number }): boolean {
-  if (action.siteId !== product.siteId || action.type !== "import_sourced_product" || action.riskTier !== "human_gated" || action.status !== "approved") return false;
-  const params = action.params;
-  return typeof params === "object" && params !== null
-    && (params as Record<string, unknown>).productId === product._id
-    && (params as Record<string, unknown>).evidenceId === product.cjEvidenceId
-    && (params as Record<string, unknown>).cjProductId === product.cjProductId
-    && (params as Record<string, unknown>).cjVariantId === product.cjVariantId
-    && (params as Record<string, unknown>).priceUsd === product.priceUsd
-    && (params as Record<string, unknown>).cogsUsd === product.cogsUsd
-    && (params as Record<string, unknown>).shippingUsd === product.shippingUsd
-    && (params as Record<string, unknown>).landedCostUsd === product.landedCostUsd
-    && (params as Record<string, unknown>).contributionMarginPct === product.contributionMarginPct
-    && (params as Record<string, unknown>).sourceVerifiedAt === product.sourceVerifiedAt;
-}
-
 /** Reserve one approved, draft-only Shopify import before crossing the provider boundary. */
 export const reserveApprovedShopifyDraftImport = mutation({
   args: { siteId: v.id("sites"), productId: v.id("products"), actionId: v.id("actions"), traceId: v.string() },
@@ -381,7 +364,14 @@ export const reserveApprovedShopifyDraftImport = mutation({
       target: `shopify:draft:${args.productId}`,
       idempotencyKey: `shopify:draft:${args.productId}`,
       status: "started",
-      detail: { actionId: args.actionId, evidenceId: product.cjEvidenceId },
+      detail: shopifyDraftTraceDetail({
+        actionId: args.actionId,
+        evidenceId: product.cjEvidenceId,
+        requestId: action.selectionRequestId,
+        cjProductId: product.cjProductId,
+        cjVariantId: product.cjVariantId,
+        productId: args.productId,
+      }),
       startedAt: Date.now(),
     });
     await appendAudit(ctx, { siteId: args.siteId, actionId: args.actionId, event: "shopify_draft_import_reserved", detail: { productId: args.productId, traceId: args.traceId } });

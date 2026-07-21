@@ -18,33 +18,48 @@ const amount = (value: unknown): number | undefined => {
   return Number.isFinite(number) && number >= 0 ? number : undefined;
 };
 
-function products(value: unknown): Row[] {
+/** CJ listV2 returns `content` grouping records, each with a `productList`. */
+export function cjCatalogueSearchProducts(value: unknown): Row[] {
   const root = row(value);
-  return rows(value).concat(rows(root?.content), rows(root?.list), rows(root?.records), rows(root?.data));
+  const data = row(root?.data);
+  const containers = [root, data].filter((candidate): candidate is Row => !!candidate);
+  const groups = containers.flatMap((container) => rows(container.content).concat(rows(container.list), rows(container.records)));
+  return groups.flatMap((group) => {
+    const nested = rows(group.productList);
+    if (nested.length) return nested;
+    // Retain the older list shape for a safe read-only fallback, but never mistake a listV2
+    // grouping object for a product.
+    return text(group.pid) || text(group.productId) || text(group.id) ? [group] : [];
+  });
 }
 
 function inventoryFor(variantId: string, sources: unknown[]): number | null {
   const inventory = sources.flatMap((source) => {
     const root = row(source);
     return rows(source).concat(rows(root?.inventories), rows(root?.list), rows(root?.content));
-  }).filter((entry) => text(entry.vid) === variantId && text(entry.countryCode)?.toUpperCase() === "US");
+  }).filter((entry) => (text(entry.vid) === variantId || !text(entry.vid)) && text(entry.countryCode)?.toUpperCase() === "US");
   if (!inventory.length) return null;
   return inventory.reduce((total, entry) => total + Math.floor(amount(entry.totalInventoryNum ?? entry.totalInventory ?? entry.storageNum) ?? 0), 0);
 }
 
 /** Do not infer shipping: CJ must explicitly identify it as free before zero is displayed. */
-export function normalizeCjCatalogueSearch(search: unknown, details: Array<{ productId: string; variants: unknown; inventory: unknown }>): CjCatalogueResult[] {
+export function normalizeCjCatalogueSearch(search: unknown, details: Array<{ productId: string; product: unknown }>): CjCatalogueResult[] {
   const byId = new Map(details.map((detail) => [detail.productId, detail]));
-  return products(search).flatMap((product) => {
+  return cjCatalogueSearchProducts(search).flatMap((product) => {
     const cjProductId = text(product.pid) ?? text(product.productId) ?? text(product.id);
     if (!cjProductId) return [];
     const detail = byId.get(cjProductId);
-    const variants = rows(detail?.variants).filter((variant) => text(variant.countryCode)?.toUpperCase() === "US" || text(variant.warehouseCountryCode)?.toUpperCase() === "US").flatMap((variant) => {
+    const detailProduct = row(detail?.product);
+    // Product Details with countryCode=US returns only US-stocked variants.  Variant records
+    // themselves do not carry a country field, so eligibility is derived from their documented
+    // inventory rows instead of an invented variant.countryCode property.
+    const variants = rows(detailProduct?.variants).flatMap((variant) => {
       const cjVariantId = text(variant.vid) ?? text(variant.variantId);
       if (!cjVariantId) return [];
       const cogsUsd = amount(variant.variantSellPrice ?? variant.sellPrice);
       const freeShipping = product.isFreeShipping === true || product.addMarkStatus === 1 || product.addMarkStatus === "1";
-      return [{ cjVariantId, label: text(variant.variantNameEn) ?? text(variant.variantName) ?? cjVariantId, inventoryQty: inventoryFor(cjVariantId, [detail?.inventory, detail?.variants]), cogsUsd: cogsUsd && cogsUsd > 0 ? cogsUsd : null, shippingUsd: freeShipping ? 0 : null }];
+      const inventoryQty = inventoryFor(cjVariantId, [variant]);
+      return inventoryQty === null ? [] : [{ cjVariantId, label: text(variant.variantNameEn) ?? text(variant.variantName) ?? cjVariantId, inventoryQty, cogsUsd: cogsUsd && cogsUsd > 0 ? cogsUsd : null, shippingUsd: freeShipping ? 0 : null }];
     });
     return [{ cjProductId, title: text(product.productNameEn) ?? text(product.productName) ?? text(product.nameEn) ?? "CJ product", variants }];
   });

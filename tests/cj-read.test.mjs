@@ -12,12 +12,12 @@ test("CJ product reads use GET, access-token authentication, and no cache", asyn
     return new Response(JSON.stringify({ result: true, data: { id: "ok" } }), { status: 200 });
   };
   try {
-    assert.deepEqual(await getProduct("product-1", "access-token"), { id: "ok" });
+    assert.deepEqual(await getProduct("product-1", "US", "access-token"), { id: "ok" });
     assert.deepEqual(await getVariants("product-1", "US", "access-token"), { id: "ok" });
     assert.equal(calls[0].options.method, "GET");
     assert.equal(calls[0].options.headers["CJ-Access-Token"], "access-token");
     assert.equal(calls[0].options.cache, "no-store");
-    assert.match(calls[0].url, /product\/query\?pid=product-1/);
+    assert.match(calls[0].url, /product\/query\?pid=product-1&countryCode=US/);
     assert.match(calls[1].url, /product\/variant\/query\?pid=product-1&countryCode=US/);
   } finally {
     globalThis.fetch = originalFetch;
@@ -67,6 +67,26 @@ test("CJ evidence is parsed from a verified US variant and unknown shipping neve
   });
   assert.equal(unknownShipping.shippingUsd, undefined);
   assert.throws(() => deriveCjEconomics(unknownShipping, 50), /unknown COGS or shipping cost/);
+});
+
+test("country-filtered Product Details binds the selected variant to its own US inventory", () => {
+  const evidence = parseCjEvidence({
+    productId: "product-1",
+    variantId: "variant-us",
+    product: {
+      productNameEn: "Verified widget",
+      variants: [
+        { vid: "variant-us", variantNameEn: "US", variantSellPrice: 12.5, inventories: [{ countryCode: "US", totalInventory: 7, verifiedWarehouse: 1 }] },
+        { vid: "variant-cn", variantNameEn: "CN", variantSellPrice: 8, inventories: [{ countryCode: "CN", totalInventory: 99, verifiedWarehouse: 1 }] },
+      ],
+    },
+    variants: [], inventory: [], variant: {}, variantInventory: [],
+  });
+  assert.equal(evidence.cjVariantId, "variant-us");
+  assert.equal(evidence.cogsUsd, 12.5);
+  assert.equal(evidence.inventoryQty, 7);
+  assert.equal(evidence.fromUsWarehouse, true);
+  assert.equal(evidence.inventoryVerified, true);
 });
 
 test("persisted CJ evidence is rechecked when a draft is activated or imported", () => {

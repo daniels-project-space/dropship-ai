@@ -45,66 +45,6 @@ export const propose = mutation({
   },
 });
 
-/**
- * Create the only approval action that can authorize a sourced Shopify draft import. The
- * commercial inputs are copied from the server-derived local draft, never from the browser.
- * A same evidence/product pair reuses its pending action so retries cannot create two approvals.
- */
-export const proposeSourcedDraftImport = mutation({
-  args: {
-    siteId: v.id("sites"),
-    productId: v.id("products"),
-    evidenceId: v.id("cjEvidence"),
-  },
-  handler: async (ctx, args) => {
-    const product = await ctx.db.get(args.productId);
-    const evidence = await ctx.db.get(args.evidenceId);
-    if (!product || product.siteId !== args.siteId || !evidence || evidence.siteId !== args.siteId) {
-      throw new Error("sourced draft product and CJ evidence must belong to the selected site");
-    }
-    if (product.status !== "draft" || product.cjEvidenceId !== evidence._id || product.cjProductId !== evidence.cjProductId || product.cjVariantId !== evidence.cjVariantId) {
-      throw new Error("sourced draft lineage does not match the selected CJ evidence");
-    }
-    const existing = await ctx.db
-      .query("actions")
-      .withIndex("by_site_status", (q) => q.eq("siteId", args.siteId))
-      .filter((q) => q.eq(q.field("type"), "import_sourced_product"))
-      .filter((q) => q.eq(q.field("params.productId"), args.productId))
-      .filter((q) => q.eq(q.field("params.evidenceId"), args.evidenceId))
-      .filter((q) => q.or(q.eq(q.field("status"), "pending_approval"), q.eq(q.field("status"), "approved"), q.eq(q.field("status"), "executing")))
-      .first();
-    if (existing) return { actionId: existing._id, status: existing.status, reused: true as const };
-
-    const actionId = await ctx.db.insert("actions", {
-      siteId: args.siteId,
-      type: "import_sourced_product",
-      params: {
-        productId: product._id,
-        evidenceId: evidence._id,
-        cjProductId: product.cjProductId,
-        cjVariantId: product.cjVariantId,
-        priceUsd: product.priceUsd,
-        cogsUsd: product.cogsUsd,
-        shippingUsd: product.shippingUsd,
-        landedCostUsd: product.landedCostUsd,
-        contributionMarginPct: product.contributionMarginPct,
-        sourceVerifiedAt: product.sourceVerifiedAt,
-      },
-      riskTier: "human_gated",
-      status: "pending_approval",
-      rationale: "Verified CJ evidence and server-derived contribution economics cleared the sourcing policy. Human approval can create one Shopify DRAFT only.",
-      proposedAt: Date.now(),
-    });
-    await appendAudit(ctx, {
-      siteId: args.siteId,
-      actionId,
-      event: "sourced_draft_import_proposed",
-      detail: { productId: product._id, evidenceId: evidence._id, cjProductId: product.cjProductId, cjVariantId: product.cjVariantId, published: false },
-    });
-    return { actionId, status: "pending_approval" as const, reused: false as const };
-  },
-});
-
 export const approve = mutation({
   args: { actionId: v.id("actions"), approver: v.optional(v.string()) },
   handler: async (ctx, { actionId, approver }) => {

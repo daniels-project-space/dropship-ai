@@ -137,9 +137,13 @@ export async function searchProducts(q: CjCatalogSearch, token?: string): Promis
   });
 }
 
-export async function getProduct(productId: string, token?: string): Promise<unknown> {
+/**
+ * Product details include variants and their inventories.  Supplying countryCode is important:
+ * CJ then returns only variants that have inventory in that country.
+ */
+export async function getProduct(productId: string, countryCode?: string, token?: string): Promise<unknown> {
   if (!productId) throw new Error("cj: productId is required");
-  return cjFetch<unknown>("/product/query", { method: "GET", token, query: { pid: productId } });
+  return cjFetch<unknown>("/product/query", { method: "GET", token, query: { pid: productId, countryCode } });
 }
 
 export async function getVariants(productId: string, countryCode?: string, token?: string): Promise<unknown> {

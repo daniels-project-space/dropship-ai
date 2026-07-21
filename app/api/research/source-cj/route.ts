@@ -5,7 +5,7 @@ import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { approvalGate } from "@/src/trigger/approval-gate";
-import { getInventoryByProduct, getInventoryByVariant, getProduct, getVariant, getVariants } from "@/src/lib/cj";
+import { getProduct } from "@/src/lib/cj";
 import { parseCjEvidence } from "@/src/lib/cjEvidence";
 import { requireOperator } from "@/src/lib/auth/server";
 import { convexClient, api } from "@/src/lib/convexClient";
@@ -44,15 +44,11 @@ export async function POST(request: Request) {
   try {
     const cjProductId = body.cjProductId.trim();
     const cjVariantId = body.cjVariantId.trim();
-    const [product, variants, inventory, variant, variantInventory] = await Promise.all([
-      getProduct(cjProductId),
-      getVariants(cjProductId, "US"),
-      getInventoryByProduct(cjProductId),
-      getVariant(cjVariantId),
-      getInventoryByVariant(cjVariantId),
-    ]);
+    // Product Details filtered to US returns the exact candidate's variants and their
+    // documented inventories. This refresh is intentionally outside discovery caching.
+    const product = await getProduct(cjProductId, "US");
     const readAt = Date.now();
-    const parsed = parseCjEvidence({ productId: cjProductId, variantId: cjVariantId, product, variants, inventory, variant, variantInventory });
+    const parsed = parseCjEvidence({ productId: cjProductId, variantId: cjVariantId, product, variants: [], inventory: [], variant: {}, variantInventory: [] });
     const convex = convexClient();
     const staged = await convex.mutation(api.products.stageSourcedDraftSelection, {
       siteId: body.siteId.trim() as Id<"sites">,

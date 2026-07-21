@@ -12,6 +12,21 @@ export function sourceSelectionDecision(input: {
   return "stage";
 }
 
+/**
+ * The persisted row is the authority for an HTTP retry. Returning it intact prevents a retry
+ * from minting another CJ evidence row, approval action, or Trigger dispatch/waitpoint lineage.
+ */
+export function reuseSourceSelectionLineage<T extends {
+  cjProductId: string;
+  cjVariantId: string;
+  priceUsd: number;
+}>(prior: T, incoming: { cjProductId: string; cjVariantId: string; priceUsd: number }): T {
+  if (prior.cjProductId !== incoming.cjProductId || prior.cjVariantId !== incoming.cjVariantId || prior.priceUsd !== incoming.priceUsd) {
+    throw new Error("source selection requestId was already used for different candidate facts");
+  }
+  return prior;
+}
+
 export function approvalDispatchDecision(input: { actionStatus: string; dispatchStatus?: string; approvalRunId?: string }): "already_dispatched" | "trigger" | "reject" {
   if (input.actionStatus !== "pending_approval") return "reject";
   if (input.dispatchStatus === "dispatched" && input.approvalRunId) return "already_dispatched";

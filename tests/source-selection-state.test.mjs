@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { approvalDispatchDecision, approvalWaitpointKey, sourceSelectionDecision } from "../src/lib/sourceSelectionState.ts";
+import { approvalDispatchDecision, approvalWaitpointKey, reuseSourceSelectionLineage, sourceSelectionDecision } from "../src/lib/sourceSelectionState.ts";
 
-test("an exact source-selection retry and a concurrent duplicate reuse one lineage", () => {
+test("an exact source-selection retry and a concurrent duplicate reuse one evidence/action/waitpoint lineage", () => {
   assert.equal(sourceSelectionDecision({ sameRequestExists: true }), "reuse");
   assert.equal(sourceSelectionDecision({ sameRequestExists: true, shopifyDraftImportStatus: "creating", existingApprovalStatus: "approved" }), "reuse");
+  const persisted = { cjProductId: "p1", cjVariantId: "v1", priceUsd: 40, evidenceId: "evidence_1", actionId: "action_1", approvalDispatchKey: "approval-gate:site:request", approvalRunId: "run_1", waitpointToken: "wait_1" };
+  assert.equal(reuseSourceSelectionLineage(persisted, { cjProductId: "p1", cjVariantId: "v1", priceUsd: 40 }), persisted);
+  assert.throws(() => reuseSourceSelectionLineage(persisted, { cjProductId: "p1", cjVariantId: "v1", priceUsd: 41 }), /already used/);
 });
 
 test("a fresh selection cannot refresh a reserved, ambiguous, or approval-protected draft", () => {

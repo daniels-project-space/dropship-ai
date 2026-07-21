@@ -66,11 +66,19 @@ export function parseCjEvidence(input: {
 }): ParsedCjEvidence {
   const product = record(input.product) ?? {};
   const variant = record(input.variant) ?? {};
-  const variants = records(input.variants);
+  // `product/query?countryCode=US` returns the eligible variant records directly on product.
+  // Keep the separately supplied list for the legacy read-only refresh path.
+  const variants = records(input.variants).concat(records(product.variants));
   const listedVariant = variants.find((candidate) => string(candidate.vid) === input.variantId) ?? {};
   const title = string(product.productNameEn) ?? string(product.nameEn) ?? string(product.productName) ?? "CJ product";
   const cogsUsd = money(variant.variantSellPrice) ?? money(listedVariant.variantSellPrice) ?? money(product.sellPrice);
-  const usInventory = inventoryRows(input.variantInventory, input.inventory, variant, listedVariant, product)
+  // Product-level inventory queries can contain every variant. Only their rows explicitly tied
+  // to the selected vid are safe to use; inventories nested under the selected variant are
+  // already exact and do not carry a vid in CJ's documented Product Details shape.
+  // queryByVid is exact even when a provider row omits vid; product-level inventory is not.
+  const externalInventory = inventoryRows(input.variantInventory)
+    .concat(inventoryRows(input.inventory).filter((row) => string(row.vid) === input.variantId));
+  const usInventory = inventoryRows(variant, listedVariant).concat(externalInventory)
     .filter((row) => string(row.countryCode)?.toUpperCase() === "US");
   const inventoryQty = usInventory.reduce((total, row) => total + quantity(row.totalInventoryNum ?? row.totalInventory ?? row.storageNum), 0);
   const inventoryVerified = usInventory.some((row) => row.verifiedWarehouse === 1 || row.verifiedWarehouse === "1");

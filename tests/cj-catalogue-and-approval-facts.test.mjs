@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeCjCatalogueSearch } from "../src/lib/cjCatalog.ts";
+import { cjCatalogueSearchProducts, normalizeCjCatalogueSearch } from "../src/lib/cjCatalog.ts";
 import { sourcedDraftApprovalFacts } from "../src/lib/sourcedDraftApprovalFacts.ts";
 
-test("CJ search exposes exact US variants with unknown costs left unknown", () => {
-  const results = normalizeCjCatalogueSearch({ content: [{ pid: "p1", productNameEn: "Widget" }] }, [{ productId: "p1", variants: [{ vid: "v-us", countryCode: "US", variantNameEn: "Blue", variantSellPrice: "8.50" }], inventory: [{ vid: "v-us", countryCode: "US", totalInventoryNum: "7" }] }]);
+test("CJ listV2 nesting and Product Details inventory shape expose exact US variants", () => {
+  // Exact documented listV2 shape: grouping records contain productList, not product rows.
+  const search = { content: [{ productList: [{ id: "p1", nameEn: "Widget" }] }] };
+  assert.deepEqual(cjCatalogueSearchProducts(search), [{ id: "p1", nameEn: "Widget" }]);
+  // Exact documented variant shape has no countryCode. Country belongs to inventories.
+  const results = normalizeCjCatalogueSearch(search, [{ productId: "p1", product: { variants: [{ vid: "v-us", variantNameEn: "Blue", variantSellPrice: "8.50", inventories: [{ countryCode: "US", totalInventory: 7, verifiedWarehouse: 1 }] }, { vid: "v-cn", variantNameEn: "Red", variantSellPrice: "8.50", inventories: [{ countryCode: "CN", totalInventory: 9, verifiedWarehouse: 1 }] }] } }]);
   assert.deepEqual(results, [{ cjProductId: "p1", title: "Widget", variants: [{ cjVariantId: "v-us", label: "Blue", inventoryQty: 7, cogsUsd: 8.5, shippingUsd: null }] }]);
 });
 
