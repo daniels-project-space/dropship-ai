@@ -189,6 +189,25 @@ export default defineSchema({
     trackingNumber: v.optional(v.string()),       // via CJ ORDER webhook, not create-response
     trackingUrl: v.optional(v.string()),
     totalUsd: v.number(),
+    // Immutable input supplied to CJ only after a separate human approval. This contains order
+    // PII, so it is never copied to outbox payloads, traces, logs, or Trigger payloads.
+    cjOrderInput: v.optional(v.object({
+      orderNumber: v.string(),
+      shippingZip: v.string(),
+      shippingCountryCode: v.string(),
+      shippingCountry: v.string(),
+      shippingProvince: v.string(),
+      shippingCity: v.string(),
+      shippingAddress: v.string(),
+      shippingCustomerName: v.string(),
+      shippingPhone: v.string(),
+      logisticName: v.optional(v.string()),
+      fromCountryCode: v.optional(v.string()),
+      products: v.array(v.object({ vid: v.string(), quantity: v.number() })),
+    })),
+    cjOrderInputHash: v.optional(v.string()),
+    cjApprovalActionId: v.optional(v.id("actions")),
+    cjDispatchStatus: v.optional(v.union(v.literal("staged"), v.literal("reserved"), v.literal("ambiguous"), v.literal("sent"), v.literal("failed"))),
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
   }).index("by_site", ["siteId"]).index("by_shopify_order", ["shopifyOrderId"]).index("by_site_status", ["siteId", "fulfillmentStatus"]),

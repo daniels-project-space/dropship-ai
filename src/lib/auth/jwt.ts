@@ -20,9 +20,18 @@ function settings() {
 
 /** A short-lived token used only by the browser Convex client. */
 export function mintOperatorJwt(now = Math.floor(Date.now() / 1000)): string {
+  return mintServiceJwtForSubject("dropship-ai:operator", now);
+}
+
+/** Short-lived server identity for Trigger/route-to-Convex calls; never read from a static env token. */
+export function mintServiceJwt(now = Math.floor(Date.now() / 1000)): string {
+  return mintServiceJwtForSubject("dropship-ai:service", now);
+}
+
+function mintServiceJwtForSubject(subject: "dropship-ai:operator" | "dropship-ai:service", now: number): string {
   const { issuer, audience, privateKey, kid } = settings();
   const header = base64Url(JSON.stringify({ alg: "RS256", typ: "JWT", kid }));
-  const payload = base64Url(JSON.stringify({ iss: issuer, aud: audience, sub: "dropship-ai:operator", iat: now, exp: now + 5 * 60 }));
+  const payload = base64Url(JSON.stringify({ iss: issuer, aud: audience, sub: subject, iat: now, exp: now + 5 * 60 }));
   const signer = createSign("RSA-SHA256");
   signer.update(`${header}.${payload}`);
   signer.end();

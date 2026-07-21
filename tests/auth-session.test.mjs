@@ -18,6 +18,7 @@ import { POST as postDiscover } from "../app/api/research/discover/route.ts";
 import { GET as getCjSearch } from "../app/api/research/cj-search/route.ts";
 import { POST as postSourceCj } from "../app/api/research/source-cj/route.ts";
 import { POST as postApprovalResolve } from "../app/api/approvals/resolve/route.ts";
+import { POST as postSandboxDispatch } from "../app/api/orders/dispatch-sandbox/route.ts";
 import { GET as getOperatorToken } from "../app/api/auth/token/route.ts";
 import { POST as postLogout } from "../app/api/auth/logout/route.ts";
 
@@ -97,6 +98,7 @@ test("every operator route independently rejects a forged session", async () => 
       getCjSearch(new Request("https://control.example/api/research/cj-search?q=widget", { headers: forgedHeaders })),
       postSourceCj(post()),
       postApprovalResolve(post()),
+      postSandboxDispatch(post()),
       postLogout(post()),
     ]);
     for (const response of responses) {

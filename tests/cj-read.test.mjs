@@ -41,6 +41,39 @@ test("CJ refresh exchanges only the refresh token and returns rotated credential
   }
 });
 
+test("an expired server-held CJ token refreshes once and retries with the rotated pair", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccess = process.env.CJ_ACCESS_TOKEN;
+  const originalRefresh = process.env.CJ_REFRESH_TOKEN;
+  const calls = [];
+  process.env.CJ_ACCESS_TOKEN = "expired-access";
+  process.env.CJ_REFRESH_TOKEN = "rotation-refresh";
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    if (String(url).includes("refreshAccessToken")) {
+      return new Response(JSON.stringify({ result: true, data: { accessToken: "rotated-access", refreshToken: "rotated-refresh" } }), { status: 200 });
+    }
+    if (calls.filter((call) => String(call.url).includes("product/query")).length === 1) {
+      return new Response(JSON.stringify({ result: false, message: "expired" }), { status: 401 });
+    }
+    return new Response(JSON.stringify({ result: true, data: { id: "after-rotation" } }), { status: 200 });
+  };
+  try {
+    assert.deepEqual(await getProduct("product-rotation", "US"), { id: "after-rotation" });
+    const productCalls = calls.filter((call) => call.url.includes("product/query"));
+    assert.equal(productCalls.length, 2);
+    assert.equal(productCalls[0].options.headers["CJ-Access-Token"], "expired-access");
+    assert.equal(productCalls[1].options.headers["CJ-Access-Token"], "rotated-access");
+    assert.deepEqual(JSON.parse(calls.find((call) => call.url.includes("refreshAccessToken")).options.body), { refreshToken: "rotation-refresh" });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalAccess === undefined) delete process.env.CJ_ACCESS_TOKEN;
+    else process.env.CJ_ACCESS_TOKEN = originalAccess;
+    if (originalRefresh === undefined) delete process.env.CJ_REFRESH_TOKEN;
+    else process.env.CJ_REFRESH_TOKEN = originalRefresh;
+  }
+});
+
 test("CJ evidence is parsed from a verified US variant and unknown shipping never becomes zero", () => {
   const evidence = parseCjEvidence({
     productId: "product-1",

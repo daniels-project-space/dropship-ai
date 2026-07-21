@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test from "node:test";
 import { createZeroChargeDraftCheckout } from "../src/lib/shopify.ts";
-import { createOrder } from "../src/lib/cj.ts";
+import { createSandboxOrder, getSandboxOrderByOrderNumber } from "../src/lib/cj.ts";
 import { assertLiveEffectsEnabled, sandboxShopAllowed } from "../src/lib/effects.ts";
+import { cjOrderInputHash, normalizeCjOrderInput, sandboxDispatchDecision, sandboxOrderNumber } from "../src/lib/cjOrder.ts";
 import { verifyShopifyHmac } from "../app/api/webhooks/shopify/route.ts";
 import { verifyCjHmac } from "../app/api/webhooks/cj/route.ts";
 
@@ -44,7 +45,7 @@ test("sandbox checkout creates only an explicitly zero-dollar draft and never se
   }
 });
 
-test("CJ order creation uses create-only payType:3 and stable orderNumber", async () => {
+test("CJ sandbox dispatch is create-only, binds isSandbox=1, and has no real-effect flags", async () => {
   const originalFetch = globalThis.fetch;
   let call;
   globalThis.fetch = async (url, options) => {
@@ -53,14 +54,44 @@ test("CJ order creation uses create-only payType:3 and stable orderNumber", asyn
   };
   try {
     const input = {
-      orderNumber: "gid://shopify/Order/1", shippingZip: "00000", shippingCountryCode: "US", shippingCountry: "United States",
+      orderNumber: "ignored", shippingZip: "00000", shippingCountryCode: "US", shippingCountry: "United States",
       shippingProvince: "CA", shippingCity: "Test", shippingAddress: "Sandbox", shippingCustomerName: "Test", shippingPhone: "0000000000",
       products: [{ vid: "variant", quantity: 1 }],
     };
-    assert.deepEqual(await createOrder(input, "token"), { orderId: "cj-1", orderNumber: input.orderNumber });
+    const orderNumber = sandboxOrderNumber("site_1", "gid://shopify/Order/1");
+    const persisted = normalizeCjOrderInput(input, orderNumber);
+    assert.deepEqual(await createSandboxOrder(persisted, "token"), { orderId: "cj-1", orderNumber });
     assert.match(call.url, /shopping\/order\/createOrderV2$/);
     assert.equal(JSON.parse(call.options.body).payType, 3);
-    assert.equal(JSON.parse(call.options.body).orderNumber, input.orderNumber);
+    assert.equal(JSON.parse(call.options.body).isSandbox, 1);
+    assert.equal(JSON.parse(call.options.body).orderNumber, orderNumber);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a persisted input snapshot and approval fingerprint are stable; reserved or ambiguous work must reconcile", () => {
+  const orderNumber = sandboxOrderNumber("site_1", "gid://shopify/Order/1");
+  const first = normalizeCjOrderInput({
+    orderNumber: "untrusted", shippingZip: "00000", shippingCountryCode: "us", shippingCountry: "United States",
+    shippingProvince: "CA", shippingCity: "Test", shippingAddress: "Sandbox", shippingCustomerName: "Test", shippingPhone: "0000000000",
+    products: [{ vid: "variant", quantity: 1 }],
+  }, orderNumber);
+  const replay = normalizeCjOrderInput({ ...first, orderNumber: "other" }, orderNumber);
+  assert.equal(cjOrderInputHash(first), cjOrderInputHash(replay));
+  assert.equal(sandboxDispatchDecision("staged"), "reserve");
+  assert.equal(sandboxDispatchDecision("reserved"), "reconcile");
+  assert.equal(sandboxDispatchDecision("ambiguous"), "reconcile");
+  assert.equal(sandboxDispatchDecision("sent"), "reused");
+  assert.equal(sandboxDispatchDecision("failed"), "blocked");
+});
+
+test("CJ reconciliation accepts only an isSandbox=1 order with the exact stable identity", async () => {
+  const originalFetch = globalThis.fetch;
+  const orderNumber = sandboxOrderNumber("site_1", "gid://shopify/Order/1");
+  globalThis.fetch = async () => new Response(JSON.stringify({ result: true, data: { orderId: "cj-1", orderNum: orderNumber, isSandbox: 1 } }), { status: 200 });
+  try {
+    assert.deepEqual(await getSandboxOrderByOrderNumber(orderNumber, "token"), { orderId: "cj-1", orderNumber, isSandbox: 1 });
   } finally {
     globalThis.fetch = originalFetch;
   }

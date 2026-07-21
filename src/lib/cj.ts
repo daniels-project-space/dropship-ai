@@ -5,13 +5,35 @@ import { getKey } from "./vault";
 
 const CJ_BASE = "https://developers.cjdropshipping.com/api2.0/v1";
 
+type CjTokenBundle = { accessToken: string; refreshToken?: string; accessTokenExpiryDate?: string; refreshTokenExpiryDate?: string };
+let activeTokens: CjTokenBundle | null = null;
+let refreshInFlight: Promise<string> | null = null;
+
+async function readTokenBundle(): Promise<CjTokenBundle> {
+  const [vaultAccess, vaultRefresh] = await Promise.all([
+    getKey("cj", "CJ_ACCESS_TOKEN").catch(() => null),
+    getKey("cj", "CJ_REFRESH_TOKEN").catch(() => null),
+  ]);
+  const accessToken = vaultAccess ?? process.env.CJ_ACCESS_TOKEN;
+  const refreshToken = vaultRefresh ?? process.env.CJ_REFRESH_TOKEN;
+  if (!accessToken) throw new Error("cj: no access token — add CJ_ACCESS_TOKEN to the server vault/control plane");
+  return { accessToken, refreshToken };
+}
+
 export async function getAccessToken(): Promise<string> {
-  const fromVault = await getKey("cj", "CJ_ACCESS_TOKEN").catch(() => null);
-  const token = fromVault ?? process.env.CJ_ACCESS_TOKEN;
-  if (!token) {
-    throw new Error("cj: no access token — add CJ_ACCESS_TOKEN to vault service 'cj' or set process.env.CJ_ACCESS_TOKEN");
+  if (!activeTokens) activeTokens = await readTokenBundle();
+  return activeTokens.accessToken;
+}
+
+class CjApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "CjApiError";
   }
-  return token;
+}
+
+export function isAmbiguousCjWriteError(error: unknown): boolean {
+  return error instanceof CjApiError ? error.status >= 500 : true;
 }
 
 async function cjFetch<T>(
@@ -19,6 +41,22 @@ async function cjFetch<T>(
   options: { method?: "GET" | "POST"; body?: unknown; token?: string; query?: Record<string, string | number | boolean | undefined> } = {},
 ): Promise<T> {
   const accessToken = options.token ?? (await getAccessToken());
+  try {
+    return await cjFetchWithToken<T>(path, options, accessToken);
+  } catch (error) {
+    // An explicit caller token is never silently replaced. For normal server-controlled calls,
+    // one 401 gets a single-flight refresh; the returned pair is assigned atomically in memory.
+    if (options.token || !(error instanceof CjApiError) || error.status !== 401) throw error;
+    const refreshed = await refreshCurrentAccessToken();
+    return cjFetchWithToken<T>(path, options, refreshed);
+  }
+}
+
+async function cjFetchWithToken<T>(
+  path: string,
+  options: { method?: "GET" | "POST"; body?: unknown; token?: string; query?: Record<string, string | number | boolean | undefined> },
+  accessToken: string,
+): Promise<T> {
   const url = new URL(`${CJ_BASE}${path}`);
   for (const [key, value] of Object.entries(options.query ?? {})) {
     if (value !== undefined) url.searchParams.set(key, String(value));
@@ -40,7 +78,7 @@ async function cjFetch<T>(
     // Preserve the status without attempting to expose an HTML/provider error body.
   }
   if (!res.ok || json?.result === false || json?.success === false || !json) {
-    throw new Error(`cj ${path} failed: HTTP ${res.status} ${json?.message ?? "invalid response"}`);
+    throw new CjApiError(res.status, `cj ${path} failed: HTTP ${res.status} ${json?.message ?? "invalid response"}`);
   }
   return json.data as T;
 }
@@ -70,6 +108,32 @@ export async function refreshAccessToken(refreshToken: string): Promise<CjAccess
   return json.data;
 }
 
+/**
+ * Refresh exactly once per process when CJ rejects the current access token. Both tokens are
+ * replaced together, so concurrent requests cannot pair a new access token with an old refresh
+ * token. Persistent rotation remains a vault/control-plane operation, never a Convex write.
+ */
+export async function refreshCurrentAccessToken(): Promise<string> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    const current = activeTokens ?? await readTokenBundle();
+    if (!current.refreshToken) throw new Error("cj: access token expired and CJ_REFRESH_TOKEN is not configured in the server vault/control plane");
+    const next = await refreshAccessToken(current.refreshToken);
+    activeTokens = {
+      accessToken: next.accessToken,
+      refreshToken: next.refreshToken,
+      accessTokenExpiryDate: next.accessTokenExpiryDate,
+      refreshTokenExpiryDate: next.refreshTokenExpiryDate,
+    };
+    return next.accessToken;
+  })();
+  try {
+    return await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
+  }
+}
+
 export interface CjOrderLine {
   vid: string;
   quantity: number;
@@ -96,12 +160,39 @@ export interface CreateOrderResult {
 }
 
 /** Create-only order (payType:3). Returns CJ orderId; no tracking is expected here. */
-export async function createOrder(input: CreateOrderInput, token?: string): Promise<CreateOrderResult> {
+export async function createSandboxOrder(input: CreateOrderInput, token?: string): Promise<CreateOrderResult> {
+  if (!input.orderNumber.startsWith("dsa-sb-")) throw new Error("CJ sandbox orderNumber must use the persisted sandbox identity");
   const data = await cjFetch<{ orderId: string }>("/shopping/order/createOrderV2", {
-    body: { ...input, payType: 3 },
+    // These are a second, adapter-level boundary in addition to the dispatch mutation below.
+    body: { ...input, payType: 3, isSandbox: 1 },
     token,
   });
   return { orderId: data.orderId, orderNumber: input.orderNumber };
+}
+
+/** @deprecated All supplier writes are sandbox-only. Use createSandboxOrder. */
+export const createOrder = createSandboxOrder;
+
+export interface CjOrderLookup {
+  orderId: string;
+  orderNumber: string;
+  isSandbox: number | boolean | undefined;
+}
+
+/** CJ accepts the custom order number as `orderId` for this lookup. */
+export async function getSandboxOrderByOrderNumber(orderNumber: string, token?: string): Promise<CjOrderLookup | null> {
+  try {
+    const data = await cjFetch<{ orderId?: string; orderNum?: string; orderNumber?: string; isSandbox?: number | boolean }>("/shopping/order/getOrderDetail", {
+      method: "GET", token, query: { orderId: orderNumber },
+    });
+    const actualOrderNumber = data.orderNumber ?? data.orderNum ?? orderNumber;
+    if (!data.orderId || actualOrderNumber !== orderNumber) return null;
+    if (data.isSandbox !== 1 && data.isSandbox !== true) throw new Error("CJ reconciliation found a non-sandbox order");
+    return { orderId: data.orderId, orderNumber: actualOrderNumber, isSandbox: data.isSandbox };
+  } catch (error) {
+    if (error instanceof CjApiError && error.status === 404) return null;
+    throw error;
+  }
 }
 
 export interface CjProductQuery {

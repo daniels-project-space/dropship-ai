@@ -2,6 +2,7 @@
 import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
+import { cjOrderInputHash, normalizeCjOrderInput, sandboxDispatchDecision, sandboxOrderNumber } from "../src/lib/cjOrder";
 
 const fulfillmentStatus = v.union(
   v.literal("received"),
@@ -10,6 +11,17 @@ const fulfillmentStatus = v.union(
   v.literal("delivered"),
   v.literal("error"),
 );
+const cjDispatchStatus = v.union(v.literal("staged"), v.literal("reserved"), v.literal("ambiguous"), v.literal("sent"), v.literal("failed"));
+const cjOrderInput = v.object({
+  orderNumber: v.string(), shippingZip: v.string(), shippingCountryCode: v.string(), shippingCountry: v.string(),
+  shippingProvince: v.string(), shippingCity: v.string(), shippingAddress: v.string(), shippingCustomerName: v.string(),
+  shippingPhone: v.string(), logisticName: v.optional(v.string()), fromCountryCode: v.optional(v.string()),
+  products: v.array(v.object({ vid: v.string(), quantity: v.number() })),
+});
+
+async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
+  if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: sandbox dispatch requires the service runtime");
+}
 
 // Map a Shopify displayFulfillmentStatus → our fulfillment enum. We DON'T touch sent_to_cj here
 // (that's set by the CJ loop in Phase 2b) — a Shopify-side FULFILLED maps straight to "shipped".
@@ -122,6 +134,109 @@ export const record = mutation({
     });
     await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { orderId, shopifyOrderId: args.shopifyOrderId } });
     return orderId;
+  },
+});
+
+/**
+ * Persist an immutable CJ input snapshot and a deterministic orderNumber before creating the
+ * human-gated sandbox-dispatch action. This is service-only: order PII never crosses a browser.
+ */
+export const stageSandboxCjDispatch = mutation({
+  args: { siteId: v.id("sites"), shopifyOrderId: v.string(), totalUsd: v.number(), cjInput: cjOrderInput },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const orderNumber = sandboxOrderNumber(String(args.siteId), args.shopifyOrderId);
+    const input = normalizeCjOrderInput(args.cjInput, orderNumber);
+    const inputHash = cjOrderInputHash(input);
+    let order = await ctx.db.query("orders").withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
+    if (order && order.siteId !== args.siteId) throw new Error("shopify order belongs to another site");
+    if (order?.cjOrderInputHash && order.cjOrderInputHash !== inputHash) throw new Error("CJ order inputs are immutable once staged");
+    if (!order) {
+      const orderId = await ctx.db.insert("orders", { siteId: args.siteId, shopifyOrderId: args.shopifyOrderId, totalUsd: args.totalUsd, fulfillmentStatus: "received", cjOrderInput: input, cjOrderInputHash: inputHash, cjDispatchStatus: "staged", createdAt: Date.now(), sample: false });
+      order = await ctx.db.get(orderId);
+    } else if (!order.cjOrderInputHash) {
+      await ctx.db.patch(order._id, { cjOrderInput: input, cjOrderInputHash: inputHash, cjDispatchStatus: "staged" });
+      order = await ctx.db.get(order._id);
+    }
+    if (!order) throw new Error("order staging failed");
+    if (order.cjApprovalActionId) return { orderId: order._id, actionId: order.cjApprovalActionId, orderNumber, inputHash, reused: true };
+    const actionId = await ctx.db.insert("actions", {
+      siteId: args.siteId, type: "dispatch_cj_sandbox_order", riskTier: "human_gated", status: "pending_approval",
+      params: { orderId: order._id, orderNumber, inputHash, isSandbox: 1, payType: 3 },
+      rationale: "Immutable order-input snapshot is ready. Approval can dispatch exactly one CJ sandbox-only, create-only order.", proposedAt: Date.now(),
+    });
+    await ctx.db.patch(order._id, { cjApprovalActionId: actionId });
+    await appendAudit(ctx, { siteId: args.siteId, actionId, event: "cj_sandbox_dispatch_staged", detail: { orderId: order._id, orderNumber, inputHash, isSandbox: 1, payType: 3 } });
+    return { orderId: order._id, actionId, orderNumber, inputHash, reused: false };
+  },
+});
+
+/** Atomically reserve a valid approval before the worker is permitted to call CJ. */
+export const claimSandboxCjDispatch = mutation({
+  args: { actionId: v.id("actions") },
+  handler: async (ctx, { actionId }) => {
+    await requireServiceIdentity(ctx);
+    const action = await ctx.db.get(actionId);
+    if (!action || action.type !== "dispatch_cj_sandbox_order" || action.status !== "approved") throw new Error("CJ sandbox dispatch needs its exact approved action");
+    const params = action.params as { orderId?: string; orderNumber?: string; inputHash?: string; isSandbox?: number; payType?: number };
+    // `params` is intentionally untyped action metadata; constrain this dynamic lookup back to
+    // the order shape before inspecting any PII/state fields.
+    const order = params.orderId ? await ctx.db.get(params.orderId as any) as any : null;
+    if (!order || order.siteId !== action.siteId || order.cjApprovalActionId !== actionId || !order.cjOrderInput || !order.cjOrderInputHash) throw new Error("CJ approval is not bound to a persisted order input");
+    if (params.orderNumber !== order.cjOrderInput.orderNumber || params.inputHash !== order.cjOrderInputHash || params.isSandbox !== 1 || params.payType !== 3) throw new Error("CJ approval binding is invalid");
+    const decision = sandboxDispatchDecision(order.cjDispatchStatus);
+    if (decision === "reused") return { state: "reused" as const, siteId: order.siteId, orderId: order._id, cjOrderId: order.cjOrderId, orderNumber: order.cjOrderInput.orderNumber };
+    if (decision === "reconcile") return { state: "reconcile_required" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber };
+    if (decision === "blocked") return { state: "blocked" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber };
+    await ctx.db.patch(order._id, { cjDispatchStatus: "reserved" });
+    await appendAudit(ctx, { siteId: order.siteId, actionId, event: "cj_sandbox_dispatch_reserved", detail: { orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, isSandbox: 1 } });
+    return { state: "reserved" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, inputHash: order.cjOrderInputHash, cjInput: order.cjOrderInput };
+  },
+});
+
+export const markSandboxCjDispatched = mutation({
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), cjOrderId: v.string() },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const order = await ctx.db.get(args.orderId);
+    const action = await ctx.db.get(args.actionId);
+    if (!order || !action || order.cjApprovalActionId !== args.actionId || action.status !== "approved") throw new Error("sandbox dispatch completion is not authorized");
+    await ctx.db.patch(order._id, { cjOrderId: args.cjOrderId, cjDispatchStatus: "sent", fulfillmentStatus: "sent_to_cj" });
+    await ctx.db.patch(action._id, { status: "executed", resolvedAt: Date.now() });
+    await appendAudit(ctx, { siteId: order.siteId, actionId: action._id, event: "cj_sandbox_dispatch_sent", detail: { orderId: order._id, orderNumber: order.cjOrderInput?.orderNumber, cjOrderId: args.cjOrderId, isSandbox: 1, payType: 3 } });
+    return order._id;
+  },
+});
+
+export const markSandboxCjAmbiguous = mutation({
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), reason: v.string() },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const order = await ctx.db.get(args.orderId);
+    if (!order || order.cjApprovalActionId !== args.actionId) throw new Error("sandbox dispatch ambiguity is not authorized");
+    await ctx.db.patch(order._id, { cjDispatchStatus: "ambiguous" });
+    await appendAudit(ctx, { siteId: order.siteId, actionId: args.actionId, event: "cj_sandbox_dispatch_ambiguous", detail: { orderId: order._id, orderNumber: order.cjOrderInput?.orderNumber, reason: args.reason.slice(0, 300), reconciliationRequired: true } });
+    return order._id;
+  },
+});
+
+/** Reconciliation may either bind a confirmed sandbox order or explicitly reopen a later retry. */
+export const reconcileSandboxCjDispatch = mutation({
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), cjOrderId: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const order = await ctx.db.get(args.orderId);
+    const action = await ctx.db.get(args.actionId);
+    if (!order || !action || order.cjApprovalActionId !== args.actionId || action.status !== "approved" || !order.cjOrderInput) throw new Error("sandbox reconciliation is not authorized");
+    if (args.cjOrderId) {
+      await ctx.db.patch(order._id, { cjOrderId: args.cjOrderId, cjDispatchStatus: "sent", fulfillmentStatus: "sent_to_cj" });
+      await ctx.db.patch(action._id, { status: "executed", resolvedAt: Date.now() });
+      await appendAudit(ctx, { siteId: order.siteId, actionId: args.actionId, event: "cj_sandbox_dispatch_reconciled", detail: { orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, cjOrderId: args.cjOrderId, isSandbox: 1 } });
+      return { state: "found" as const };
+    }
+    await ctx.db.patch(order._id, { cjDispatchStatus: "staged" });
+    await appendAudit(ctx, { siteId: order.siteId, actionId: args.actionId, event: "cj_sandbox_dispatch_reconciled_absent", detail: { orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, retryRequiresNewRun: true } });
+    return { state: "absent" as const };
   },
 });
 

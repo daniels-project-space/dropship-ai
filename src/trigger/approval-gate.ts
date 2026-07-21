@@ -53,8 +53,8 @@ export const approvalGate = task({
         if (decision.approved) {
           await convex.mutation(api.actions.approve, { actionId, approver: decision.approver });
           const action = await convex.query(api.actions.get, { actionId });
-          if (action?.type === "import_sourced_product") {
-            logger.info("approval-gate approved sourced import; awaiting draft-only executor", { actionId });
+          if (action?.type === "import_sourced_product" || action?.type === "dispatch_cj_sandbox_order") {
+            logger.info("approval-gate approved action; awaiting its explicit bounded executor", { actionId, type: action.type });
             return { status: "approved" as const, actionId };
           }
           await convex.mutation(api.actions.markExecuted, {

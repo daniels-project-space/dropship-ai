@@ -1,73 +1,71 @@
-// Order fulfillment loop.
-//  fulfillOrder task: Shopify order in → cj.createOrder (create-only, payType:3) → record to Convex.
-//  handleCjTrackingWebhook: called by the CJ ORDER webhook route → update Convex order tracking
-//    + push tracking to Shopify via fulfillmentTrackingInfoUpdate.
+// Sandbox-only CJ fulfillment loop. Supplier writes are impossible without an immutable order
+// snapshot, its exact approved action, an atomic reservation, and a second adapter-level
+// `isSandbox: 1` boundary.
 import { task, logger } from "@trigger.dev/sdk/v3";
 import { convexClient, api } from "../lib/convexClient";
-import { createOrder, parseOrderWebhook, type CreateOrderInput } from "../lib/cj";
+import { createSandboxOrder, getSandboxOrderByOrderNumber, isAmbiguousCjWriteError, parseOrderWebhook } from "../lib/cj";
 import { fulfillmentTrackingInfoUpdate, type ShopifyClientConfig } from "../lib/shopify";
 import { assertLiveEffectsEnabled, type EffectMode } from "../lib/effects";
 import type { Id } from "../../convex/_generated/dataModel";
 
 export interface FulfillOrderPayload {
-  siteId: string;
-  shopifyOrderId: string;
-  totalUsd: number;
-  cjInput: CreateOrderInput;
-  cjAccessToken?: string; // optional override; else cj.ts resolves from vault/env
-  /** Defaults to sandbox. Live supplier creation requires the deployment-time effects gate. */
-  mode?: EffectMode;
+  /** The single human-gated action which is permanently bound to one input snapshot. */
+  actionId: string;
 }
 
 export const fulfillOrder = task({
   id: "fulfill-order",
-  run: async (payload: FulfillOrderPayload) => {
+  run: async ({ actionId }: FulfillOrderPayload) => {
     const convex = convexClient();
-    const siteId = payload.siteId as Id<"sites">;
-    const mode = payload.mode ?? "sandbox";
-    const idempotencyKey = `cj:${mode}:create:${payload.siteId}:${payload.shopifyOrderId}`;
-    const target = `fulfillment:${payload.siteId}:${payload.shopifyOrderId}`;
-    const traceId = idempotencyKey;
+    // This transaction is the reservation point. It is intentionally before both the outbox
+    // record and every CJ network request, and returns no input unless the reservation succeeds.
+    const claimed = await convex.mutation(api.orders.claimSandboxCjDispatch, { actionId: actionId as Id<"actions"> });
+    if (claimed.state === "reused") return { skipped: true, reason: "already_dispatched", orderId: claimed.orderId, cjOrderId: claimed.cjOrderId };
+    if (claimed.state === "blocked") return { skipped: true, reason: "dispatch_blocked", orderId: claimed.orderId };
 
-    // Persist intent before crossing the CJ boundary. This survives Trigger retries and leaves
-    // an operator-visible trace even when the supplier is unavailable.
-    const queued = await convex.mutation(api.ops.enqueue, {
-      siteId, kind: `cj.${mode}.create_order`, target, idempotencyKey, traceId,
-      payload: { shopifyOrderId: payload.shopifyOrderId, mode },
-    });
-    if (queued.duplicate && queued.status === "delivered") {
-      return { skipped: true, reason: "already delivered", shopifyOrderId: payload.shopifyOrderId };
+    if (claimed.state === "reconcile_required") {
+      // A response loss, timeout, 5xx, or abandoned reservation must be read-reconciled using
+      // the stable custom order number. A negative result only reopens a *later* run.
+      const existing = await getSandboxOrderByOrderNumber(claimed.orderNumber);
+      const reconciled = await convex.mutation(api.orders.reconcileSandboxCjDispatch, {
+        actionId: actionId as Id<"actions">, orderId: claimed.orderId as Id<"orders">,
+        cjOrderId: existing?.orderId,
+      });
+      return { reconciled: reconciled.state, orderId: claimed.orderId, orderNumber: claimed.orderNumber, retryRequired: reconciled.state === "absent" };
     }
+
+    const target = `cj:sandbox:${claimed.orderId}`;
+    const idempotencyKey = `cj:sandbox:create:${claimed.orderId}:${claimed.inputHash}`;
+    const queued = await convex.mutation(api.ops.enqueue, {
+      siteId: claimed.siteId,
+      kind: "cj.sandbox.create_order",
+      target,
+      idempotencyKey,
+      traceId: idempotencyKey,
+      // Never put customer-address input into durable job payloads or traces.
+      payload: { actionId, orderId: claimed.orderId, orderNumber: claimed.orderNumber, inputHash: claimed.inputHash, isSandbox: 1, payType: 3 },
+    });
     const lock = await convex.mutation(api.ops.claimTarget, { target, owner: idempotencyKey, leaseMs: 10 * 60_000 });
-    if (!lock.acquired) return { skipped: true, reason: "target locked", shopifyOrderId: payload.shopifyOrderId };
+    if (!lock.acquired) return { skipped: true, reason: "target_locked", orderId: claimed.orderId };
 
     try {
       await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "processing" });
-      // 1. Record the received order first (idempotent) so we never lose it on a CJ failure.
-      const orderId = await convex.mutation(api.orders.record, { siteId, shopifyOrderId: payload.shopifyOrderId, totalUsd: payload.totalUsd });
-      const existing = await convex.query(api.orders.getByShopifyOrder, { shopifyOrderId: payload.shopifyOrderId });
-      if (existing?.cjOrderId) {
-        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { cjOrderId: existing.cjOrderId, reused: true } });
-        return { orderId, cjOrderId: existing.cjOrderId, shopifyOrderId: payload.shopifyOrderId, reused: true };
-      }
-
-      // 2. The source order number is the stable supplier-side idempotency key. Sandbox mode
-      // never performs a CJ request: it produces a deterministic local supplier reference.
-      if (payload.cjInput.orderNumber !== payload.shopifyOrderId) throw new Error("CJ orderNumber must equal the Shopify order id");
-      const cjResult = mode === "sandbox"
-        ? { orderId: `sandbox-cj:${payload.siteId}:${payload.shopifyOrderId}`, orderNumber: payload.shopifyOrderId }
-        : await (async () => {
-          assertLiveEffectsEnabled(mode);
-          return createOrder(payload.cjInput, payload.cjAccessToken);
-        })();
-      logger.info("cj order created", { mode, shopifyOrderId: payload.shopifyOrderId, cjOrderId: cjResult.orderId, traceId });
-
-      // 3. Stamp the CJ order id + status onto the Convex order.
-      await convex.mutation(api.orders.markSentToCj, { orderId, cjOrderId: cjResult.orderId });
-      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { cjOrderId: cjResult.orderId, mode, zeroCharge: mode === "sandbox" } });
-      return { orderId, cjOrderId: cjResult.orderId, shopifyOrderId: payload.shopifyOrderId, traceId, mode, zeroCharge: mode === "sandbox" };
+      // createSandboxOrder itself hard-codes `isSandbox: 1` and payType:3.
+      const result = await createSandboxOrder(claimed.cjInput);
+      await convex.mutation(api.orders.markSandboxCjDispatched, {
+        actionId: actionId as Id<"actions">, orderId: claimed.orderId as Id<"orders">, cjOrderId: result.orderId,
+      });
+      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "delivered", detail: { orderId: claimed.orderId, cjOrderId: result.orderId, isSandbox: 1, payType: 3, zeroCharge: true } });
+      logger.info("CJ sandbox order created", { actionId, orderId: claimed.orderId, cjOrderId: result.orderId, orderNumber: claimed.orderNumber });
+      return { orderId: claimed.orderId, cjOrderId: result.orderId, orderNumber: claimed.orderNumber, isSandbox: 1, payType: 3, zeroCharge: true };
     } catch (error) {
-      await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: String(error).slice(0, 500) });
+      const message = error instanceof Error ? error.message : "CJ sandbox write failed";
+      if (isAmbiguousCjWriteError(error)) {
+        await convex.mutation(api.orders.markSandboxCjAmbiguous, { actionId: actionId as Id<"actions">, orderId: claimed.orderId as Id<"orders">, reason: message });
+        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: "CJ response ambiguous; reconciliation required before retry" });
+      } else {
+        await convex.mutation(api.ops.markOutbox, { outboxId: queued.outboxId, status: "failed", error: message.slice(0, 500) });
+      }
       throw error;
     } finally {
       await convex.mutation(api.ops.releaseTarget, { target, owner: idempotencyKey });
@@ -77,38 +75,22 @@ export const fulfillOrder = task({
 
 export interface CjWebhookHandlerArgs {
   payload: unknown;
-  // Shopify creds + fulfillmentId required to push tracking back to the storefront.
   shopify?: { cfg: ShopifyClientConfig; fulfillmentId: string };
   mode?: EffectMode;
 }
 
-/**
- * Handle an inbound CJ ORDER webhook. Parses tracking, writes it to Convex, and (if Shopify
- * creds/fulfillmentId are provided) pushes tracking to Shopify. Call this from the webhook route.
- */
+/** Local tracking is idempotent; forwarding remains separately live-effects-gated. */
 export async function handleCjTrackingWebhook(args: CjWebhookHandlerArgs) {
   const convex = convexClient();
   const tracking = parseOrderWebhook(args.payload);
-  if (!tracking.orderNumber) {
-    throw new Error("cj webhook: missing orderNumber — cannot map to a Shopify order");
-  }
-
+  if (!tracking.orderNumber) throw new Error("cj webhook: missing orderNumber — cannot map to a Shopify order");
   await convex.mutation(api.orders.applyTracking, {
-    shopifyOrderId: tracking.orderNumber,
-    trackingNumber: tracking.trackNumber,
-    trackingUrl: tracking.trackingUrl,
-    cjOrderId: tracking.cjOrderId,
-    status: "shipped",
+    shopifyOrderId: tracking.orderNumber, trackingNumber: tracking.trackNumber, trackingUrl: tracking.trackingUrl,
+    cjOrderId: tracking.cjOrderId, status: "shipped",
   });
-
   if (args.shopify && tracking.trackNumber) {
     assertLiveEffectsEnabled(args.mode ?? "sandbox");
-    await fulfillmentTrackingInfoUpdate(args.shopify.cfg, args.shopify.fulfillmentId, {
-      number: tracking.trackNumber,
-      url: tracking.trackingUrl,
-      company: tracking.logisticName,
-    }, false);
+    await fulfillmentTrackingInfoUpdate(args.shopify.cfg, args.shopify.fulfillmentId, { number: tracking.trackNumber, url: tracking.trackingUrl, company: tracking.logisticName }, false);
   }
-
   return { applied: true, orderNumber: tracking.orderNumber, trackNumber: tracking.trackNumber };
 }
