@@ -4,8 +4,8 @@ import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { cjFreightQuoteDigest, cjOrderInputHash, normalizeCjOrderInput, sandboxDispatchDecision, sandboxOrderNumber, stableSha256 } from "../src/lib/cjOrder";
 import { hasVerifiedShopifyCjLineage } from "../src/lib/orderLineageState";
-import { hasValidSandboxCjApprovalBinding } from "../src/lib/sandboxCjBinding";
-import { CJ_STAGING_MAX_ATTEMPTS, cjStagingFailureTransition, cjStagingGenerationFingerprint, hasExactCjStagingGeneration, legacyCjStagingRunnableAt, type CjStagingPhase } from "../src/lib/cjStagingState";
+import { hasCurrentSandboxCjDispatchReceipt, hasValidSandboxCjApprovalBinding } from "../src/lib/sandboxCjBinding";
+import { CJ_STAGING_MAX_ATTEMPTS, CjStagingFailureError, cjStagingFailureTransition, cjStagingGenerationFingerprint, hasExactCjStagingGeneration, legacyCjStagingRunnableAt, type CjStagingPhase } from "../src/lib/cjStagingState";
 
 const fulfillmentStatus = v.union(
   v.literal("received"),
@@ -22,6 +22,7 @@ const cjOrderInput = v.object({
   products: v.array(v.object({ vid: v.string(), quantity: v.number() })),
 });
 const shopifyLine = v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() });
+const sandboxDispatchReceipt = v.object({ actionId: v.id("actions"), orderId: v.id("orders"), inputHash: v.string(), generation: v.number(), generationFingerprint: v.string(), attempt: v.number() });
 
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: sandbox dispatch requires the service runtime");
@@ -186,7 +187,7 @@ export const claimCjStagingPreflight = mutation({
     // Stage and approval-dispatch are independently durable boundaries.  A lost worker must
     // resume the persisted action/key, not declare it complete before the waitpoint is armed.
     if (intent.status === "staged" || intent.status === "approval_dispatching") return { state: "staged" as const, intentId };
-    if (intent.status === "approval_dispatched") return { state: "complete" as const, intentId };
+    if (intent.status === "approval_dispatched" || intent.status === "approval_resolved") return { state: "complete" as const, intentId };
     const now = Date.now();
     if (intent.status === "preflighting" && (intent.leaseExpiresAt ?? 0) > now) return { state: "busy" as const, intentId };
     if (intent.status !== "pending" && intent.status !== "preflighting" && intent.status !== "preflight_required") throw new Error("CJ staging intent is not eligible for preflight");
@@ -196,8 +197,19 @@ export const claimCjStagingPreflight = mutation({
       return { state: "needs_attention" as const, intentId };
     }
     const order = await ctx.db.get(intent.orderId);
-    if (!order || order.siteId !== intent.siteId) throw new Error("CJ staging intent order binding is invalid");
-    const lineage = await resolvePersistedShopifyCjLineage(ctx, intent.siteId, intent.shopifyLines);
+    if (!order || order.siteId !== intent.siteId) {
+      await ctx.db.patch(intentId, { status: "needs_attention", runnableAt: undefined, leaseExpiresAt: undefined, lastError: { code: "invalid_or_unbound_input" }, updatedAt: now });
+      await appendAudit(ctx, { siteId: intent.siteId, event: "cj_staging_needs_attention", detail: { intentId, code: "invalid_or_unbound_input" } });
+      return { state: "needs_attention" as const, intentId };
+    }
+    let lineage;
+    try {
+      lineage = await resolvePersistedShopifyCjLineage(ctx, intent.siteId, intent.shopifyLines);
+    } catch {
+      await ctx.db.patch(intentId, { status: "needs_attention", runnableAt: undefined, leaseExpiresAt: undefined, lastError: { code: "invalid_verified_lineage" }, updatedAt: now });
+      await appendAudit(ctx, { siteId: intent.siteId, event: "cj_staging_needs_attention", detail: { intentId, code: "invalid_verified_lineage" } });
+      return { state: "needs_attention" as const, intentId };
+    }
     const quoteInputDigest = cjFreightQuoteDigest({
       siteId: String(intent.siteId), shopifyOrderId: order.shopifyOrderId, fromCountryCode: lineage.fromCountryCode,
       destinationCountryCode: intent.shipping.shippingCountryCode, shippingZip: intent.shipping.shippingZip,
@@ -237,7 +249,7 @@ export const stageQuotedCjStagingIntent = mutation({
     await requireServiceIdentity(ctx);
     const intent = await ctx.db.get(intentId);
     if (!intent) throw new Error("CJ staging intent not found");
-    if (intent.status === "staged" || intent.status === "approval_dispatching" || intent.status === "approval_dispatched") return { state: "reused" as const, actionId: intent.actionId };
+    if (intent.status === "staged" || intent.status === "approval_dispatching" || intent.status === "approval_dispatched" || intent.status === "approval_resolved") return { state: "reused" as const, actionId: intent.actionId };
     if (intent.status !== "quoted" || !intent.quote || !intent.quoteInputDigest || !intent.quoteProvider) throw new Error("CJ staging needs a persisted freight quote");
     const now = Date.now();
     if (now - intent.quote.quotedAt > CJ_FREIGHT_MAX_AGE_MS) {
@@ -245,10 +257,15 @@ export const stageQuotedCjStagingIntent = mutation({
       return { state: "preflight_required" as const };
     }
     const order = await ctx.db.get(intent.orderId);
-    if (!order || order.siteId !== intent.siteId) throw new Error("CJ staging intent order binding is invalid");
-    const lineage = await resolvePersistedShopifyCjLineage(ctx, intent.siteId, intent.shopifyLines);
+    if (!order || order.siteId !== intent.siteId) throw new CjStagingFailureError("permanent", "invalid_or_unbound_input");
+    let lineage;
+    try {
+      lineage = await resolvePersistedShopifyCjLineage(ctx, intent.siteId, intent.shopifyLines);
+    } catch {
+      throw new CjStagingFailureError("permanent", "invalid_verified_lineage");
+    }
     const digest = cjFreightQuoteDigest({ siteId: String(intent.siteId), shopifyOrderId: order.shopifyOrderId, fromCountryCode: lineage.fromCountryCode, destinationCountryCode: intent.shipping.shippingCountryCode, shippingZip: intent.shipping.shippingZip, products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })), providerEndpoint: intent.quoteProvider.endpoint, providerVersion: intent.quoteProvider.version });
-    if (digest !== intent.quoteInputDigest || intent.quote.fromCountryCode !== lineage.fromCountryCode) throw new Error("CJ freight quote is not bound to current verified lineage");
+    if (digest !== intent.quoteInputDigest || intent.quote.fromCountryCode !== lineage.fromCountryCode) throw new CjStagingFailureError("permanent", "invalid_verified_lineage");
     const orderNumber = sandboxOrderNumber(String(intent.siteId), order.shopifyOrderId);
     const input = normalizeCjOrderInput({ orderNumber, ...intent.shipping, logisticName: intent.quote.logisticName, fromCountryCode: lineage.fromCountryCode, products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })) }, orderNumber);
     const inputHash = cjOrderInputHash(input);
@@ -308,7 +325,7 @@ export const claimCjStagingApprovalDispatch = mutation({
     await requireServiceIdentity(ctx);
     const intent = await ctx.db.get(intentId);
     if (!intent || !intent.actionId) throw new Error("CJ staging approval is not ready");
-    if (intent.status === "approval_dispatched") return { state: "reused" as const, actionId: intent.actionId };
+    if (intent.status === "approval_dispatched" || intent.status === "approval_resolved") return { state: "reused" as const, actionId: intent.actionId };
     const now = Date.now();
     if (intent.status === "approval_dispatching" && (intent.leaseExpiresAt ?? 0) > now) return { state: "busy" as const };
     if (intent.status !== "staged" && intent.status !== "approval_dispatching") throw new Error("CJ staging approval is not ready");
@@ -323,7 +340,12 @@ export const claimCjStagingApprovalDispatch = mutation({
     const leaseGeneration = (intent.leaseGeneration ?? 0) + 1;
     const order = await ctx.db.get(intent.orderId);
     const params = action?.params as Record<string, unknown> | undefined;
-    if (!order || action?.status !== "pending_approval" || params?.generation !== order.cjDispatchGeneration || params?.generationFingerprint !== order.cjDispatchGenerationFingerprint || params?.quoteInputDigest !== order.cjQuoteInputDigest) throw new Error("CJ staging approval generation is stale");
+    if (!order || params?.generation !== order.cjDispatchGeneration || params?.generationFingerprint !== order.cjDispatchGenerationFingerprint || params?.quoteInputDigest !== order.cjQuoteInputDigest) throw new Error("CJ staging approval generation is stale");
+    if (action.status === "approved" || action.status === "rejected") {
+      await ctx.db.patch(intentId, { status: "approval_resolved", leaseExpiresAt: undefined, runnableAt: undefined, updatedAt: now });
+      return { state: "resolved" as const, actionId: intent.actionId };
+    }
+    if (action.status !== "pending_approval") throw new Error("CJ staging approval is no longer pending");
     await ctx.db.patch(intentId, { status: "approval_dispatching", failureCount, leaseGeneration, leaseExpiresAt, runnableAt: leaseExpiresAt, updatedAt: now });
     return { state: "dispatch" as const, actionId: intent.actionId, approvalDispatchKey: action.approvalDispatchKey, leaseGeneration, attempt: intent.attempt };
   },
@@ -339,8 +361,23 @@ export const recordCjStagingApprovalDispatch = mutation({
     // A human may resolve the exact action between Trigger accepting the run and this durable
     // acknowledgement. Same action/key/run is a successful reconciliation, never a new wait.
     if (action.approvalDispatchKey !== approvalDispatchKey || action.approvalRunId !== approvalRunId || action.approvalDispatchStatus !== "dispatched") throw new Error("CJ staging approval completion is not authorized");
-    await ctx.db.patch(intentId, { status: "approval_dispatched", leaseExpiresAt: undefined, runnableAt: undefined, updatedAt: Date.now() });
-    return { ok: true, ignored: false as const };
+    const resolved = action.status === "approved" || action.status === "rejected";
+    await ctx.db.patch(intentId, { status: resolved ? "approval_resolved" : "approval_dispatched", leaseExpiresAt: undefined, runnableAt: undefined, updatedAt: Date.now() });
+    return { ok: true, ignored: false as const, state: resolved ? "resolved" as const : "approval_dispatched" as const };
+  },
+});
+
+/** Close the staging lease when the exact human action resolves during a Trigger retry. */
+export const resolveCjStagingApproval = mutation({
+  args: { intentId: v.id("cjStagingIntents"), actionId: v.id("actions"), approvalDispatchKey: v.string(), leaseGeneration: v.number() },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const intent = await ctx.db.get(args.intentId);
+    const action = await ctx.db.get(args.actionId);
+    if (!intent || !action || intent.actionId !== args.actionId || intent.status !== "approval_dispatching" || intent.leaseGeneration !== args.leaseGeneration) return { ignored: true as const };
+    if (action.approvalDispatchKey !== args.approvalDispatchKey || (action.status !== "approved" && action.status !== "rejected")) return { ignored: true as const };
+    await ctx.db.patch(intent._id, { status: "approval_resolved", leaseExpiresAt: undefined, runnableAt: undefined, updatedAt: Date.now() });
+    return { ignored: false as const, state: "resolved" as const };
   },
 });
 
@@ -350,11 +387,14 @@ export const listDueCjStagingIntents = query({
   handler: async (ctx, { limit }) => {
     await requireServiceIdentity(ctx);
     const now = Date.now();
-    const rows = await ctx.db.query("cjStagingIntents")
-      .withIndex("by_runnable_at", (q: any) => q.gt("runnableAt", 0).lte("runnableAt", now))
-      .order("asc")
-      .take(Math.max(1, Math.min(limit ?? 25, 100)));
-    return rows.filter((intent) => ["pending", "preflight_required", "quoted", "staged", "preflighting", "approval_dispatching"].includes(intent.status)).map(({ _id }) => ({ _id }));
+    const cap = Math.max(1, Math.min(limit ?? 25, 100));
+    // Query each runnable state, rather than taking a mixed runnable index and filtering after
+    // it. More than one page of malformed terminal rows can therefore never starve valid work.
+    const phases = ["pending", "preflight_required", "quoted", "staged", "preflighting", "approval_dispatching"] as const;
+    const pages = await Promise.all(phases.map((status) => ctx.db.query("cjStagingIntents")
+      .withIndex("by_status_runnable_at", (q: any) => q.eq("status", status).gt("runnableAt", 0).lte("runnableAt", now))
+      .order("asc").take(cap)));
+    return pages.flat().sort((a, b) => (a.runnableAt ?? 0) - (b.runnableAt ?? 0)).slice(0, cap).map(({ _id }) => ({ _id }));
   },
 });
 
@@ -364,7 +404,7 @@ export const recordCjStagingFailure = mutation({
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const intent = await ctx.db.get(args.intentId);
-    if (!intent || ["approval_dispatched", "needs_attention", "failed"].includes(intent.status) || intent.status !== args.expectedPhase || intent.attempt !== args.expectedAttempt || intent.leaseGeneration !== args.leaseGeneration) return { ignored: true as const };
+    if (!intent || ["approval_dispatched", "approval_resolved", "needs_attention", "failed"].includes(intent.status) || intent.status !== args.expectedPhase || intent.attempt !== args.expectedAttempt || intent.leaseGeneration !== args.leaseGeneration) return { ignored: true as const };
     const now = Date.now();
     const failureCount = (intent.failureCount ?? intent.workerAttempt ?? 0) + 1;
     const transition = cjStagingFailureTransition(now, failureCount, args.kind, intent.status as CjStagingPhase);
@@ -374,8 +414,8 @@ export const recordCjStagingFailure = mutation({
   },
 });
 
-const CJ_STAGING_ROLLOUT_VERSION = "lease-fencing-v1";
-const CJ_STAGING_ROLLOUT_PHASES = ["pending", "preflight_required", "quoted", "staged", "preflighting", "approval_dispatching"] as const;
+const CJ_STAGING_ROLLOUT_VERSION = "lease-fencing-v2";
+const CJ_STAGING_RUNNABLE_PHASES = ["pending", "preflight_required", "quoted", "staged", "preflighting", "approval_dispatching"] as const;
 
 /** Bounded, resumable optional-field rollout. Completed versions perform no status-index reads. */
 export const reconcileLegacyCjStagingIntents = mutation({
@@ -390,24 +430,28 @@ export const reconcileLegacyCjStagingIntents = mutation({
       marker = await ctx.db.get(markerId);
     }
     if (!marker || marker.completed) return { repaired: 0, completed: true as const };
-    const status = CJ_STAGING_ROLLOUT_PHASES[marker.phase];
-    if (!status) {
-      await ctx.db.patch(marker._id, { completed: true, updatedAt: now });
-      return { repaired: 0, completed: true as const };
-    }
-    const page = await ctx.db.query("cjStagingIntents").withIndex("by_status", (q: any) => q.eq("status", status)).paginate({ cursor: marker.cursor ?? null, numItems: cap });
-    const rows = page.page.filter((intent) => intent.runnableAt === undefined);
-    for (const intent of rows) {
-      const runnableAt = legacyCjStagingRunnableAt(status, intent.leaseExpiresAt, now);
-      await ctx.db.patch(intent._id, { runnableAt, leaseGeneration: intent.leaseGeneration ?? 0, failureCount: intent.failureCount ?? intent.workerAttempt ?? 0, updatedAt: now });
+    // One immutable creation-order cursor means a concurrent phase transition cannot jump over
+    // a later status cursor. New writes already carry the fields, so completion has no fan-out.
+    const page = await ctx.db.query("cjStagingIntents").withIndex("by_created_at").order("asc").paginate({ cursor: marker.cursor ?? null, numItems: cap });
+    let repaired = 0;
+    for (const intent of page.page) {
+      if (CJ_STAGING_RUNNABLE_PHASES.includes(intent.status as any)) {
+        const patch: Record<string, unknown> = {};
+        if (intent.runnableAt === undefined) patch.runnableAt = legacyCjStagingRunnableAt(intent.status as CjStagingPhase, intent.leaseExpiresAt, now);
+        if (intent.leaseGeneration === undefined) patch.leaseGeneration = 0;
+        if (intent.failureCount === undefined) patch.failureCount = intent.workerAttempt ?? 0;
+        if (Object.keys(patch).length) { patch.updatedAt = now; await ctx.db.patch(intent._id, patch); repaired++; }
+      } else if (intent.runnableAt !== undefined) {
+        await ctx.db.patch(intent._id, { runnableAt: undefined, leaseExpiresAt: undefined, updatedAt: now });
+        repaired++;
+      }
     }
     if (page.isDone) {
-      const nextPhase = marker.phase + 1;
-      await ctx.db.patch(marker._id, { phase: nextPhase, cursor: undefined, completed: nextPhase >= CJ_STAGING_ROLLOUT_PHASES.length, updatedAt: now });
+      await ctx.db.patch(marker._id, { cursor: undefined, completed: true, updatedAt: now });
     } else {
       await ctx.db.patch(marker._id, { cursor: page.continueCursor, updatedAt: now });
     }
-    return { repaired: rows.length, completed: false as const, phase: marker.phase };
+    return { repaired, completed: false as const, phase: marker.phase };
   },
 });
 
@@ -443,24 +487,26 @@ export const claimSandboxCjDispatch = mutation({
     // or CJ id never gets to reuse this success path.
     if (action.status === "executed" && order.cjDispatchStatus === "sent" && order.cjOrderId) return { state: "reused" as const, siteId: order.siteId, orderId: order._id, cjOrderId: order.cjOrderId, orderNumber: order.cjOrderInput.orderNumber };
     if (action.status !== "approved") throw new Error("CJ sandbox dispatch needs its exact approved action");
+    const currentReceipt = () => ({ actionId, orderId: order._id, inputHash: order.cjOrderInputHash!, generation: order.cjDispatchGeneration!, generationFingerprint: order.cjDispatchGenerationFingerprint!, attempt: order.cjDispatchAttempt ?? 0 });
     const decision = sandboxDispatchDecision(order.cjDispatchStatus);
     if (decision === "reused") return { state: "reused" as const, siteId: order.siteId, orderId: order._id, cjOrderId: order.cjOrderId, orderNumber: order.cjOrderInput.orderNumber };
-    if (decision === "reconcile") return { state: "reconcile_required" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber };
+    if (decision === "reconcile") return { state: "reconcile_required" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, receipt: currentReceipt() };
     if (decision === "blocked") return { state: "blocked" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber };
     const attempt = (order.cjDispatchAttempt ?? 0) + 1;
     await ctx.db.patch(order._id, { cjDispatchStatus: "reserved", cjDispatchAttempt: attempt });
     await appendAudit(ctx, { siteId: order.siteId, actionId, event: "cj_sandbox_dispatch_reserved", detail: { orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, isSandbox: 1 } });
-    return { state: "reserved" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, inputHash: order.cjOrderInputHash, attempt, cjInput: order.cjOrderInput };
+    const receipt = { ...currentReceipt(), attempt };
+    return { state: "reserved" as const, siteId: order.siteId, orderId: order._id, orderNumber: order.cjOrderInput.orderNumber, inputHash: order.cjOrderInputHash, attempt, receipt, cjInput: order.cjOrderInput };
   },
 });
 
 export const markSandboxCjDispatched = mutation({
-  args: { actionId: v.id("actions"), orderId: v.id("orders"), cjOrderId: v.string() },
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), cjOrderId: v.string(), receipt: sandboxDispatchReceipt },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const order = await ctx.db.get(args.orderId);
     const action = await ctx.db.get(args.actionId);
-    if (!order || !action || order.cjApprovalActionId !== args.actionId) throw new Error("sandbox dispatch completion is not authorized");
+    if (!order || !action || order.cjApprovalActionId !== args.actionId || !hasCurrentSandboxCjDispatchReceipt({ ...args, action, order })) return { ignored: true as const };
     if (order.cjDispatchStatus === "sent" && action.status === "executed" && order.cjOrderId === args.cjOrderId) return { orderId: order._id, reused: true };
     if (action.status !== "approved" || order.cjDispatchStatus !== "reserved") throw new Error("sandbox dispatch completion is not authorized");
     await ctx.db.patch(order._id, { cjOrderId: args.cjOrderId, cjOrderNumber: order.cjOrderInput?.orderNumber, cjDispatchStatus: "sent", fulfillmentStatus: "sent_to_cj" });
@@ -471,11 +517,12 @@ export const markSandboxCjDispatched = mutation({
 });
 
 export const markSandboxCjAmbiguous = mutation({
-  args: { actionId: v.id("actions"), orderId: v.id("orders"), reason: v.string() },
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), reason: v.string(), receipt: sandboxDispatchReceipt },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const order = await ctx.db.get(args.orderId);
-    if (!order || order.cjApprovalActionId !== args.actionId) throw new Error("sandbox dispatch ambiguity is not authorized");
+    const action = await ctx.db.get(args.actionId);
+    if (!order || !action || order.cjApprovalActionId !== args.actionId || !hasCurrentSandboxCjDispatchReceipt({ ...args, action, order })) return { ignored: true as const };
     if (order.cjDispatchStatus === "sent") return { orderId: order._id, reused: true };
     if (order.cjDispatchStatus !== "reserved") throw new Error("sandbox dispatch ambiguity is not authorized");
     await ctx.db.patch(order._id, { cjDispatchStatus: "ambiguous" });
@@ -486,12 +533,12 @@ export const markSandboxCjAmbiguous = mutation({
 
 /** Reconciliation may either bind a confirmed sandbox order or explicitly reopen a later retry. */
 export const reconcileSandboxCjDispatch = mutation({
-  args: { actionId: v.id("actions"), orderId: v.id("orders"), cjOrderId: v.optional(v.string()) },
+  args: { actionId: v.id("actions"), orderId: v.id("orders"), cjOrderId: v.optional(v.string()), receipt: sandboxDispatchReceipt },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const order = await ctx.db.get(args.orderId);
     const action = await ctx.db.get(args.actionId);
-    if (!order || !action || order.cjApprovalActionId !== args.actionId || !order.cjOrderInput) throw new Error("sandbox reconciliation is not authorized");
+    if (!order || !action || order.cjApprovalActionId !== args.actionId || !order.cjOrderInput || !hasCurrentSandboxCjDispatchReceipt({ ...args, action, order })) return { state: "ignored" as const };
     if (order.cjDispatchStatus === "sent" && action.status === "executed") return { state: "found" as const, reused: true };
     if (action.status !== "approved" || (order.cjDispatchStatus !== "reserved" && order.cjDispatchStatus !== "ambiguous")) throw new Error("sandbox reconciliation is not authorized");
     if (args.cjOrderId) {
@@ -508,18 +555,6 @@ export const reconcileSandboxCjDispatch = mutation({
   },
 });
 
-// Mark an order as dispatched to CJ (after cj.createOrder).
-export const markSentToCj = mutation({
-  args: { orderId: v.id("orders"), cjOrderId: v.string() },
-  handler: async (ctx, { orderId, cjOrderId }) => {
-    const order = await ctx.db.get(orderId);
-    if (!order) throw new Error(`order ${orderId} not found`);
-    await ctx.db.patch(orderId, { cjOrderId, fulfillmentStatus: "sent_to_cj" });
-    await appendAudit(ctx, { siteId: order.siteId, event: "order_sent_to_cj", detail: { orderId, cjOrderId } });
-    return orderId;
-  },
-});
-
 // Apply tracking from the CJ ORDER webhook. CJ orderNumber is a dedicated indexed identity,
 // never a Shopify id; this prevents an arbitrary provider value mapping another order.
 export const applyTracking = mutation({
@@ -531,6 +566,7 @@ export const applyTracking = mutation({
     status: v.optional(fulfillmentStatus),
   },
   handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
     const order = await ctx.db
       .query("orders")
       .withIndex("by_cj_order_number", (q) => q.eq("cjOrderNumber", args.cjOrderNumber))

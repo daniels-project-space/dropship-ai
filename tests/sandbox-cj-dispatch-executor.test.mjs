@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { executeSandboxCjDispatch } from "../src/lib/sandboxCjDispatchExecutor.ts";
 
-const reserved = { state: "reserved", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1", inputHash: "hash-1", attempt: 1, cjInput: { logisticName: "Quoted Route", fromCountryCode: "US" } };
+const receipt = { actionId: "action-1", orderId: "order-1", inputHash: "hash-1", generation: 1, generationFingerprint: "f".repeat(64), attempt: 1 };
+const reserved = { state: "reserved", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1", inputHash: "hash-1", attempt: 1, receipt, cjInput: { logisticName: "Quoted Route", fromCountryCode: "US" } };
 
 function harness(claims = [reserved], overrides = {}) {
   const calls = [];
@@ -37,19 +38,19 @@ test("actual Trigger executor claims once before its only CJ create call and dup
 });
 
 test("ambiguous CJ response requires a read reconciliation; found completes without another create", async () => {
-  const run = harness([{ state: "reconcile_required", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1" }], {
+  const run = harness([{ state: "reconcile_required", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1", receipt }], {
     findByOrderNumber: async () => ({ orderId: "cj-1" }),
     reconcile: async (input) => { run.calls.push(["reconcile", input]); return { state: "found" }; },
   });
   const result = await executeSandboxCjDispatch(run.deps);
   assert.deepEqual(result, { reconciled: "found", orderId: "order-1", orderNumber: "dsa-sb-1" });
   assert.equal(run.calls.some((entry) => Array.isArray(entry) && entry[0] === "create"), false);
-  assert.deepEqual(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "reconcile")[0][1], { orderId: "order-1", cjOrderId: "cj-1" });
+  assert.deepEqual(run.calls.filter((entry) => Array.isArray(entry) && entry[0] === "reconcile")[0][1], { orderId: "order-1", cjOrderId: "cj-1", receipt });
 });
 
 test("reconciliation absent fences exactly one new continuation before the only create", async () => {
   const resumed = { ...reserved, attempt: 2 };
-  const run = harness([{ state: "reconcile_required", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1" }, resumed]);
+  const run = harness([{ state: "reconcile_required", siteId: "site-1", orderId: "order-1", orderNumber: "dsa-sb-1", receipt }, resumed]);
   await executeSandboxCjDispatch(run.deps);
   assert.equal(run.calls.filter((entry) => entry === "claim").length, 2);
   const enqueue = run.calls.find((entry) => Array.isArray(entry) && entry[0] === "enqueue")[1];

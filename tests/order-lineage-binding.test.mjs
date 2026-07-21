@@ -31,4 +31,8 @@ test("Convex approval reducer rejects wrong action, order, site, logistics, and 
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, logisticName: "unverified" } }, order }), false);
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, generation: 1 } }, order }), false);
   assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, quoteInputDigest: "quote-b" } }, order }), false);
+  assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, logisticsQuotedAt: 124 } }, order }), false);
+  assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, logisticsQuotedPriceUsd: 4.6 } }, order }), false);
+  assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, fromCountryCode: "CN" } }, order }), false);
+  assert.equal(hasValidSandboxCjApprovalBinding({ actionId: "action-a", action: { ...action, params: { ...action.params, isSandbox: 0 } }, order }), false);
 });

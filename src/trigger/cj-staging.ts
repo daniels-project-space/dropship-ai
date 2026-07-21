@@ -25,8 +25,10 @@ export async function processCjStagingIntent({ intentId }: CjStagingPayload) {
     // does not log it or put it into a task payload, trace, audit row, or outbox.
     quote: async (input) => selectVerifiedCjFreight(await quoteCjFreight(input)),
     recordQuote: async (quote) => {
-      await convex.mutation(api.orders.recordCjStagingQuote, { intentId: intentId as Id<"cjStagingIntents">, ...quote });
+      const recorded: any = await convex.mutation(api.orders.recordCjStagingQuote, { intentId: intentId as Id<"cjStagingIntents">, ...quote });
+      if (recorded.ignored) return recorded;
       failureFence = { expectedPhase: "quoted", expectedAttempt: quote.attempt, leaseGeneration: quote.leaseGeneration };
+      return recorded;
     },
     stage: () => convex.mutation(api.orders.stageQuotedCjStagingIntent, { intentId: intentId as Id<"cjStagingIntents"> }) as any,
     claimApproval: async () => {
@@ -46,7 +48,8 @@ export async function processCjStagingIntent({ intentId }: CjStagingPayload) {
         throw error;
       }
     },
-    recordApproval: async ({ actionId, approvalDispatchKey, approvalRunId, leaseGeneration }) => { await convex.mutation(api.orders.recordCjStagingApprovalDispatch, { intentId: intentId as Id<"cjStagingIntents">, actionId: actionId as Id<"actions">, approvalDispatchKey, approvalRunId, leaseGeneration }); },
+    recordApproval: ({ actionId, approvalDispatchKey, approvalRunId, leaseGeneration }) => convex.mutation(api.orders.recordCjStagingApprovalDispatch, { intentId: intentId as Id<"cjStagingIntents">, actionId: actionId as Id<"actions">, approvalDispatchKey, approvalRunId, leaseGeneration }) as any,
+    resolveApproval: ({ actionId, approvalDispatchKey, leaseGeneration }) => convex.mutation(api.orders.resolveCjStagingApproval, { intentId: intentId as Id<"cjStagingIntents">, actionId: actionId as Id<"actions">, approvalDispatchKey, leaseGeneration }) as any,
     });
     if (result.state === "approval_dispatched") logger.info("CJ staging intent processed", { intentId, actionId: result.actionId });
     return { intentId, ...result };

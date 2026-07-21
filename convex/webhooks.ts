@@ -13,6 +13,10 @@ const fulfillmentStatus = v.union(
 const RANK = { received: 0, sent_to_cj: 1, shipped: 2, delivered: 3, error: 0 } as const;
 type FulfillmentStatus = keyof typeof RANK;
 
+async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }) {
+  if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: webhook intake requires the service runtime");
+}
+
 export const recordShopifyOrder = mutation({
   args: {
     siteId: v.id("sites"), deliveryId: v.string(), topic: v.string(), payloadHash: v.string(),
@@ -23,6 +27,7 @@ export const recordShopifyOrder = mutation({
     })),
   },
   handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
     const prior = await ctx.db.query("webhookReceipts")
       .withIndex("by_provider_site_delivery", (q) => q.eq("provider", "shopify").eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
     const receiptDecision = shopifyReceiptDecision(prior, args);
@@ -110,6 +115,7 @@ export const recordCjTracking = mutation({
     cjOrderNumber: v.string(), trackingNumber: v.optional(v.string()), trackingUrl: v.optional(v.string()), cjOrderId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
     const prior = await ctx.db.query("webhookReceipts")
       .withIndex("by_provider_site_delivery", (q) => q.eq("provider", "cj").eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
     if (webhookDeliveryDecision(prior) === "duplicate") return { duplicate: true, outcome: prior!.outcome };

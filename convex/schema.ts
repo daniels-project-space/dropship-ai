@@ -243,7 +243,7 @@ export default defineSchema({
     orderId: v.id("orders"),
     deliveryId: v.string(),
     payloadHash: v.string(),
-    status: v.union(v.literal("pending"), v.literal("preflighting"), v.literal("quoted"), v.literal("preflight_required"), v.literal("staged"), v.literal("approval_dispatching"), v.literal("approval_dispatched"), v.literal("needs_attention"), v.literal("failed")),
+    status: v.union(v.literal("pending"), v.literal("preflighting"), v.literal("quoted"), v.literal("preflight_required"), v.literal("staged"), v.literal("approval_dispatching"), v.literal("approval_dispatched"), v.literal("approval_resolved"), v.literal("needs_attention"), v.literal("failed")),
     attempt: v.number(),
     // Monotonic lease fence. It is independent from the bounded failure budget so a replayed
     // claim can never consume a retry and a stale worker can never mutate a newer lease.
@@ -268,7 +268,7 @@ export default defineSchema({
     actionId: v.optional(v.id("actions")),
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_site_status", ["siteId", "status"]).index("by_status", ["status"]).index("by_runnable_at", ["runnableAt"]).index("by_status_runnable_at", ["status", "runnableAt"]).index("by_order", ["orderId"]).index("by_site_delivery", ["siteId", "deliveryId"]),
+  }).index("by_site_status", ["siteId", "status"]).index("by_status", ["status"]).index("by_runnable_at", ["runnableAt"]).index("by_status_runnable_at", ["status", "runnableAt"]).index("by_created_at", ["createdAt"]).index("by_order", ["orderId"]).index("by_site_delivery", ["siteId", "deliveryId"]),
 
   // A singleton, versioned rollout cursor. Once complete, sweeps never fan out through legacy
   // status indexes again; a future migration uses a new version row.

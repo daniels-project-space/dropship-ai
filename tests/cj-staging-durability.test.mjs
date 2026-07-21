@@ -5,7 +5,7 @@ import { cjFreightQuoteDigest } from "../src/lib/cjOrder.ts";
 import { CJ_STAGING_MAX_ATTEMPTS, CjStagingFailureError, classifyCjStagingFailure, cjStagingFailureTransition, cjStagingGenerationFingerprint, cjStagingRetryAt, hasExactCjStagingGeneration, legacyCjStagingRunnableAt, stagingInputDuplicateDecision } from "../src/lib/cjStagingState.ts";
 
 function worker(overrides = {}) {
-  const calls = { quote: 0, recordQuote: 0, stage: 0, trigger: 0, recordApproval: 0 };
+  const calls = { quote: 0, recordQuote: 0, stage: 0, trigger: 0, recordApproval: 0, resolveApproval: 0 };
   const deps = {
     claimPreflight: async () => ({ state: "preflight", attempt: 1, leaseGeneration: 1, quoteInputDigest: "digest", fromCountryCode: "US", destinationCountryCode: "US", shippingZip: "90210", products: [{ vid: "v1", quantity: 1 }] }),
     quote: async () => { calls.quote++; return { logisticName: "USPS", logisticPriceUsd: 5 }; },
@@ -15,6 +15,7 @@ function worker(overrides = {}) {
     beginApproval: async () => ({ status: "dispatching" }),
     triggerApproval: async () => { calls.trigger++; return "run-1"; },
     recordApproval: async () => { calls.recordApproval++; },
+    resolveApproval: async () => { calls.resolveApproval++; },
     now: () => 1,
     ...overrides,
   };
@@ -27,7 +28,7 @@ test("durable semantic duplicate intake has no CJ or Trigger surface", async () 
   assert.equal(stagingInputDuplicateDecision("digest-a", "digest-b"), "needs_attention");
   const { calls, deps } = worker();
   await executeCjStaging(deps);
-  assert.deepEqual(calls, { quote: 1, recordQuote: 1, stage: 1, trigger: 1, recordApproval: 1 });
+  assert.deepEqual(calls, { quote: 1, recordQuote: 1, stage: 1, trigger: 1, recordApproval: 1, resolveApproval: 0 });
 });
 
 test("bounded retry transitions are due once, then terminal; permanent inputs need attention", () => {
@@ -56,7 +57,7 @@ test("failure after durable intake retries in the worker, and a persisted quote 
 test("concurrent fenced worker sees busy and cannot double stage or dispatch", async () => {
   const { calls, deps } = worker({ claimPreflight: async () => ({ state: "busy" }) });
   assert.deepEqual(await executeCjStaging(deps), { state: "busy" });
-  assert.deepEqual(calls, { quote: 0, recordQuote: 0, stage: 0, trigger: 0, recordApproval: 0 });
+  assert.deepEqual(calls, { quote: 0, recordQuote: 0, stage: 0, trigger: 0, recordApproval: 0, resolveApproval: 0 });
 });
 
 test("a stale quote re-enters explicit preflight and cannot arm or execute approval", async () => {
@@ -78,6 +79,24 @@ test("an ambiguous Trigger response cannot mark the intent dispatched", async ()
   const { calls, deps } = worker({ triggerApproval: async () => { calls.trigger++; throw new Error("response lost"); } });
   await assert.rejects(() => executeCjStaging(deps), /response lost/);
   assert.equal(calls.recordApproval, 0);
+});
+
+test("stale quote and approval acknowledgements stop the real executor immediately", async () => {
+  const staleQuote = worker({ recordQuote: async () => { staleQuote.calls.recordQuote++; return { ignored: true }; } });
+  assert.deepEqual(await executeCjStaging(staleQuote.deps), { state: "stale" });
+  assert.equal(staleQuote.calls.stage, 0);
+  assert.equal(staleQuote.calls.trigger, 0);
+
+  const staleApproval = worker({ recordApproval: async () => { staleApproval.calls.recordApproval++; return { ignored: true }; } });
+  assert.deepEqual(await executeCjStaging(staleApproval.deps), { state: "stale" });
+  assert.equal(staleApproval.calls.trigger, 1);
+});
+
+test("a resolved approval closes the claimed staging lease instead of leaving it runnable", async () => {
+  const resolved = worker({ beginApproval: async () => ({ status: "resolved" }) });
+  assert.deepEqual(await executeCjStaging(resolved.deps), { state: "resolved" });
+  assert.equal(resolved.calls.resolveApproval, 1);
+  assert.equal(resolved.calls.trigger, 0);
 });
 
 test("crash boundaries resume the persisted stage/action rather than re-quoting or replacing it", async () => {

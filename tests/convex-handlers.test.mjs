@@ -3,7 +3,8 @@ import test from "node:test";
 import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";
-import { cjStagingInputDigest } from "../src/lib/cjOrder.ts";
+import { cjOrderInputHash, cjStagingInputDigest } from "../src/lib/cjOrder.ts";
+import { cjStagingGenerationFingerprint } from "../src/lib/cjStagingState.ts";
 
 const modules = {
   "../convex/orders.ts": () => import("../convex/orders.ts"),
@@ -24,6 +25,23 @@ async function seed(t, status = "pending", runnableAt = 1) {
     const orderId = await ctx.db.insert("orders", { siteId, shopifyOrderId: "gid://shopify/Order/1", totalUsd: 50, fulfillmentStatus: "received", createdAt: 1 });
     const intentId = await ctx.db.insert("cjStagingIntents", { siteId, orderId, deliveryId: "delivery-a", payloadHash: "hash-a", status, attempt: 1, leaseGeneration: 2, failureCount: 0, runnableAt, shipping, shopifyLines: lines, stagingInputDigest: cjStagingInputDigest({ shipping, shopifyLines: lines }), createdAt: 1, updatedAt: 1 });
     return { siteId, orderId, intentId };
+  });
+}
+
+async function seedApprovedDispatch(t) {
+  return t.run(async (ctx) => {
+    const now = Date.now();
+    const siteId = await ctx.db.insert("sites", { name: "Dispatch", niche: "test", status: "active", minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual", createdAt: now });
+    const orderId = await ctx.db.insert("orders", { siteId, shopifyOrderId: "gid://shopify/Order/dispatch", totalUsd: 50, fulfillmentStatus: "received", createdAt: now });
+    const cjOrderInput = { orderNumber: "dsa-sb-dispatch", ...shipping, logisticName: "USPS", fromCountryCode: "US", products: [{ vid: "v1", quantity: 1 }] };
+    const inputHash = cjOrderInputHash(cjOrderInput);
+    const quoteInputDigest = "q".repeat(64);
+    const preflight = { logisticName: "USPS", fromCountryCode: "US", quotedAt: now, quotedPriceUsd: 5 };
+    const generation = 1;
+    const generationFingerprint = cjStagingGenerationFingerprint({ generation, inputHash, quoteInputDigest, ...preflight });
+    const actionId = await ctx.db.insert("actions", { siteId, type: "dispatch_cj_sandbox_order", riskTier: "human_gated", status: "approved", params: { orderId, orderNumber: cjOrderInput.orderNumber, inputHash, generation, generationFingerprint, quoteInputDigest, isSandbox: 1, payType: 3, logisticName: "USPS", fromCountryCode: "US", logisticsQuotedAt: now, logisticsQuotedPriceUsd: 5 }, rationale: "test", proposedAt: now });
+    await ctx.db.patch(orderId, { cjOrderInput, cjLogisticsPreflight: preflight, cjOrderInputHash: inputHash, cjOrderNumber: cjOrderInput.orderNumber, cjDispatchGeneration: generation, cjDispatchGenerationFingerprint: generationFingerprint, cjQuoteInputDigest: quoteInputDigest, cjApprovalActionId: actionId, cjDispatchStatus: "staged", cjDispatchAttempt: 0 });
+    return { siteId, orderId, actionId };
   });
 }
 
@@ -86,4 +104,55 @@ test("Convex rollout is resumable and completion stops legacy status fan-out", a
   for (let n = 0; n < 8 && !result.completed; n++) result = await service(t).mutation(api.orders.reconcileLegacyCjStagingIntents, { limit: 25 });
   assert.equal(result.completed, true);
   assert.deepEqual(await service(t).mutation(api.orders.reconcileLegacyCjStagingIntents, { limit: 25 }), { repaired: 0, completed: true });
+});
+
+test("final CJ provider writers reject stale immutable reservation receipts", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId, actionId } = await seedApprovedDispatch(t);
+  await assert.rejects(() => t.mutation(api.orders.claimSandboxCjDispatch, { actionId }), /UNAUTHENTICATED/);
+  const claim = await service(t).mutation(api.orders.claimSandboxCjDispatch, { actionId });
+  assert.equal(claim.state, "reserved");
+  assert.equal(claim.receipt.attempt, 1);
+  // Simulate a newer reservation after reconciliation. A late worker from attempt 1 may not
+  // mark success, ambiguity, or reconciliation on attempt 2.
+  await t.run((ctx) => ctx.db.patch(orderId, { cjDispatchAttempt: 2 }));
+  const complete = await service(t).mutation(api.orders.markSandboxCjDispatched, { actionId, orderId, cjOrderId: "cj-old", receipt: claim.receipt });
+  const ambiguous = await service(t).mutation(api.orders.markSandboxCjAmbiguous, { actionId, orderId, reason: "lost", receipt: claim.receipt });
+  const reconcile = await service(t).mutation(api.orders.reconcileSandboxCjDispatch, { actionId, orderId, receipt: claim.receipt });
+  assert.equal(complete.ignored, true);
+  assert.equal(ambiguous.ignored, true);
+  assert.equal(reconcile.state, "ignored");
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  assert.equal(order.cjDispatchStatus, "reserved");
+  assert.equal(order.cjOrderId, undefined);
+});
+
+test("provider intake and tracking handlers require the service identity", async () => {
+  const t = convexTest({ schema, modules });
+  const { orderId } = await seedApprovedDispatch(t);
+  const order = await t.run((ctx) => ctx.db.get(orderId));
+  await assert.rejects(() => t.mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" }), /UNAUTHENTICATED/);
+  await assert.rejects(() => t.mutation(api.webhooks.recordCjTracking, { siteId: order.siteId, deliveryId: "d", topic: "ORDER", payloadHash: "h", cjOrderNumber: order.cjOrderNumber }), /UNAUTHENTICATED/);
+});
+
+test("approval resolution races close the same claimed intent without re-arming it", async () => {
+  const t = convexTest({ schema, modules });
+  const { siteId, orderId, actionId } = await seedApprovedDispatch(t);
+  const now = Date.now();
+  await t.run(async (ctx) => {
+    await ctx.db.patch(actionId, { status: "pending_approval", approvalDispatchKey: "approval:test", approvalDispatchStatus: "pending" });
+    await ctx.db.insert("cjStagingIntents", { siteId, orderId, deliveryId: "approval-race", payloadHash: "approval-race", status: "staged", actionId, attempt: 1, leaseGeneration: 1, failureCount: 0, runnableAt: now, shipping, shopifyLines: lines, createdAt: now, updatedAt: now });
+  });
+  const intent = await t.run((ctx) => ctx.db.query("cjStagingIntents").withIndex("by_order", (q) => q.eq("orderId", orderId)).first());
+  const claim = await service(t).mutation(api.orders.claimCjStagingApprovalDispatch, { intentId: intent._id });
+  assert.equal(claim.state, "dispatch");
+  // This models a human approval between the durable claim and beginApproval/retry.
+  await t.run((ctx) => ctx.db.patch(actionId, { status: "approved", resolvedAt: Date.now() }));
+  const closed = await service(t).mutation(api.orders.resolveCjStagingApproval, { intentId: intent._id, actionId, approvalDispatchKey: "approval:test", leaseGeneration: claim.leaseGeneration });
+  assert.equal(closed.ignored, false);
+  const terminal = await t.run((ctx) => ctx.db.get(intent._id));
+  assert.equal(terminal.status, "approval_resolved");
+  assert.equal(terminal.runnableAt, undefined);
+  assert.equal(terminal.leaseExpiresAt, undefined);
+  assert.equal((await service(t).mutation(api.orders.claimCjStagingApprovalDispatch, { intentId: intent._id })).state, "reused");
 });
