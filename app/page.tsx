@@ -53,7 +53,7 @@ function PortfolioInner() {
             </h1>
             <p className="mt-5 max-w-xl text-[15px] leading-relaxed text-ink-dim">
               {isAll
-                ? "Live performance across every brand-site — revenue, organic reach, conversion and the content-fit gate. The brain proposes; you approve what carries money or ban-risk."
+                ? "Verified performance across every brand-site — revenue, organic reach, conversion and the content-fit gate. The brain proposes; you approve what carries money or ban-risk."
                 : "Scoped performance for this brand. Switch back to the full fleet from the brand selector."}
             </p>
           </div>

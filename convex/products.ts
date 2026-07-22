@@ -32,7 +32,6 @@ export const upsert = mutation({
     shippingUsd: v.number(),
     priceUsd: v.number(),
     cjFromUsWarehouse: v.boolean(),
-    shopifyProductId: v.optional(v.string()),
     cjProductId: v.optional(v.string()),
     contributionMarginPct: v.optional(v.number()),
     status: v.optional(productStatus),
@@ -401,7 +400,15 @@ export const completeApprovedShopifyDraftImport = mutation({
     if (!trace) throw new Error("draft import trace is missing");
     const now = Date.now();
     if (!args.shopifyProductId.startsWith("gid://shopify/Product/") || !args.shopifyVariantId.startsWith("gid://shopify/ProductVariant/")) throw new Error("Shopify draft import returned invalid product or variant identity");
-    await ctx.db.patch(args.productId, { shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, shopifyDraftImportStatus: "created" });
+    await ctx.db.patch(args.productId, {
+      shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId,
+      shopifyDraftImportStatus: "created", shopifyObservedAt: now,
+      shopifyEconomicsSnapshotAttemptId: undefined, shopifyEconomicsExcludedAt: now,
+    });
+    const site = await ctx.db.get(args.siteId);
+    if (site?.shopifyEconomicsSyncStatus === "current") {
+      await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
+    }
     await ctx.db.patch(args.actionId, { status: "executed", resolvedAt: now });
     const traceDetail = typeof trace.detail === "object" && trace.detail !== null ? trace.detail as Record<string, unknown> : {};
     await ctx.db.patch(trace._id, { status: "succeeded", detail: { ...traceDetail, productId: args.productId, actionId: args.actionId, evidenceId: product.cjEvidenceId, shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, published: false }, finishedAt: now });
@@ -428,65 +435,6 @@ export const markApprovedShopifyDraftImportAmbiguous = mutation({
     }
     await appendAudit(ctx, { siteId: args.siteId, actionId: args.actionId, event: "shopify_draft_import_ambiguous", detail: { productId: args.productId, traceId: args.traceId, reconcileRequired: true } });
     return args.productId;
-  },
-});
-
-// Bulk idempotent upsert of REAL Shopify products (keyed on siteId + shopifyProductId).
-// cogsUsd/shippingUsd stay 0 (unknown until CJ sourcing) and contributionMarginPct is left
-// undefined; the dashboard derives a price-only margin when those are absent. Every row is
-// written sample:false so it replaces — and is never confused with — seeded demo data.
-export const upsertFromShopify = mutation({
-  args: {
-    siteId: v.id("sites"),
-    products: v.array(
-      v.object({
-        shopifyProductId: v.string(),
-        title: v.string(),
-        priceUsd: v.number(),
-        status: productStatus,
-        imageUrl: v.optional(v.string()), // accepted for parity; schema has no image column (ignored)
-      }),
-    ),
-  },
-  handler: async (ctx, { siteId, products }) => {
-    await requireServiceIdentity(ctx);
-    let inserted = 0;
-    let updated = 0;
-    for (const p of products) {
-      const existing = await ctx.db
-        .query("products")
-        .withIndex("by_site", (q) => q.eq("siteId", siteId))
-        .filter((q) => q.eq(q.field("shopifyProductId"), p.shopifyProductId))
-        .first();
-      if (existing) {
-        // A Shopify sync must never be an activation path. Existing active products retain their
-        // state for observation, while DRAFT/unknown-cost products remain local drafts until the
-        // verified evidence gate is explicitly passed through setStatus.
-        const status = p.status === "active" && existing.status !== "active" ? "draft" : p.status;
-        await ctx.db.patch(existing._id, {
-          title: p.title,
-          priceUsd: p.priceUsd,
-          status,
-          sample: false,
-        });
-        updated++;
-      } else {
-        await ctx.db.insert("products", {
-          siteId,
-          title: p.title,
-          shopifyProductId: p.shopifyProductId,
-          cjFromUsWarehouse: false,
-          cogsUsd: 0,
-          shippingUsd: 0,
-          priceUsd: p.priceUsd,
-          status: p.status === "active" ? "draft" : p.status,
-          createdAt: Date.now(),
-          sample: false,
-        });
-        inserted++;
-      }
-    }
-    return { inserted, updated, total: products.length };
   },
 });
 

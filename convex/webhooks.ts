@@ -14,6 +14,18 @@ const creditAdjustmentState = v.union(v.literal("none"), v.literal("partial"), v
 
 const RANK = { received: 0, sent_to_cj: 1, shipped: 2, delivered: 3, error: 0 } as const;
 type FulfillmentStatus = keyof typeof RANK;
+type EconomicField = "currencyCode" | "currentTotal" | "financialStatus" | "test" | "cancelled" | "creditAdjustmentState";
+const ECONOMIC_FIELDS: EconomicField[] = ["currencyCode", "currentTotal", "financialStatus", "test", "cancelled", "creditAdjustmentState"];
+
+function economicFieldObservationTimes(
+  args: Partial<Record<EconomicField, unknown>>,
+  observedAt: number,
+  prior: Partial<Record<EconomicField, number>> = {},
+) {
+  const times = { ...prior };
+  for (const field of ECONOMIC_FIELDS) if (args[field] !== undefined) times[field] = observedAt;
+  return times;
+}
 
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }) {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: webhook intake requires the service runtime");
@@ -32,6 +44,7 @@ export const recordShopifyOrder = mutation({
   },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
+    const observedAt = Date.now();
     const prior = await ctx.db.query("webhookReceipts")
       .withIndex("by_provider_site_delivery", (q) => q.eq("provider", "shopify").eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
     const receiptDecision = shopifyReceiptDecision(prior, args);
@@ -70,7 +83,11 @@ export const recordShopifyOrder = mutation({
     if (existing) {
       const next = RANK[args.fulfillmentStatus] > RANK[existing.fulfillmentStatus as FulfillmentStatus]
         ? args.fulfillmentStatus : existing.fulfillmentStatus;
-      const patch: Record<string, unknown> = { fulfillmentStatus: next, sample: false };
+      const patch: Record<string, unknown> = {
+        fulfillmentStatus: next, sample: false, shopifyObservedAt: observedAt,
+        shopifyEconomicsSnapshotAttemptId: undefined, shopifyEconomicsExcludedAt: observedAt,
+        shopifyEconomicFieldObservedAt: economicFieldObservationTimes(args, observedAt, existing.shopifyEconomicFieldObservedAt),
+      };
       for (const key of ["currencyCode", "currentTotal", "financialStatus", "test", "cancelled", "creditAdjustmentState"] as const) {
         if (args[key] !== undefined) patch[key] = args[key];
       }
@@ -85,6 +102,8 @@ export const recordShopifyOrder = mutation({
         creditAdjustmentState: args.creditAdjustmentState,
         totalUsd: args.currencyCode === "USD" ? args.currentTotal : undefined,
         fulfillmentStatus: args.fulfillmentStatus, createdAt: args.createdAt, sample: false,
+        shopifyObservedAt: observedAt, shopifyEconomicsExcludedAt: observedAt,
+        shopifyEconomicFieldObservedAt: economicFieldObservationTimes(args, observedAt),
       });
       await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { source: "shopify_webhook" } });
     }
@@ -92,6 +111,11 @@ export const recordShopifyOrder = mutation({
     let intentNeedsAttention = false;
     const storedOrder = await ctx.db.get(orderId) as any;
     const site = await ctx.db.get(args.siteId);
+    if (site?.shopifyEconomicsSyncStatus === "current") {
+      // A post-snapshot provider fact is retained, but launch economics wait for a new complete
+      // snapshot generation before including it.
+      await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
+    }
     const economicallyEligible = !!storedOrder && !!site && eligibleUsdOrder(storedOrder, site.storeCurrency);
     if (args.stagingInput && economicallyEligible) {
       // Deterministic on the mirrored order, not merely delivery ID: Shopify can redeliver a
@@ -125,7 +149,7 @@ export const recordShopifyOrder = mutation({
     }
     await ctx.db.insert("webhookReceipts", {
       provider: "shopify", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
-      payloadHash: args.payloadHash, outcome: "applied", cjStagingIntentId: intentId ?? undefined, receivedAt: Date.now(),
+      payloadHash: args.payloadHash, outcome: "applied", cjStagingIntentId: intentId ?? undefined, receivedAt: observedAt,
     });
     // `applied` means intake/mirroring completed, never that CJ quote, staging, or approval did.
     return { duplicate: false, outcome: "applied" as const, intentId, intentNeedsAttention };

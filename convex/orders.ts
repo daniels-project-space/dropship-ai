@@ -23,6 +23,13 @@ const cjOrderInput = v.object({
 });
 const shopifyLine = v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() });
 const creditAdjustmentState = v.union(v.literal("none"), v.literal("partial"), v.literal("full"));
+type EconomicField = "currencyCode" | "currentTotal" | "financialStatus" | "test" | "cancelled" | "creditAdjustmentState";
+const ECONOMIC_FIELDS: EconomicField[] = ["currencyCode", "currentTotal", "financialStatus", "test", "cancelled", "creditAdjustmentState"];
+function economicFieldObservationTimes(args: Partial<Record<EconomicField, unknown>>, observedAt: number, prior: Partial<Record<EconomicField, number>> = {}) {
+  const times = { ...prior };
+  for (const field of ECONOMIC_FIELDS) if (args[field] !== undefined) times[field] = observedAt;
+  return times;
+}
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: sandbox dispatch requires the service runtime");
 }
@@ -87,82 +94,6 @@ export function mapShopifyFulfillment(displayStatus: string | null | undefined):
 
 // Bulk idempotent upsert of REAL Shopify orders (keyed on shopifyOrderId). Used by the initial
 // sync + manual "Sync now". Writes sample:false. Does NOT trigger any CJ/fulfillment action — it
-// only mirrors Shopify state. fulfillmentStatus is mapped from Shopify's displayFulfillmentStatus
-// but an existing order already advanced past Shopify's view (e.g. sent_to_cj/delivered) is NOT
-// downgraded.
-const ADVANCED_ORDER: Record<ShopFulfillment, number> = {
-  received: 0,
-  sent_to_cj: 1,
-  shipped: 2,
-  delivered: 3,
-  error: 0,
-};
-export const upsertFromShopify = mutation({
-  args: {
-    siteId: v.id("sites"),
-    orders: v.array(
-      v.object({
-        shopifyOrderId: v.string(),
-        currencyCode: v.string(),
-        currentTotal: v.number(),
-        financialStatus: v.string(),
-        test: v.boolean(),
-        cancelled: v.boolean(),
-        creditAdjustmentState,
-        fulfillmentStatus: fulfillmentStatus,
-        createdAt: v.number(),
-      }),
-    ),
-  },
-  handler: async (ctx, { siteId, orders }) => {
-    await requireServiceIdentity(ctx);
-    let inserted = 0;
-    let updated = 0;
-    for (const o of orders) {
-      const existing = await ctx.db
-        .query("orders")
-        .withIndex("by_site_shopify_order", (q) => q.eq("siteId", siteId).eq("shopifyOrderId", o.shopifyOrderId))
-        .first();
-      if (existing) {
-        // never downgrade an order the fulfillment loop has already advanced
-        const nextStatus =
-          ADVANCED_ORDER[o.fulfillmentStatus] > ADVANCED_ORDER[existing.fulfillmentStatus]
-            ? o.fulfillmentStatus
-            : existing.fulfillmentStatus;
-        await ctx.db.patch(existing._id, {
-          currencyCode: o.currencyCode,
-          currentTotal: o.currentTotal,
-          financialStatus: o.financialStatus,
-          test: o.test,
-          cancelled: o.cancelled,
-          creditAdjustmentState: o.creditAdjustmentState,
-          totalUsd: o.currencyCode === "USD" ? o.currentTotal : undefined,
-          fulfillmentStatus: nextStatus,
-          sample: false,
-        });
-        updated++;
-      } else {
-        await ctx.db.insert("orders", {
-          siteId,
-          shopifyOrderId: o.shopifyOrderId,
-          fulfillmentStatus: o.fulfillmentStatus,
-          currencyCode: o.currencyCode,
-          currentTotal: o.currentTotal,
-          financialStatus: o.financialStatus,
-          test: o.test,
-          cancelled: o.cancelled,
-          creditAdjustmentState: o.creditAdjustmentState,
-          totalUsd: o.currencyCode === "USD" ? o.currentTotal : undefined,
-          createdAt: o.createdAt,
-          sample: false,
-        });
-        inserted++;
-      }
-    }
-    return { inserted, updated, total: orders.length };
-  },
-});
-
 // Record a freshly received Shopify order (idempotent on shopifyOrderId).
 export const record = mutation({
   args: {
@@ -180,19 +111,27 @@ export const record = mutation({
   },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
+    const observedAt = Date.now();
     const existing = await ctx.db
       .query("orders")
       .withIndex("by_site_shopify_order", (q) => q.eq("siteId", args.siteId).eq("shopifyOrderId", args.shopifyOrderId))
       .first();
     if (existing) {
-      const patch: Record<string, unknown> = {};
+      const patch: Record<string, unknown> = {
+        shopifyObservedAt: observedAt,
+        shopifyEconomicsSnapshotAttemptId: undefined,
+        shopifyEconomicsExcludedAt: observedAt,
+        shopifyEconomicFieldObservedAt: economicFieldObservationTimes(args, observedAt, existing.shopifyEconomicFieldObservedAt),
+      };
       if (args.cjOrderId) patch.cjOrderId = args.cjOrderId;
       if (args.fulfillmentStatus) patch.fulfillmentStatus = args.fulfillmentStatus;
       for (const key of ["currencyCode", "currentTotal", "financialStatus", "test", "cancelled", "creditAdjustmentState"] as const) {
         if (args[key] !== undefined) patch[key] = args[key];
       }
       if (args.currentTotal !== undefined && args.currencyCode === "USD") patch.totalUsd = args.currentTotal;
-      if (Object.keys(patch).length) await ctx.db.patch(existing._id, patch);
+      await ctx.db.patch(existing._id, patch);
+      const site = await ctx.db.get(args.siteId);
+      if (site?.shopifyEconomicsSyncStatus === "current") await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
       return existing._id;
     }
     const orderId = await ctx.db.insert("orders", {
@@ -207,8 +146,13 @@ export const record = mutation({
       test: args.test,
       cancelled: args.cancelled,
       creditAdjustmentState: args.creditAdjustmentState,
-      createdAt: Date.now(),
+      shopifyObservedAt: observedAt,
+      shopifyEconomicsExcludedAt: observedAt,
+      shopifyEconomicFieldObservedAt: economicFieldObservationTimes(args, observedAt),
+      createdAt: observedAt,
     });
+    const site = await ctx.db.get(args.siteId);
+    if (site?.shopifyEconomicsSyncStatus === "current") await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
     await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { orderId } });
     return orderId;
   },

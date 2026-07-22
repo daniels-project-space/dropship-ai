@@ -8,6 +8,18 @@ import { matchesDataMode, type DataMode } from "./sampleScope";
 import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
 import { shopifyEconomicsReadiness } from "../src/lib/shopifySyncState";
 
+function hasCurrentEconomicsSnapshot(site: { shopifyEconomicsSyncAttemptId?: string } & Parameters<typeof shopifyEconomicsReadiness>[0]): boolean {
+  return shopifyEconomicsReadiness(site) === "current" && !!site.shopifyEconomicsSyncAttemptId;
+}
+
+function belongsToCurrentEconomicsSnapshot(
+  row: { shopifyEconomicsSnapshotAttemptId?: string },
+  site: { shopifyEconomicsSyncAttemptId?: string },
+): boolean {
+  return !!site.shopifyEconomicsSyncAttemptId
+    && row.shopifyEconomicsSnapshotAttemptId === site.shopifyEconomicsSyncAttemptId;
+}
+
 export const portfolio = query({
   args: { dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
   handler: async (ctx, { dataMode }) => {
@@ -45,7 +57,9 @@ export const portfolio = query({
           killDate: site.killDate ?? null,
           pendingActionCount: pendingActions.length,
           activeProductCount: activeProducts.length,
-          ordersAwaitingFulfillment: openOrders.filter((order) => eligibleUsdOrder(order, site.storeCurrency)).length,
+          ordersAwaitingFulfillment: hasCurrentEconomicsSnapshot(site)
+            ? openOrders.filter((order) => belongsToCurrentEconomicsSnapshot(order, site) && eligibleUsdOrder(order, site.storeCurrency)).length
+            : 0,
         };
       }),
     );
@@ -192,6 +206,8 @@ export const timeseries = query({
     const window = Math.min(days ?? 30, 180);
     const since = Date.now() - window * DAY_MS;
     const sites = await resolveSites(ctx, scope, dataMode);
+    const commerceMetric = metric === "revenue" || metric === "orders";
+    const commerceVerified = !commerceMetric || (window <= 60 && sites.length > 0 && sites.every(hasCurrentEconomicsSnapshot));
 
     // dense day buckets
     const buckets = new Map<string, number>();
@@ -199,12 +215,14 @@ export const timeseries = query({
 
     for (const s of sites) {
       if (metric === "revenue" || metric === "orders") {
+        if (!commerceVerified) continue;
         const orders = await ctx.db
           .query("orders")
           .withIndex("by_site", (q) => q.eq("siteId", s._id))
           .take(2000);
         for (const o of orders) {
           if (o.createdAt < since) continue;
+          if (!belongsToCurrentEconomicsSnapshot(o, s)) continue;
           if (!eligibleUsdOrder(o, s.storeCurrency)) continue;
           const k = dayKey(o.createdAt);
           if (!buckets.has(k)) continue;
@@ -236,7 +254,7 @@ export const timeseries = query({
     const prior = points.slice(0, half).reduce((s, p) => s + p.value, 0);
     const deltaPct = prior > 0 ? ((recent - prior) / prior) * 100 : recent > 0 ? 100 : 0;
 
-    return { metric, days: window, points, total, deltaPct, currencyCode: metric === "revenue" ? "USD" : null, eligibleRealOrdersOnly: metric === "revenue" || metric === "orders" };
+    return { metric, days: window, points, total, deltaPct, currencyCode: metric === "revenue" ? "USD" : null, eligibleRealOrdersOnly: commerceMetric, commerceVerified };
   },
 });
 
@@ -284,6 +302,7 @@ export const funnel = query({
     const window = Math.min(days ?? 30, 180);
     const since = Date.now() - window * DAY_MS;
     const sites = await resolveSites(ctx, scope, dataMode);
+    const commerceVerified = window <= 60 && sites.length > 0 && sites.every(hasCurrentEconomicsSnapshot);
 
     let views = 0;
     let pageviews = 0;
@@ -312,8 +331,12 @@ export const funnel = query({
         atc += m.addToCartCount ?? 0;
         checkout += m.checkoutCount ?? 0;
       }
-      const orders = await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", s._id)).take(2000);
-      purchases += orders.filter((order) => order.createdAt >= since && eligibleUsdOrder(order, s.storeCurrency)).length;
+      if (commerceVerified) {
+        const orders = await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", s._id)).take(2000);
+        purchases += orders.filter((order) => order.createdAt >= since
+          && belongsToCurrentEconomicsSnapshot(order, s)
+          && eligibleUsdOrder(order, s.storeCurrency)).length;
+      }
     }
     const stages = [
       { label: "Provider-observed reach", value: views },
@@ -322,7 +345,7 @@ export const funnel = query({
       { label: "Shopify checkout", value: checkout },
       { label: "Shopify purchase", value: purchases },
     ];
-    return { stages, days: window, providerObservedOnly: true, purchaseBasis: "eligible_real_paid_usd_orders" };
+    return { stages, days: window, providerObservedOnly: true, purchaseBasis: "eligible_real_paid_usd_orders", commerceVerified };
   },
 });
 
@@ -442,7 +465,9 @@ export const brandDetail = query({
       ]);
 
     const totalViews = publishedPosts.reduce((s, p) => s + (hasProviderObservedPostMetrics(p) ? p.views ?? 0 : 0), 0);
-    const eligibleOrders = allOrders.filter((order) => eligibleUsdOrder(order, site.storeCurrency));
+    const eligibleOrders = hasCurrentEconomicsSnapshot(site)
+      ? allOrders.filter((order) => belongsToCurrentEconomicsSnapshot(order, site) && eligibleUsdOrder(order, site.storeCurrency))
+      : [];
     const revenueUsd = eligibleOrders.reduce((sum, order) => sum + order.currentTotal!, 0);
 
     return {

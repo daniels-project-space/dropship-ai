@@ -82,6 +82,11 @@ export default defineSchema({
     shopifyVariantId: v.optional(v.string()),
     shopifyDraftImportStatus: v.optional(v.union(v.literal("creating"), v.literal("created"), v.literal("ambiguous"))),
     shopifyDraftImportTraceId: v.optional(v.string()),
+    // Snapshot generation is the economic inclusion fence. Provider observations are retained
+    // independently so a webhook/draft-import race can invalidate or supersede a snapshot.
+    shopifyObservedAt: v.optional(v.number()),
+    shopifyEconomicsSnapshotAttemptId: v.optional(v.string()),
+    shopifyEconomicsExcludedAt: v.optional(v.number()),
     cjProductId: v.optional(v.string()),
     cjVariantId: v.optional(v.string()),          // exact sellable variant used for the verified quote
     cjFromCountryCode: v.optional(v.string()),    // verified CJ inventory origin used for freight preflight
@@ -244,6 +249,19 @@ export default defineSchema({
     test: v.optional(v.boolean()),
     cancelled: v.optional(v.boolean()),
     creditAdjustmentState: v.optional(v.union(v.literal("none"), v.literal("partial"), v.literal("full"))),
+    shopifyObservedAt: v.optional(v.number()),
+    shopifyEconomicsSnapshotAttemptId: v.optional(v.string()),
+    shopifyEconomicsExcludedAt: v.optional(v.number()),
+    // Per-field webhook fences let a snapshot merge complete economic reads without overwriting
+    // a newer partial orders/updated observation.
+    shopifyEconomicFieldObservedAt: v.optional(v.object({
+      currencyCode: v.optional(v.number()),
+      currentTotal: v.optional(v.number()),
+      financialStatus: v.optional(v.number()),
+      test: v.optional(v.number()),
+      cancelled: v.optional(v.number()),
+      creditAdjustmentState: v.optional(v.number()),
+    })),
     fulfillmentStatus: v.union(
       v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
     ),

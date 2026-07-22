@@ -10,8 +10,9 @@ import { randomUUID } from "node:crypto";
 import { getShop, listProductsWithCoverage, listOrdersWithCoverage, type ShopifyClientConfig } from "./shopify";
 import type { Id } from "../../convex/_generated/dataModel";
 import { assertShopifyIdentity, normalizeShopifyDomain } from "./shopifyIdentity";
+import { SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS } from "./shopifySyncState";
 
-type ProductStatus = "draft" | "active" | "archived" | "killed";
+type ProductStatus = "draft" | "active" | "archived";
 function mapProductStatus(s: "ACTIVE" | "ARCHIVED" | "DRAFT"): ProductStatus {
   switch (s) {
     case "ACTIVE":
@@ -24,7 +25,7 @@ function mapProductStatus(s: "ACTIVE" | "ARCHIVED" | "DRAFT"): ProductStatus {
   }
 }
 
-type Fulfillment = "received" | "sent_to_cj" | "shipped" | "delivered" | "error";
+type Fulfillment = "received" | "shipped";
 function mapFulfillment(displayStatus: string): Fulfillment {
   return displayStatus.toUpperCase() === "FULFILLED" ? "shipped" : "received";
 }
@@ -37,20 +38,31 @@ export interface SyncResult {
 }
 
 export function boundedShopifySinceDays(value: number): number {
-  return Math.min(Math.max(Math.trunc(value), 1), 60);
+  if (!Number.isFinite(value)) throw new Error("invalid Shopify sync coverage window");
+  return Math.min(Math.max(Math.trunc(value), 1), SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS);
 }
+
+type ShopifySyncDependencies = {
+  client?: ReturnType<typeof convexClient>;
+  createAttemptId?: () => string;
+  readShop?: typeof getShop;
+  readProducts?: typeof listProductsWithCoverage;
+  readOrders?: typeof listOrdersWithCoverage;
+  now?: () => number;
+};
 
 /** Run the read-only products+orders sync after durably recording the attempt. */
 export async function syncShopify(
   siteId: string,
   config: ShopifyClientConfig | (() => Promise<ShopifyClientConfig>),
   { sinceDays = 60 }: { sinceDays?: number } = {},
+  dependencies: ShopifySyncDependencies = {},
 ): Promise<SyncResult> {
-  const convex = convexClient();
+  const convex = dependencies.client ?? convexClient();
   const sid = siteId as Id<"sites">;
   const boundedSinceDays = boundedShopifySinceDays(sinceDays);
 
-  const attemptId = randomUUID();
+  const attemptId = (dependencies.createAttemptId ?? randomUUID)();
   await convex.mutation(api.sites.beginEconomicsSync, { siteId: sid, attemptId, sinceDays: boundedSinceDays });
 
   try {
@@ -59,7 +71,7 @@ export async function syncShopify(
     const cfg = typeof config === "function" ? await config() : config;
     // Identity is a prerequisite read, but it is not economics success. Any failure after the
     // durable attempt begins records a failed latest attempt without erasing prior success.
-    const shop = await getShop(cfg);
+    const shop = await (dependencies.readShop ?? getShop)(cfg);
     assertShopifyIdentity(cfg.shop, shop.myshopifyDomain, shop.currencyCode);
     await convex.mutation(api.sites.verifyConnectedStore, {
       siteId: sid,
@@ -68,52 +80,47 @@ export async function syncShopify(
     });
 
     const [productRead, orderRead] = await Promise.all([
-      listProductsWithCoverage(cfg, { limit: 250 }),
-      listOrdersWithCoverage(cfg, { sinceDays: boundedSinceDays, limit: 250 }),
+      (dependencies.readProducts ?? listProductsWithCoverage)(cfg, { limit: 250 }),
+      (dependencies.readOrders ?? listOrdersWithCoverage)(cfg, { sinceDays: boundedSinceDays, limit: 250 }),
     ]);
     const products = productRead.items;
     const orders = orderRead.items;
+    const snapshotReadAt = (dependencies.now ?? Date.now)();
 
-    if (products.length) {
-      await convex.mutation(api.products.upsertFromShopify, {
-        siteId: sid,
-        products: products.map((p) => ({
-          shopifyProductId: p.id,
-          title: p.title,
-          priceUsd: p.priceUsd,
-          status: mapProductStatus(p.status),
-          imageUrl: p.imageUrl ?? undefined,
-        })),
+    // No mirror mutation is reachable until both reads prove complete canonical coverage.
+    if (!productRead.complete || !orderRead.complete || boundedSinceDays !== SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS) {
+      await convex.mutation(api.sites.markEconomicsSyncNotCurrent, {
+        siteId: sid, attemptId, status: "incomplete",
+        reason: boundedSinceDays !== SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS
+          ? "noncanonical_window"
+          : !productRead.complete ? "product_truncation" : "order_truncation",
       });
+      return { productCount: products.length, orderCount: orders.length, lastSyncedAt: snapshotReadAt, economicsSync: "incomplete" };
     }
 
-    if (orders.length) {
-      await convex.mutation(api.orders.upsertFromShopify, {
-        siteId: sid,
-        orders: orders.map((o) => ({
-          shopifyOrderId: o.id,
-          currencyCode: o.currencyCode,
-          currentTotal: o.currentTotal,
-          financialStatus: o.financialStatus,
-          test: o.test,
-          cancelled: o.cancelled,
-          creditAdjustmentState: o.creditAdjustmentState,
-          fulfillmentStatus: mapFulfillment(o.displayFulfillmentStatus),
-          createdAt: o.createdAt,
-        })),
-      });
-    }
-
-    const economicsSync = productRead.complete && orderRead.complete ? "current" : "incomplete";
-    await convex.mutation(api.sites.finishEconomicsSync, {
+    const committed = await convex.mutation(api.sites.commitEconomicsSnapshot, {
       siteId: sid,
       attemptId,
-      status: economicsSync,
-      ...(economicsSync === "current" ? { productCount: products.length, orderCount: orders.length } : {}),
+      snapshotReadAt,
+      products: products.map((p) => ({
+        shopifyProductId: p.id, title: p.title, priceUsd: p.priceUsd,
+        status: mapProductStatus(p.status), imageUrl: p.imageUrl ?? undefined,
+      })),
+      orders: orders.map((o) => ({
+        shopifyOrderId: o.id, currencyCode: o.currencyCode, currentTotal: o.currentTotal,
+        financialStatus: o.financialStatus, test: o.test, cancelled: o.cancelled,
+        creditAdjustmentState: o.creditAdjustmentState,
+        fulfillmentStatus: mapFulfillment(o.displayFulfillmentStatus), createdAt: o.createdAt,
+      })),
     });
-    return { productCount: products.length, orderCount: orders.length, lastSyncedAt: Date.now(), economicsSync };
+    return {
+      productCount: committed.productCount,
+      orderCount: committed.orderCount,
+      lastSyncedAt: committed.finishedAt,
+      economicsSync: committed.status,
+    };
   } catch (error) {
-    await convex.mutation(api.sites.finishEconomicsSync, { siteId: sid, attemptId, status: "failed" });
+    await convex.mutation(api.sites.markEconomicsSyncNotCurrent, { siteId: sid, attemptId, status: "failed", reason: "provider_or_commit_failure" });
     throw error;
   }
 }

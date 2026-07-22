@@ -1,4 +1,5 @@
 export const SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+export const SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS = 60;
 
 export type ShopifyEconomicsSyncStatus = "pending" | "current" | "failed" | "incomplete";
 export type ShopifyEconomicsReadiness =
@@ -15,7 +16,11 @@ type ShopifySiteSyncFacts = {
   storeCurrency?: string;
   shopifyAccessVerifiedAt?: number;
   shopifyEconomicsSyncStatus?: ShopifyEconomicsSyncStatus;
+  shopifyEconomicsSyncAttemptId?: string;
   shopifyEconomicsSyncSucceededAt?: number;
+  shopifyEconomicsSyncSinceDays?: number;
+  shopifyEconomicsSyncProductCount?: number;
+  shopifyEconomicsSyncOrderCount?: number;
 };
 
 /** Fail-closed launch state: identity proof and complete, fresh economics proof are independent. */
@@ -32,6 +37,12 @@ export function shopifyEconomicsReadiness(
     case "incomplete": return "incomplete";
     case "pending": return "pending";
     case "current": {
+      if (site.shopifyEconomicsSyncSinceDays !== SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS
+        || !site.shopifyEconomicsSyncAttemptId
+        || !Number.isInteger(site.shopifyEconomicsSyncProductCount)
+        || site.shopifyEconomicsSyncProductCount! < 0
+        || !Number.isInteger(site.shopifyEconomicsSyncOrderCount)
+        || site.shopifyEconomicsSyncOrderCount! < 0) return "incomplete";
       const succeededAt = site.shopifyEconomicsSyncSucceededAt;
       if (!Number.isFinite(succeededAt)) return "stale";
       const age = now - succeededAt!;

@@ -113,8 +113,8 @@ export function SiteCard({ site, index = 0 }: { site: PortfolioSite; index?: num
           accent={hasPending}
           pulse={hasPending}
         />
-        <Metric value={site.activeProductCount} label="Live products" />
-        <Metric value={site.ordersAwaitingFulfillment} label="Open orders" />
+        <Metric value={site.activeProductCount} label="Active products" />
+        <Metric value={site.shopifyEconomicsSyncState === "current" ? site.ordersAwaitingFulfillment : "—"} label="Open orders" />
       </div>
 
       <div className="mt-5 flex items-center justify-between">

@@ -106,7 +106,11 @@ export async function GET(request: Request) {
         ? { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: "verified", detail: `${verified} site(s) resolved recurring vault access and returned the expected USD myshopify identity`, next: "Re-run readiness after any token, domain, or store-currency change." }
         : { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: missing ? "blocked" : "unverified", detail: `${verified} verified; ${legacy} need re-verification; ${missing} missing recurring vault access; ${failed} failed current identity reads`, next: "Re-verify each affected site. A one-time operator token check is never counted as recurring access." });
 
-      const economics = sites.map((site) => shopifyEconomicsReadiness(site));
+      // Keep the launch endpoint's own canonical-window fence even if the shared reducer is
+      // later reused for a diagnostic display state.
+      const economics = sites.map((site) => site.shopifyEconomicsSyncSinceDays === 60
+        ? shopifyEconomicsReadiness(site)
+        : "incomplete" as const);
       const current = economics.filter((state) => state === "current").length;
       const states = ["pending", "stale", "failed", "incomplete", "needs_reverification"] as const;
       const detail = states.map((state) => `${economics.filter((value) => value === state).length} ${state}`).join("; ");
