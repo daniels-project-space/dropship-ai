@@ -3,6 +3,7 @@
 import { NextResponse } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { scheduleApprovedCreative } from "@/src/trigger/content-factory";
+import { withTriggerAuth } from "@/src/lib/triggerAuth";
 
 export const runtime = "nodejs";
 
@@ -13,21 +14,24 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
-  if (!body.creativeId) {
+  const creativeId = body.creativeId;
+  if (!creativeId) {
     return NextResponse.json({ error: "creativeId is required" }, { status: 400 });
   }
-  if (!process.env.TRIGGER_SECRET_KEY && !process.env.TRIGGER_ACCESS_TOKEN) {
-    // Approval still succeeds in Convex; distribution is deferred until Trigger is configured.
-    return NextResponse.json(
-      { ok: false, deferred: true, reason: "trigger not configured (TRIGGER_SECRET_KEY missing)" },
-      { status: 202 },
-    );
-  }
   try {
-    const handle = await tasks.trigger<typeof scheduleApprovedCreative>("schedule-approved-creative", {
-      creativeId: body.creativeId,
-      caption: body.caption,
-    });
+    const handle = await withTriggerAuth(() =>
+      tasks.trigger<typeof scheduleApprovedCreative>("schedule-approved-creative", {
+        creativeId,
+        ...(body.caption !== undefined ? { caption: body.caption } : {}),
+      }),
+    );
+    if (!handle) {
+      // Approval still succeeds in Convex; distribution is deferred until Trigger is configured.
+      return NextResponse.json(
+        { ok: false, deferred: true, reason: "trigger not configured (project key unavailable to server)" },
+        { status: 202 },
+      );
+    }
     return NextResponse.json({ ok: true, runId: handle.id });
   } catch (err) {
     return NextResponse.json(

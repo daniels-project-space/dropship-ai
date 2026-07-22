@@ -4,6 +4,7 @@
 // exact next-step text — secret values never cross this boundary.
 import { NextResponse } from "next/server";
 import { getKey, getService } from "@/src/lib/vault";
+import { getTriggerAccessToken } from "@/src/lib/triggerAuth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -115,20 +116,21 @@ export async function GET() {
     }
   }
 
-  // ── Trigger runtime key (the dropship-specific secret) ──────────────────────
-  const triggerKeys = await vaultKeyNames("trigger");
-  const hasDropshipTrigger = triggerKeys.some((k) => /DROPSHIP/i.test(k));
+  // ── Trigger runtime key ────────────────────────────────────────────────────
+  // Use the exact same resolution path as the enqueue routes. A key merely
+  // existing under an unrelated vault name must not make this check look ready.
+  const hasDropshipTrigger = Boolean(await getTriggerAccessToken());
   checks.push({
     id: "trigger",
     group: "Orchestration",
     label: "Trigger.dev runtime key",
     state: hasDropshipTrigger ? "ready" : "action_needed",
     detail: hasDropshipTrigger
-      ? "DROPSHIP_AI_TRIGGER_SECRET_KEY present"
-      : "DROPSHIP_AI_TRIGGER_SECRET_KEY missing",
+      ? "Project Trigger key available to server"
+      : "Project Trigger key unavailable to server",
     next: hasDropshipTrigger
       ? "Server can enqueue the content-factory + brain tasks."
-      : "Add trigger/DROPSHIP_AI_TRIGGER_SECRET_KEY to the vault (Trigger.dev → API keys → PROD).",
+      : "Add trigger/DROPSHIP_AI_TRIGGER_SECRET_KEY to the vault or set TRIGGER_SECRET_KEY on the server.",
   });
 
   // ── Generation sources ──────────────────────────────────────────────────────

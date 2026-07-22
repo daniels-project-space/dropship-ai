@@ -1,12 +1,12 @@
 // Server-only route: enqueue the content-factory Trigger task from the Creative Studio UI.
 // Uses the Trigger SDK's tasks.trigger (no client bundle leakage; runs in the Node runtime).
 //
-// Auth: this is an internal operator console. The route requires TRIGGER_SECRET_KEY (or
-// TRIGGER_ACCESS_TOKEN) to be present in the server env to actually enqueue; if absent it
-// returns a 503 with a clear note rather than failing opaquely.
+// Auth: this is an internal operator console. The route resolves the project-scoped Trigger
+// key from the server environment or vault, and returns 503 when neither is available.
 import { NextResponse } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { contentFactory } from "@/src/trigger/content-factory";
+import { withTriggerAuth } from "@/src/lib/triggerAuth";
 
 export const runtime = "nodejs";
 
@@ -17,24 +17,26 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
-  if (!body.siteId) {
+  const siteId = body.siteId;
+  if (!siteId) {
     return NextResponse.json({ error: "siteId is required" }, { status: 400 });
   }
-  if (!process.env.TRIGGER_SECRET_KEY && !process.env.TRIGGER_ACCESS_TOKEN) {
-    return NextResponse.json(
-      { error: "trigger not configured (TRIGGER_SECRET_KEY missing on server)" },
-      { status: 503 },
-    );
-  }
-
   try {
-    const handle = await tasks.trigger<typeof contentFactory>("content-factory", {
-      siteId: body.siteId,
-      productId: body.productId,
-      variants: body.variants ?? 3,
-      scenePrompt: body.scenePrompt,
-      hooks: body.hooks,
-    });
+    const handle = await withTriggerAuth(() =>
+      tasks.trigger<typeof contentFactory>("content-factory", {
+        siteId,
+        variants: body.variants ?? 3,
+        ...(body.productId !== undefined ? { productId: body.productId } : {}),
+        ...(body.scenePrompt !== undefined ? { scenePrompt: body.scenePrompt } : {}),
+        ...(body.hooks !== undefined ? { hooks: body.hooks } : {}),
+      }),
+    );
+    if (!handle) {
+      return NextResponse.json(
+        { error: "trigger not configured (project key unavailable to server)" },
+        { status: 503 },
+      );
+    }
     return NextResponse.json({ ok: true, runId: handle.id });
   } catch (err) {
     return NextResponse.json(
