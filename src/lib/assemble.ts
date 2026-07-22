@@ -158,7 +158,7 @@ export async function assemble(input: AssembleInput, overrides: Partial<Assembly
       const captionPath = join(dir, "caption.txt");
       await writeFile(captionPath, input.captions, "utf8");
       filters.push(
-        `drawtext=textfile='${escapeFilterValue(captionPath)}':fontcolor=white:fontsize=52:`
+        `drawtext=textfile='${escapeFilterValue(captionPath)}':expansion=none:fontcolor=white:fontsize=52:`
         + "box=1:boxcolor=black@0.45:boxborderw=24:x=(w-text_w)/2:y=h*0.72:line_spacing=8",
       );
     }

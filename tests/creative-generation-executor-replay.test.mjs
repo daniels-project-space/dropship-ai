@@ -187,7 +187,7 @@ test("actual executor reuses the exact Fal receipt after deterministic R2 respon
   { claims: 3, polls: 1, failures: 1, objectWrites: 1 });
 });
 
-test("actual executor records TTS headers, cancels the body, and restart is read-only recovery", async () => {
+test("actual executor cancels TTS after receipt response loss and restart is read-only recovery", async () => {
   const t = convexTest({ schema, modules });
   const { row } = await seedVariant(t, "executor-tts-restart-0001");
   await t.run((ctx) => ctx.db.patch(row._id, {
@@ -199,6 +199,7 @@ test("actual executor records TTS headers, cancels the body, and restart is read
   const requestId = "tts-request-0001";
   const historyItemId = "tts-history-0001";
   const audioObject = storedObject("audio/mpeg", "tts-audio");
+  let loseReceiptResponse = true;
   const effects = effectsFor(t, counts, {
     openElevenLabsTts: async ({ text, voiceId, model }) => {
       counts.ttsSubmits++;
@@ -213,8 +214,18 @@ test("actual executor records TTS headers, cancels the body, and restart is read
       counts.ttsAudioReads++; counts.storageAttempts++; counts.storageCommits++;
       assert.equal(id, historyItemId); assert.equal(r2Key, row.audioR2Key); return audioObject;
     },
+  }, async (name) => {
+    if (name === "creativeGenerations:recordTtsReceipt" && loseReceiptResponse) {
+      loseReceiptResponse = false;
+      throw new Error("Convex response lost after TTS receipt commit");
+    }
   });
-  await processCreativeGenerationVariant({ variantId: row._id, stage: "tts_reservation" }, "tts-submit-owner", effects);
+  await assert.rejects(
+    () => processCreativeGenerationVariant({ variantId: row._id, stage: "tts_reservation" }, "tts-submit-owner", effects),
+  );
+  const receiptDurable = await t.run((ctx) => ctx.db.get(row._id));
+  assert.deepEqual({ stage: receiptDurable.stage, requestId: receiptDurable.ttsRequestId },
+    { stage: "tts_receipt", requestId });
   const stale = await processCreativeGenerationVariant({ variantId: row._id, stage: "tts_reservation" }, "tts-submit-replay", effects);
   await processCreativeGenerationVariant({ variantId: row._id, stage: "tts_receipt" }, "tts-history-owner", effects);
   const copied = await processCreativeGenerationVariant({ variantId: row._id, stage: "tts_audio_copy" }, "tts-audio-owner", effects);
@@ -226,9 +237,10 @@ test("actual executor records TTS headers, cancels the body, and restart is read
   assert.deepEqual({ claims: counts.mutations["creativeGenerations:claimVariantStage"],
     begins: counts.mutations["creativeGenerations:beginProviderSubmission"],
     receipts: counts.mutations["creativeGenerations:recordTtsReceipt"],
+    failedReceiptWrites: counts.mutations["creativeGenerations:recordVariantFailure"],
     historyWrites: counts.mutations["creativeGenerations:recordTtsHistoryItem"],
     objectWrites: counts.mutations["creativeGenerations:recordTtsObjectCopy"] },
-  { claims: 4, begins: 1, receipts: 1, historyWrites: 1, objectWrites: 1 });
+  { claims: 4, begins: 1, receipts: 1, failedReceiptWrites: 1, historyWrites: 1, objectWrites: 1 });
 });
 
 test("actual executor assembly and final Convex response loss create one output and one review creative", async () => {

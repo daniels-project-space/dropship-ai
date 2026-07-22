@@ -78,7 +78,7 @@ test("assembly rejects an oversized FFmpeg output before read or upload", async 
 });
 
 test("hostile operator captions stay in a temp text file and the mandatory label remains burned", async () => {
-  const hostile = "quote' colon: comma, semicolon; brackets[] percent% slash\\ newline\n$(touch /tmp/never)";
+  const hostile = "quote' colon: comma, semicolon; brackets[] percent% %{metadata:title} slash\\ newline\n$(touch /tmp/never)";
   let ffmpegArgs; let captionContents; let uploads = 0;
   const result = await assemble(baseInput(hostile), {
     probeFfmpeg: () => true,
@@ -100,6 +100,10 @@ test("hostile operator captions stay in a temp text file and the mandatory label
   const filter = ffmpegArgs[ffmpegArgs.indexOf("-vf") + 1];
   assert.equal(captionContents, hostile);
   assert.equal(filter.includes(hostile), false);
+  for (const operatorText of ["percent%", "%{metadata:title}", "$(touch /tmp/never)"]) {
+    assert.equal(filter.includes(operatorText), false);
+  }
+  assert.match(filter, /drawtext=textfile='[^']+caption\.txt':expansion=none:fontcolor=white:fontsize=52:/);
   assert.match(filter, /drawtext=text='AI-generated'/);
   assert.deepEqual({ uploads, labelBurned: result.labelBurned, backend: result.backend },
     { uploads: 1, labelBurned: true, backend: "ffmpeg" });

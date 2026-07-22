@@ -126,16 +126,21 @@ export async function processCreativeGenerationVariant(
     if (payload.stage === "tts_reservation") {
       const apiKey = await effects.getElevenLabsApiKey();
       await convex.mutation(api.creativeGenerations.beginProviderSubmission, { variantId, expectedStage: "tts_reservation", leaseGeneration });
+      let opened: Awaited<ReturnType<CreativeGenerationExecutorEffects["openElevenLabsTts"]>> | undefined;
       try {
-        const opened = await effects.openElevenLabsTts({ text: row.hook, voiceId: row.voiceId, model: row.ttsModel, apiKey });
+        opened = await effects.openElevenLabsTts({ text: row.hook, voiceId: row.voiceId, model: row.ttsModel, apiKey });
         const recorded = await convex.mutation(api.creativeGenerations.recordTtsReceipt, { variantId, leaseGeneration, ...opened.receipt });
-        // The header receipt is durable. Stop the unneeded audio stream without materializing it;
-        // the next stage recovers this exact billed generation from history.
-        await effects.cancelResponseBody(opened.response);
         return recorded;
       } catch (error) {
         if (error instanceof TtsDefinitiveSubmissionError) return fail("definitive", "tts_submission_rejected");
         return fail("ambiguous", error instanceof TtsSubmissionAmbiguousError ? "tts_submission_receipt_ambiguous" : "tts_submission_unknown");
+      } finally {
+        // Once headers expose a receipt, the initial audio is never a persistence input. Always
+        // stop it, including when the receipt commits but its Convex response is lost. Cleanup is
+        // best-effort and cannot weaken the durable receipt/replay boundary.
+        if (opened) {
+          try { await effects.cancelResponseBody(opened.response); } catch { /* best-effort cleanup */ }
+        }
       }
     }
 

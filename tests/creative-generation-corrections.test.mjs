@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 import "./helpers/unref-long-convex-timers.mjs";
 import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";
 import { createGeneratePost } from "../app/api/generate/route.ts";
-import { readResponseBodyBounded } from "../src/lib/boundedBody.ts";
+import { readJsonResponseBounded, readResponseBodyBounded } from "../src/lib/boundedBody.ts";
 import {
   creativeGenerationInputDigest,
   normalizeCreativeGenerationInput,
@@ -286,6 +288,46 @@ test("bounded readers accept exact bodies and reject chunked Fal/ElevenLabs over
   });
   assert.equal(normal.bytes, jpeg.byteLength);
   assert.equal(normalWrites, 1);
+});
+
+test("bounded JSON accepts fetch-decoded gzip, caps decoded bytes, and keeps identity length strict", async (t) => {
+  const expected = { message: "x".repeat(1_000) };
+  const decoded = Buffer.from(JSON.stringify(expected));
+  const encoded = gzipSync(decoded);
+  assert.deepEqual({ declaredCompressedBytes: encoded.byteLength, decodedBytes: decoded.byteLength },
+    { declaredCompressedBytes: 42, decodedBytes: 1_014 });
+  const server = createServer((_request, response) => {
+    response.writeHead(200, {
+      "content-type": "application/json",
+      "content-encoding": "gzip",
+      "content-length": String(encoded.byteLength),
+    });
+    response.end(encoded);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+
+  const fetched = await fetch(`http://127.0.0.1:${address.port}/fixture`);
+  assert.equal(fetched.headers.get("content-encoding"), "gzip");
+  assert.equal(Number(fetched.headers.get("content-length")), encoded.byteLength);
+  assert.ok(decoded.byteLength > encoded.byteLength);
+  assert.deepEqual(await readJsonResponseBounded(fetched, decoded.byteLength, "gzip fixture"), expected);
+
+  let overflowCancels = 0;
+  const overflow = new Response(oversizedMediaStream(16, () => overflowCancels++), {
+    headers: { "content-encoding": "gzip", "content-length": "8" },
+  });
+  await assert.rejects(() => readJsonResponseBounded(overflow, 16, "decoded gzip fixture"), /exceeds 16 bytes/);
+  assert.equal(overflowCancels, 1);
+
+  await assert.rejects(() => readJsonResponseBounded(new Response("{}", {
+    headers: { "content-encoding": "identity", "content-length": "1" },
+  }), 16, "identity fixture"), /content-length mismatch/);
 });
 
 test("TTS executor cancels the initial body after its durable receipt and never bills twice", async () => {
