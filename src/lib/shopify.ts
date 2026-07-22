@@ -1,6 +1,7 @@
-// Shopify Admin GraphQL client (API 2026-01). Thin typed wrapper — calls are stubbed/minimal
-// but compile-clean. Token: vault per-site "SHOPIFY_ADMIN_TOKEN" or process.env fallback.
-// NOTE: as of 2026-06-14 no "shopify" vault service exists — pass the token explicitly or set env.
+// Shopify Admin GraphQL client pinned to stable API 2026-01. Shopify supports this version until
+// 2027-01-16; retaining the fixture-proven contract is safer than an unverified quarterly bump.
+// Recurring tokens resolve only through each site's server-side vault reference.
+import { assertLiveEffectsEnabled, sandboxShopAllowed } from "./effects";
 const API_VERSION = "2026-01";
 
 export interface ShopifyClientConfig {
@@ -84,17 +85,20 @@ export interface ShopifyProduct {
   priceUsd: number; // first variant price (0 when no variant/price)
 }
 
+export type ShopifyBoundedRead<T> = { items: T[]; complete: boolean };
+
 /**
  * List products with cursor pagination up to `limit` (hard-capped at 250 to stay polite).
  * Pulls 50 per page. priceUsd is the first variant's price parsed to a number.
  */
-export async function listProducts(
+export async function listProductsWithCoverage(
   cfg: ShopifyClientConfig,
   { limit = 250 }: { limit?: number } = {},
-): Promise<ShopifyProduct[]> {
+): Promise<ShopifyBoundedRead<ShopifyProduct>> {
   const cap = Math.min(limit, 250);
   const out: ShopifyProduct[] = [];
   let after: string | null = null;
+  let hasMore = false;
   while (out.length < cap) {
     const pageSize = Math.min(50, cap - out.length);
     const data: {
@@ -120,11 +124,19 @@ export async function listProducts(
         priceUsd: Number(n.variants.nodes[0]?.price ?? 0) || 0,
       });
     }
-    if (!data.products.pageInfo.hasNextPage) break;
+    hasMore = data.products.pageInfo.hasNextPage;
+    if (!hasMore) break;
     after = data.products.pageInfo.endCursor;
     if (!after) break;
   }
-  return out.slice(0, cap);
+  return { items: out.slice(0, cap), complete: !hasMore };
+}
+
+export async function listProducts(
+  cfg: ShopifyClientConfig,
+  options: { limit?: number } = {},
+): Promise<ShopifyProduct[]> {
+  return (await listProductsWithCoverage(cfg, options)).items;
 }
 
 const ORDERS_QUERY = /* GraphQL */ `
@@ -136,7 +148,11 @@ const ORDERS_QUERY = /* GraphQL */ `
         name
         createdAt
         displayFulfillmentStatus
-        totalPriceSet { shopMoney { amount } }
+        displayFinancialStatus
+        test
+        cancelledAt
+        currentTotalPriceSet { shopMoney { amount currencyCode } }
+        refunds { id }
         lineItems(first: 50) {
           nodes { quantity product { id } }
         }
@@ -155,25 +171,34 @@ export interface ShopifyOrder {
   name: string; // "#1001"
   createdAt: number; // ms epoch
   displayFulfillmentStatus: string; // FULFILLED | UNFULFILLED | PARTIALLY_FULFILLED | ...
-  totalUsd: number;
+  currencyCode: string;
+  currentTotal: number;
+  financialStatus: string;
+  test: boolean;
+  cancelled: boolean;
+  creditAdjustmentState: "none" | "partial" | "full";
   lineItems: ShopifyOrderLine[];
 }
 
 /**
- * List orders created in the trailing `sinceDays` window (default 60). NOTE: the `read_orders`
+ * List orders from an exact cutoff, or a trailing `sinceDays` window for standalone callers.
+ * Snapshot orchestration always supplies the durable Convex-owned cutoff. NOTE: the `read_orders`
  * scope only exposes the **last 60 days** of orders by default — older history needs Shopify's
  * `read_all_orders` protected scope (app approval). 60 days is the safe default. Cursor-paginated,
  * 50 per page, capped at 250 orders.
  */
-export async function listOrders(
+export async function listOrdersWithCoverage(
   cfg: ShopifyClientConfig,
-  { sinceDays = 60, limit = 250 }: { sinceDays?: number; limit?: number } = {},
-): Promise<ShopifyOrder[]> {
+  { createdAtMin, sinceDays = 60, limit = 250 }: { createdAtMin?: number; sinceDays?: number; limit?: number } = {},
+): Promise<ShopifyBoundedRead<ShopifyOrder>> {
   const cap = Math.min(limit, 250);
-  const sinceIso = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+  const cutoff = createdAtMin ?? Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+  if (!Number.isFinite(cutoff)) throw new Error("Shopify order cutoff is invalid");
+  const sinceIso = new Date(cutoff).toISOString();
   const queryFilter = `created_at:>=${sinceIso}`;
   const out: ShopifyOrder[] = [];
   let after: string | null = null;
+  let hasMore = false;
   while (out.length < cap) {
     const pageSize = Math.min(50, cap - out.length);
     const data: {
@@ -184,7 +209,11 @@ export async function listOrders(
           name: string;
           createdAt: string;
           displayFulfillmentStatus: string;
-          totalPriceSet: { shopMoney: { amount: string } };
+          displayFinancialStatus: string | null;
+          test: boolean;
+          cancelledAt: string | null;
+          currentTotalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+          refunds: Array<{ id: string }>;
           lineItems: { nodes: Array<{ quantity: number; product: { id: string } | null }> };
         }>;
       };
@@ -195,24 +224,38 @@ export async function listOrders(
         name: n.name,
         createdAt: Date.parse(n.createdAt),
         displayFulfillmentStatus: n.displayFulfillmentStatus,
-        totalUsd: Number(n.totalPriceSet?.shopMoney?.amount ?? 0) || 0,
+        currencyCode: n.currentTotalPriceSet.shopMoney.currencyCode,
+        currentTotal: Number(n.currentTotalPriceSet.shopMoney.amount),
+        financialStatus: n.displayFinancialStatus ?? "UNKNOWN",
+        test: n.test,
+        cancelled: n.cancelledAt !== null,
+        creditAdjustmentState: n.displayFinancialStatus === "REFUNDED" ? "full"
+          : n.displayFinancialStatus === "PARTIALLY_REFUNDED" || n.refunds.length ? "partial" : "none",
         lineItems: n.lineItems.nodes.map((li) => ({
           productId: li.product?.id ?? null,
           quantity: li.quantity,
         })),
       });
     }
-    if (!data.orders.pageInfo.hasNextPage) break;
+    hasMore = data.orders.pageInfo.hasNextPage;
+    if (!hasMore) break;
     after = data.orders.pageInfo.endCursor;
     if (!after) break;
   }
-  return out.slice(0, cap);
+  return { items: out.slice(0, cap), complete: !hasMore };
+}
+
+export async function listOrders(
+  cfg: ShopifyClientConfig,
+  options: { createdAtMin?: number; sinceDays?: number; limit?: number } = {},
+): Promise<ShopifyOrder[]> {
+  return (await listOrdersWithCoverage(cfg, options)).items;
 }
 
 const PRODUCT_CREATE = /* GraphQL */ `
-  mutation productCreate($input: ProductInput!) {
-    productCreate(input: $input) {
-      product { id title handle }
+  mutation productCreate($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
+    productCreate(product: $product, media: $media) {
+      product { id title handle media(first: 1) { nodes { mediaContentType } } variants(first: 1) { nodes { id } } }
       userErrors { field message }
     }
   }
@@ -222,21 +265,58 @@ export interface ProductCreateInput {
   title: string;
   descriptionHtml?: string;
   vendor?: string;
-  status?: "ACTIVE" | "DRAFT";
+  /** Server-derived only. Shopify's initial variant gets this exact approved sell price. */
+  priceUsd: number;
+  /** Server-derived CJ VID, retained as Shopify SKU for exact order-lineage mapping. */
+  cjVariantId: string;
+  /** Exact HTTPS media URL from immutable CJ evidence. */
+  mediaUrl: string;
 }
+
+const PRODUCT_VARIANTS_BULK_UPDATE = /* GraphQL */ `
+  mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      productVariants { id price sku }
+      userErrors { field message }
+    }
+  }
+`;
 
 export async function productCreate(
   cfg: ShopifyClientConfig,
   input: ProductCreateInput,
-): Promise<{ id: string; title: string; handle: string }> {
+): Promise<{ id: string; title: string; handle: string; variantId: string }> {
+  if (!Number.isFinite(input.priceUsd) || input.priceUsd <= 0) throw new Error("productCreate requires a positive verified price");
+  if (!input.cjVariantId.trim()) throw new Error("productCreate requires an exact CJ variant");
+  try {
+    const mediaUrl = new URL(input.mediaUrl);
+    if (mediaUrl.protocol !== "https:") throw new Error("not HTTPS");
+  } catch {
+    throw new Error("productCreate requires verified HTTPS media");
+  }
   const data = await graphql<{
-    productCreate: { product: { id: string; title: string; handle: string } | null; userErrors: Array<{ message: string }> };
-  }>(cfg, PRODUCT_CREATE, { input });
+    productCreate: { product: { id: string; title: string; handle: string; media: { nodes: Array<{ mediaContentType: string }> }; variants: { nodes: Array<{ id: string }> } } | null; userErrors: Array<{ message: string }> };
+  }>(cfg, PRODUCT_CREATE, {
+    product: { title: input.title, ...(input.descriptionHtml ? { descriptionHtml: input.descriptionHtml } : {}), ...(input.vendor ? { vendor: input.vendor } : {}), status: "DRAFT" },
+    media: [{ originalSource: input.mediaUrl, mediaContentType: "IMAGE" }],
+  });
   const { product, userErrors } = data.productCreate;
-  if (userErrors.length || !product) {
+  const variantId = product?.variants.nodes[0]?.id;
+  if (userErrors.length || !product || !variantId || !product.media.nodes.some((media) => media.mediaContentType === "IMAGE")) {
     throw new Error(`productCreate failed: ${userErrors.map((e) => e.message).join("; ") || "no product"}`);
   }
-  return product;
+  const variants = await graphql<{
+    productVariantsBulkUpdate: { productVariants: Array<{ id: string; price: string; sku: string | null }>; userErrors: Array<{ message: string }> };
+  }>(cfg, PRODUCT_VARIANTS_BULK_UPDATE, {
+    productId: product.id,
+    variants: [{ id: variantId, price: input.priceUsd.toFixed(2), sku: input.cjVariantId }],
+  });
+  const updatedVariant = variants.productVariantsBulkUpdate.productVariants.find((candidate) => candidate.id === variantId);
+  if (variants.productVariantsBulkUpdate.userErrors.length || !updatedVariant
+    || Number(updatedVariant.price) !== Number(input.priceUsd.toFixed(2)) || updatedVariant.sku !== input.cjVariantId) {
+    throw new Error(`productVariantsBulkUpdate failed: ${variants.productVariantsBulkUpdate.userErrors.map((e) => e.message).join("; ") || "exact price/variant was not returned"}`);
+  }
+  return { id: product.id, title: product.title, handle: product.handle, variantId };
 }
 
 const PAGE_CREATE = /* GraphQL */ `
@@ -267,6 +347,91 @@ export async function pageCreate(
   return created;
 }
 
+// ── Zero-charge sandbox checkout ────────────────────────────────────────────
+// A draft is intentionally NOT completed and its invoice is never sent. It exercises the
+// merchant's Draft Orders scope/checkout configuration without creating a payable order,
+// reserving inventory, notifying a customer, or invoking fulfillment.
+const DRAFT_ORDER_CREATE = /* GraphQL */ `
+  mutation draftOrderCreate($input: DraftOrderInput!) {
+    draftOrderCreate(input: $input) {
+      draftOrder { id name invoiceUrl status totalPriceSet { shopMoney { amount currencyCode } } }
+      userErrors { field message }
+    }
+  }
+`;
+
+export interface ZeroChargeDraftCheckoutInput {
+  /** Stable caller-generated trace id. It is stored on the draft for manual reconciliation. */
+  traceId: string;
+}
+
+export interface ZeroChargeDraftCheckout {
+  id: string;
+  name: string;
+  invoiceUrl: string | null;
+  totalAmount: string;
+  currencyCode: string;
+}
+
+/**
+ * Create a $0, non-shippable custom line item for a development-store checkout trace.
+ * Never call draftOrderInvoiceSend or draftOrderComplete from this control plane: either action
+ * turns this isolated trace into a customer/order side effect.
+ */
+export async function createZeroChargeDraftCheckout(
+  cfg: ShopifyClientConfig,
+  input: ZeroChargeDraftCheckoutInput,
+): Promise<ZeroChargeDraftCheckout> {
+  if (!input.traceId.trim()) throw new Error("shopify sandbox checkout: traceId is required");
+  if (!sandboxShopAllowed(cfg.shop)) {
+    throw new Error("shopify sandbox checkout is disabled or this shop is not allowlisted");
+  }
+  const data = await graphql<{
+    draftOrderCreate: {
+      draftOrder: {
+        id: string;
+        name: string;
+        invoiceUrl: string | null;
+        status: string;
+        totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+      } | null;
+      userErrors: Array<{ message: string }>;
+    };
+  }>(cfg, DRAFT_ORDER_CREATE, {
+    input: {
+      // A custom $0 line avoids inventory reservation and makes the no-charge property explicit.
+      lineItems: [{
+        title: "JARVIS sandbox checkout verification — no fulfillment",
+        quantity: 1,
+        originalUnitPrice: "0.00",
+        requiresShipping: false,
+        taxable: false,
+      }],
+      customAttributes: [
+        { key: "jarvis_mode", value: "sandbox" },
+        { key: "jarvis_trace_id", value: input.traceId },
+        { key: "fulfillment", value: "disabled" },
+      ],
+      note: `JARVIS zero-charge sandbox trace ${input.traceId}. Do not invoice or complete.`,
+      tags: ["jarvis-sandbox", "zero-charge", "do-not-complete"],
+    },
+  });
+  const { draftOrder, userErrors } = data.draftOrderCreate;
+  if (userErrors.length || !draftOrder) {
+    throw new Error(`draftOrderCreate failed: ${userErrors.map((e) => e.message).join("; ") || "no draft order"}`);
+  }
+  if (Number(draftOrder.totalPriceSet.shopMoney.amount) !== 0) {
+    throw new Error("sandbox checkout invariant failed: draft order total is not zero");
+  }
+  return {
+    id: draftOrder.id,
+    name: draftOrder.name,
+    invoiceUrl: draftOrder.invoiceUrl,
+    totalAmount: draftOrder.totalPriceSet.shopMoney.amount,
+    currencyCode: draftOrder.totalPriceSet.shopMoney.currencyCode,
+  };
+}
+
 const FULFILLMENT_TRACKING_UPDATE = /* GraphQL */ `
   mutation fulfillmentTrackingInfoUpdate($fulfillmentId: ID!, $trackingInfoInput: FulfillmentTrackingInput!, $notifyCustomer: Boolean) {
     fulfillmentTrackingInfoUpdate(
@@ -292,6 +457,8 @@ export async function fulfillmentTrackingInfoUpdate(
   tracking: TrackingInfo,
   notifyCustomer = true,
 ): Promise<{ id: string; status: string }> {
+  // Keep this provider mutation closed even if a future caller bypasses the webhook worker.
+  assertLiveEffectsEnabled("live");
   const data = await graphql<{
     fulfillmentTrackingInfoUpdate: { fulfillment: { id: string; status: string } | null; userErrors: Array<{ message: string }> };
   }>(cfg, FULFILLMENT_TRACKING_UPDATE, {

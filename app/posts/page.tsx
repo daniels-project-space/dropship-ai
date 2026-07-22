@@ -170,7 +170,8 @@ function PostDrawer({ post, onClose }: { post: BoardPost | null; onClose: () => 
         </dl>
         <p className="text-[12px] leading-relaxed text-ink-faint">
           Views on published posts feed the day-30 viability gate. Cold-start posts publish semi-manual
-          until Ayrshare is linked; after that the brain schedules automatically.
+          until exact publication authorization is recorded. Automated mode additionally requires
+          verified target accounts and the deployment live-effects gate.
         </p>
       </div>
     </Drawer>
@@ -265,7 +266,7 @@ function DistributionBoardInner() {
                 </svg>
               }
               title="No posts published yet"
-              body="Approve a creative in the Studio to push it down this pipeline. Each platform gets a row here — semi-manual at cold-start, automated once Ayrshare is connected — and views feed the day-30 gate above."
+              body="Approve the content, then separately authorize the exact caption, platforms and target accounts. Only that second action creates rows here; automated mode remains gated by verified targets and live-effects acknowledgement."
             />
           ) : (
             <div className="flex flex-col gap-3">

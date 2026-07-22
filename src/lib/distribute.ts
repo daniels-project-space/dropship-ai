@@ -10,9 +10,10 @@
 //   with status "awaiting_manual_publish" (Daniel taps publish). This module returns a
 //   directive telling the caller to take Path B; it does NOT touch Convex itself.
 import { getKey } from "./vault";
+import { assertLiveEffectsEnabled } from "./effects";
 
 const AYRSHARE_BASE = "https://api.ayrshare.com/api";
-export const PLATFORMS = ["tiktok", "instagram", "youtube"] as const;
+export const PLATFORMS = ["tiktok", "instagram", "youtube", "facebook"] as const;
 export type Platform = (typeof PLATFORMS)[number];
 
 export type CreativeForPublish = {
@@ -24,7 +25,7 @@ export type CreativeForPublish = {
 };
 
 export type DistributeResult =
-  | { mode: "ayrshare"; ok: true; platforms: Platform[]; postIds: Record<string, string>; aiFlagSet: true }
+  | { mode: "ayrshare"; ok: true; platforms: Platform[]; postIds: Record<string, string>; missingPlatforms: Platform[]; providerReceiptId?: string; providerErrors?: unknown; aiFlagSet: true }
   | { mode: "semi_manual"; ok: true; reason: string }
   | { mode: "blocked"; ok: false; reason: string };
 
@@ -51,8 +52,26 @@ export async function ayrshareAvailable(): Promise<boolean> {
  * a semi_manual directive (caller writes an "awaiting_manual_publish" post row). Always passes the
  * label gate first.
  */
-export async function distribute(c: CreativeForPublish): Promise<DistributeResult> {
+export async function distribute(
+  c: CreativeForPublish,
+  options: {
+    distributionMode: "semi_manual" | "automated";
+    idempotencyKey?: string;
+    destinations: Array<{ platform: Platform; targetAccount: string }>;
+  },
+): Promise<DistributeResult> {
   assertLabelGate(c); // throws on any unlabeled AI asset — hard stop
+  if (!options.destinations.length || new Set(options.destinations.map((d) => d.platform)).size !== options.destinations.length
+    || options.destinations.some((d) => !d.targetAccount.trim())) {
+    return { mode: "blocked", ok: false, reason: "publication authorization has invalid target destinations" };
+  }
+
+  // An approved creative is not itself permission to publish unless the brand explicitly opted
+  // into automated distribution and the deployment has the two-key live-effects acknowledgement.
+  if (options.distributionMode !== "automated") {
+    return { mode: "semi_manual", ok: true, reason: "brand is in semi-manual distribution mode; operator must publish externally." };
+  }
+  assertLiveEffectsEnabled("live");
 
   const key = await getKey("ayrshare", "AYRSHARE_API_KEY");
   if (!key) {
@@ -63,13 +82,33 @@ export async function distribute(c: CreativeForPublish): Promise<DistributeResul
     };
   }
 
+  // The authorization stores public account identities, never profile credentials. Verify the
+  // exact selected accounts with a fresh read before crossing the publication boundary.
+  const accountResponse = await fetch(`${AYRSHARE_BASE}/user`, {
+    headers: { Authorization: `Bearer ${key}` }, cache: "no-store",
+  });
+  const accountJson = (await accountResponse.json().catch(() => ({}))) as {
+    displayNames?: Array<{ platform?: string; id?: string; username?: string; displayName?: string }>;
+  };
+  if (!accountResponse.ok) return { mode: "blocked", ok: false, reason: `ayrshare target verification failed: HTTP ${accountResponse.status}` };
+  const accounts = accountJson.displayNames ?? [];
+  for (const destination of options.destinations) {
+    const match = accounts.some((account) => account.platform === destination.platform
+      && [account.id, account.username, account.displayName].some((identity) => identity === destination.targetAccount));
+    if (!match) return { mode: "blocked", ok: false, reason: `authorized ${destination.platform} target account is not currently linked` };
+  }
+  const requestedPlatforms = options.destinations.map((d) => d.platform);
+
   const res = await fetch(`${AYRSHARE_BASE}/post`, {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       post: c.caption,
-      platforms: [...PLATFORMS],
+      platforms: requestedPlatforms,
       mediaUrls: [c.mediaUrl],
+      // Ayrshare deduplicates this key. Our durable target lock prevents concurrent submissions,
+      // and this provider fence protects a later retry of the exact immutable distribution intent.
+      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey, notes: options.idempotencyKey } : {}),
       // AI-content disclosure flags (platform + Ayrshare meta) — set because the asset is AI-made.
       isVideo: true,
       tiktokOptions: { aiGeneratedContent: true },
@@ -81,10 +120,13 @@ export async function distribute(c: CreativeForPublish): Promise<DistributeResul
   });
   const json = (await res.json().catch(() => ({}))) as {
     status?: string;
+    id?: string;
     postIds?: Array<{ platform: string; id?: string; postUrl?: string }>;
     errors?: unknown;
   };
-  if (!res.ok || json.status === "error") {
+  // Ayrshare may return successful receipts for only some platforms with top-level status=error.
+  // Preserve those receipts; callers must reconcile the missing platforms and never rebroadcast.
+  if (!res.ok && !(json.postIds?.some((post) => typeof post.id === "string" && post.id.trim()))) {
     return {
       mode: "blocked",
       ok: false,
@@ -96,5 +138,29 @@ export async function distribute(c: CreativeForPublish): Promise<DistributeResul
   for (const p of json.postIds ?? []) {
     if (p.id) postIds[p.platform] = p.id;
   }
-  return { mode: "ayrshare", ok: true, platforms: [...PLATFORMS], postIds, aiFlagSet: true };
+  const missingPlatforms = requestedPlatforms.filter((platform) => !postIds[platform]);
+  return {
+    mode: "ayrshare",
+    ok: true,
+    platforms: requestedPlatforms,
+    postIds,
+    missingPlatforms,
+    providerReceiptId: typeof json.id === "string" && json.id.trim() ? json.id : undefined,
+    providerErrors: json.errors,
+    aiFlagSet: true,
+  };
+}
+
+/** Read-only receipt reconciliation. It intentionally has no POST fallback. */
+export async function reconcileAyrsharePost(providerReceiptId: string, requestedPlatforms: Platform[]): Promise<{ postIds: Record<string, string>; missingPlatforms: Platform[]; providerErrors?: unknown }> {
+  const key = await getKey("ayrshare", "AYRSHARE_API_KEY");
+  if (!key) throw new Error("AYRSHARE_API_KEY absent; provider receipt cannot be reconciled");
+  const res = await fetch(`${AYRSHARE_BASE}/post/${encodeURIComponent(providerReceiptId)}`, {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  const json = (await res.json().catch(() => ({}))) as { postIds?: Array<{ platform: string; id?: string }>; errors?: unknown };
+  if (!res.ok) throw new Error(`ayrshare receipt reconciliation failed: HTTP ${res.status}`);
+  const postIds: Record<string, string> = {};
+  for (const post of json.postIds ?? []) if (post.id?.trim()) postIds[post.platform] = post.id;
+  return { postIds, missingPlatforms: requestedPlatforms.filter((platform) => !postIds[platform]), providerErrors: json.errors };
 }

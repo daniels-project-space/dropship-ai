@@ -11,6 +11,8 @@ export type PortfolioSite = {
   status: SiteStatus;
   distributionMode: "semi_manual" | "automated";
   shopifyDomain: string | null;
+  shopifyNeedsReverification: boolean;
+  shopifyEconomicsSyncState: "not_connected" | "needs_reverification" | "pending" | "current" | "stale" | "failed" | "incomplete";
   customDomain: string | null;
   killDate: number | null;
   pendingActionCount: number;
@@ -93,6 +95,17 @@ export function SiteCard({ site, index = 0 }: { site: PortfolioSite; index?: num
         </span>
       </div>
 
+      {site.shopifyNeedsReverification && (
+        <p className="mt-3 rounded-lg border border-pending/25 bg-pending/5 px-3 py-2 text-[11px] text-pending">
+          Shopify needs re-verification; order and revenue readiness is withheld.
+        </p>
+      )}
+      {!site.shopifyNeedsReverification && site.shopifyEconomicsSyncState !== "current" && (
+        <p className="mt-3 rounded-lg border border-pending/25 bg-pending/5 px-3 py-2 text-[11px] text-pending">
+          Economics sync is {site.shopifyEconomicsSyncState.replaceAll("_", " ")}; zero revenue is not launch-ready evidence.
+        </p>
+      )}
+
       <div className="mt-6 grid grid-cols-3 gap-4 border-t border-line-soft pt-5">
         <Metric
           value={site.pendingActionCount}
@@ -100,8 +113,8 @@ export function SiteCard({ site, index = 0 }: { site: PortfolioSite; index?: num
           accent={hasPending}
           pulse={hasPending}
         />
-        <Metric value={site.activeProductCount} label="Live products" />
-        <Metric value={site.ordersAwaitingFulfillment} label="Open orders" />
+        <Metric value={site.activeProductCount} label="Active products" />
+        <Metric value={site.shopifyEconomicsSyncState === "current" ? site.ordersAwaitingFulfillment : "—"} label="Open orders" />
       </div>
 
       <div className="mt-5 flex items-center justify-between">

@@ -20,6 +20,7 @@ import { AreaChart, LineChart, BarChart, Funnel, RadialGauge, Heatmap, MiniBars 
 import { StatusDot } from "./StatusDot";
 import { Icon } from "./Icons";
 import { fmtUsd, fmtCompact, PLATFORM, type Platform } from "./tokens";
+import { commercePresentationState } from "@/src/lib/commercePresentation";
 
 type Timeframe = 7 | 30 | 90;
 type PlatformFilter = "all" | Platform;
@@ -31,7 +32,7 @@ type TopProduct = {
   title: string;
   siteName: string;
   views: number;
-  cvr: number;
+  cvr: number | null;
   marginPct: number | null;
   priceUsd: number;
   trend: number[];
@@ -42,33 +43,43 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
   const [tf, setTf] = useState<Timeframe>(30);
   const [pf, setPf] = useState<PlatformFilter>("all");
 
-  // primary metric series + secondary series, all scoped + windowed (re-queries on tf/pf change)
-  const revenue = useQuery(api.dashboard.timeseries, { scope, metric: "revenue", days: tf });
-  const orders = useQuery(api.dashboard.timeseries, { scope, metric: "orders", days: tf });
-  const views = useQuery(api.dashboard.timeseries, { scope, metric: "views", days: tf, platform: pf });
-  const engagement = useQuery(api.dashboard.timeseries, { scope, metric: "engagement", days: tf, platform: pf });
-  const platforms = useQuery(api.dashboard.platformBreakdown, { scope, days: tf });
-  const funnel = useQuery(api.dashboard.funnel, { scope, days: tf });
-  const products = useQuery(api.dashboard.topProducts, { scope, limit: 6 });
-  const insights = useQuery(api.insights.list, { scope, days: tf });
-  const cadence = useQuery(api.dashboard.postingCadence, { scope, days: 84 });
-  const gate = useQuery(api.dashboard.contentFitGate, scope === "all" ? {} : { siteId: scope as never });
-  const portfolio = useQuery(api.dashboard.portfolio);
+  const snapshot = useQuery(api.dashboard.commandCenterSnapshot, { scope, days: tf, platform: pf });
+  const data = snapshot?.projectionState === "ready" || snapshot?.projectionState === "legacy" ? snapshot : undefined;
+  const revenue = data?.revenue;
+  const orders = data?.orders;
+  const views = data?.views;
+  const engagement = data?.engagement;
+  const platforms = data?.platforms;
+  const funnel = data?.funnel;
+  const products = data?.products;
+  const insights = data?.insights;
+  const cadence = data?.cadence;
+  const gate = data?.gate;
   const recent = useQuery(
     scope === "all" ? api.audit.listRecent : api.audit.listBySite,
     scope === "all" ? { limit: 8 } : ({ siteId: scope as never, limit: 8 } as never),
   );
 
   const tfLabel = `${tf}d`;
+  const commerce = commercePresentationState({
+    days: tf,
+    revenueVerified: revenue?.commerceVerified,
+    ordersVerified: orders?.commerceVerified,
+    funnelVerified: funnel?.commerceVerified,
+  });
+  const commerceVerified = commerce.verified;
+  const commerceLoading = commerce.loading;
+  const commerceAwaiting = commerce.detail;
 
   // KPI strip values
   const netRevenue = revenue?.total ?? 0;
   const orderCount = orders?.total ?? 0;
   const viewTotal = views?.total ?? 0;
-  const pendingTotal = portfolio?.totalPendingActions ?? 0;
+  const pendingTotal = data?.pendingTotal ?? 0;
   // contribution margin: weighted from top products (representative blended)
-  const marginVals = (products ?? []).map((p) => p.marginPct).filter((m): m is number => m != null);
-  const blendedMargin = marginVals.length ? marginVals.reduce((s, m) => s + m, 0) / marginVals.length : 0;
+  const marginVals = (products ?? []).map((p: TopProduct) => p.marginPct).filter((m: number | null): m is number => m != null);
+  const blendedMargin = marginVals.length ? marginVals.reduce((s: number, m: number) => s + m, 0) / marginVals.length : 0;
+  const marginVerified = commerceVerified && marginVals.length > 0;
   const gatePassed = gate?.passed ?? false;
   const bestVideoViews = gate?.bestVideo?.views ?? 0;
 
@@ -117,9 +128,9 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
       header: "CVR",
       align: "right",
       sortable: true,
-      sortValue: (r) => r.cvr,
+      sortValue: (r) => r.cvr ?? 0,
       hideBelow: "sm",
-      render: (r) => <span className="num text-ink-dim">{r.cvr.toFixed(1)}%</span>,
+      render: (r) => r.cvr == null ? <span className="text-ink-faint">Unavailable</span> : <span className="num text-ink-dim">{r.cvr.toFixed(1)}%</span>,
     },
     {
       key: "margin",
@@ -199,36 +210,37 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
           <KpiTile
             key="rev"
             label={`Net revenue · ${tfLabel}`}
-            numericValue={netRevenue}
-            format={(n) => fmtUsd(n, 0)}
-            delta={revenue?.deltaPct ?? null}
+            {...(commerceVerified ? { numericValue: netRevenue, format: (n: number) => fmtUsd(n, 0) } : { value: "Unverified" })}
+            delta={commerceVerified ? revenue?.deltaPct ?? null : undefined}
             deltaLabel="vs prior"
-            spark={spark(revenue)}
+            spark={commerceVerified ? spark(revenue) : undefined}
             sparkColor={C.live}
-            dotHex={C.live}
-            accent="text-ink"
-            loading={revenue === undefined}
-            hint="take-home after platform fees"
+            dotHex={commerceVerified ? C.live : C.pending}
+            accent={commerceVerified ? "text-ink" : "text-pending"}
+            loading={commerceLoading}
+            hint={commerceVerified ? "take-home after platform fees" : commerceAwaiting}
           />,
           <KpiTile
             key="margin"
             label="Contribution margin"
-            numericValue={blendedMargin}
-            format={(n) => `${Math.round(n)}%`}
-            accent={blendedMargin >= 70 ? "text-live" : "text-ink"}
+            {...(marginVerified ? { numericValue: blendedMargin, format: (n: number) => `${Math.round(n)}%` } : { value: "Unverified" })}
+            accent={marginVerified ? (blendedMargin >= 70 ? "text-live" : "text-ink") : "text-pending"}
             sparkColor={C.signal}
-            loading={products === undefined}
-            hint="blended across top products"
+            loading={products === undefined || commerceLoading}
+            hint={marginVerified ? "blended across top products" : commerceVerified ? "Awaiting verified cost evidence" : commerceAwaiting}
           />,
           <KpiTile
             key="orders"
             label={`Orders · ${tfLabel}`}
-            numericValue={orderCount}
-            delta={orders?.deltaPct ?? null}
+            {...(commerceVerified ? { numericValue: orderCount } : { value: "Unverified" })}
+            delta={commerceVerified ? orders?.deltaPct ?? null : undefined}
             deltaLabel="vs prior"
-            spark={spark(orders)}
+            spark={commerceVerified ? spark(orders) : undefined}
             sparkColor={C.cyan}
-            loading={orders === undefined}
+            dotHex={commerceVerified ? C.cyan : C.pending}
+            accent={commerceVerified ? "text-ink" : "text-pending"}
+            loading={commerceLoading}
+            hint={commerceVerified ? undefined : commerceAwaiting}
           />,
           <KpiTile
             key="views"
@@ -264,30 +276,30 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
           <div>
             <span className="label-eyebrow text-signal">Revenue &amp; contribution</span>
             <p className="mt-2.5 font-display text-[2rem] font-medium tabular-nums leading-none text-ink">
-              {revenue === undefined ? "—" : fmtUsd(netRevenue, 0)}
+              {commerceLoading ? "—" : commerceVerified ? fmtUsd(netRevenue, 0) : "Unverified"}
             </p>
-            <p className="mt-2 num text-[11px] text-ink-faint">trailing {tfLabel} · daily net revenue</p>
+            <p className="mt-2 num text-[11px] text-ink-faint">{commerceVerified ? `trailing ${tfLabel} · daily net revenue` : commerceAwaiting}</p>
           </div>
           <div className="flex items-center gap-2.5">
-            {revenue?.deltaPct != null && (
+            {commerceVerified && revenue?.deltaPct != null && (
               <span className="inline-flex items-center gap-1.5 rounded-full border border-line-soft bg-panel-2/60 px-2.5 py-1.5">
                 <MetricDelta value={revenue.deltaPct} />
                 <span className="caption text-ink-faint">vs prior {tfLabel}</span>
               </span>
             )}
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-live/25 bg-live/5 px-2.5 py-1.5">
-              <StatusDot className="bg-live" hex={C.live} live size={6} />
-              <span className="caption uppercase tracking-wider text-ink-dim">Live</span>
+            <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 ${commerceVerified ? "border-live/25 bg-live/5" : "border-pending/25 bg-pending/5"}`}>
+              <StatusDot className={commerceVerified ? "bg-live" : "bg-pending"} hex={commerceVerified ? C.live : C.pending} live={commerceVerified} size={6} />
+              <span className="caption uppercase tracking-wider text-ink-dim">{commerce.label}</span>
             </span>
           </div>
         </div>
         <AreaChart
-          data={(revenue?.points ?? []).map((p) => ({ label: p.day.slice(5), value: p.value }))}
+          data={commerceVerified ? (revenue?.points ?? []).map((p) => ({ label: p.day.slice(5), value: p.value })) : []}
           color={C.signal}
           height={272}
           valuePrefix="$"
           format={(n) => n.toLocaleString("en-US", { maximumFractionDigits: 0 })}
-          emptyHint="Revenue populates once orders flow in this window."
+          emptyHint={commerceVerified ? "Revenue populates once orders flow in this window." : `${commerceAwaiting}; commerce values are withheld.`}
         />
       </div>
 
@@ -311,12 +323,24 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
         <div className="panel animate-rise flex min-h-[328px] flex-col rounded-2xl p-6" style={{ animationDelay: "200ms" }}>
           <SectionHeader eyebrow="Conversion funnel" accent="text-cyan" meta={tfLabel} />
           <div className="flex flex-1 flex-col justify-center">
-            <Funnel
-              stages={funnel?.stages ?? []}
-              color={C.cyan}
-              format={(n) => fmtCompact(n)}
-              emptyHint="Funnel populates once traffic flows."
-            />
+            {funnel?.conversionAvailability.state === "unavailable" ? (
+              <div className="rounded-xl border border-pending/25 bg-pending/5 px-4 py-5 text-center">
+                <p className="font-medium text-pending">Provider conversion unavailable</p>
+                <p className="mt-1 text-[12px] leading-relaxed text-ink-dim">{funnel.conversionAvailability.reason}</p>
+              </div>
+            ) : commerceVerified ? (
+              <Funnel
+                stages={funnel?.stages ?? []}
+                color={C.cyan}
+                format={(n) => fmtCompact(n)}
+                emptyHint="Funnel populates once traffic flows."
+              />
+            ) : (
+              <div className="rounded-xl border border-pending/25 bg-pending/5 px-4 py-5 text-center">
+                <p className="font-medium text-pending">Commerce unverified</p>
+                <p className="mt-1 text-[12px] leading-relaxed text-ink-dim">{commerceAwaiting}. Content reach remains available.</p>
+              </div>
+            )}
           </div>
         </div>
 

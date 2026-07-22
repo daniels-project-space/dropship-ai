@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
@@ -38,6 +39,80 @@ const RUBRIC = [
   { label: "Min kit price floor", note: "premium positioning", key: "price" },
   { label: "Sustained trend signal", note: "not a 2-week spike", key: "trend" },
 ];
+
+function SourceCjCandidate({ siteId }: { siteId: Id<"sites"> }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<Array<{ cjProductId: string; title: string; variants: Array<{ cjVariantId: string; label: string; inventoryQty: number | null; cogsUsd: number | null; shippingUsd: number | null }> }>>([]);
+  const [cjProductId, setCjProductId] = useState("");
+  const [cjVariantId, setCjVariantId] = useState("");
+  const [requestId, setRequestId] = useState("");
+  const [priceUsd, setPriceUsd] = useState("");
+  const [attemptTerminal, setAttemptTerminal] = useState(false);
+  const [state, setState] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function search() {
+    setBusy(true);
+    setState(null);
+    try {
+      const response = await fetch(`/api/research/cj-search?q=${encodeURIComponent(query)}`);
+      const result = await response.json() as { error?: string; results?: typeof results };
+      if (!response.ok) throw new Error(result.error ?? "CJ catalogue search failed");
+      setResults(result.results ?? []);
+      if ((result.results ?? []).length === 0) setState("No US-variant CJ results were returned. Nothing was selected or created.");
+    } catch (error) {
+      setState(error instanceof Error ? error.message : "CJ catalogue search failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setState(null);
+    try {
+      const response = await fetch("/api/research/source-cj", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ siteId, requestId, cjProductId, cjVariantId, priceUsd: Number(priceUsd) }),
+      });
+      const result = await response.json() as { error?: string; reason?: string; actionId?: string };
+      if (!response.ok) {
+        // A policy denial is a completed attempt. Keep this requestId for a network retry, but
+        // deliberately mint a new one if the operator corrects the candidate or price.
+        if (response.status === 422) setAttemptTerminal(true);
+        throw new Error(result.reason ?? result.error ?? "candidate was not accepted");
+      }
+      setAttemptTerminal(true);
+      setState(`CJ evidence recorded; approval ${result.actionId} is waiting. No Shopify product has been created.`);
+    } catch (error) {
+      setState(error instanceof Error ? error.message : "candidate was not accepted");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="mt-12">
+      <SectionHeader eyebrow="Search and select a CJ candidate" accent="text-signal" />
+      <div className="panel rounded-2xl p-5">
+        <div className="flex gap-3">
+          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search CJ catalogue" className="min-w-0 flex-1 rounded-lg border border-line bg-void px-3 py-2 text-sm text-ink" />
+          <button type="button" onClick={search} disabled={busy || query.trim().length < 2} className="rounded-lg bg-white/[0.04] px-4 py-2 text-sm font-semibold text-ink ring-1 ring-white/10 disabled:opacity-50">{busy ? "Searching…" : "Search CJ"}</button>
+        </div>
+        {results.length > 0 && <div className="mt-4 space-y-3">{results.map((result) => <div key={result.cjProductId} className="rounded-xl border border-line p-3"><p className="text-sm text-ink">{result.title} <span className="font-mono text-[10px] text-ink-faint">CJ {result.cjProductId}</span></p><div className="mt-2 flex flex-wrap gap-2">{result.variants.map((variant) => <button type="button" key={variant.cjVariantId} onClick={() => { const changed = cjProductId !== result.cjProductId || cjVariantId !== variant.cjVariantId; if (changed) setRequestId(crypto.randomUUID()); setCjProductId(result.cjProductId); setCjVariantId(variant.cjVariantId); if (changed) setAttemptTerminal(false); setState(`Selected ${result.title} / ${variant.label}.`); }} className={`rounded-lg border px-3 py-2 text-left text-[11px] ${cjVariantId === variant.cjVariantId ? "border-signal/70 bg-signal/10 text-signal" : "border-line text-ink-dim"}`}><span className="block">{variant.label} · CJ {variant.cjVariantId}</span><span className="font-mono text-[10px]">US stock {variant.inventoryQty ?? "unknown"} · COGS {variant.cogsUsd == null ? "unknown" : `$${variant.cogsUsd.toFixed(2)}`} · ship {variant.shippingUsd == null ? "unknown" : `$${variant.shippingUsd.toFixed(2)}`}</span></button>)}</div></div>)}</div>}
+      </div>
+      <form onSubmit={submit} className="mt-3 panel grid grid-cols-1 gap-3 rounded-2xl p-5 md:grid-cols-3 md:items-end">
+        <p className="text-[12px] text-ink-dim">{cjProductId ? `Selected CJ ${cjProductId} / ${cjVariantId}` : "Select an exact US CJ variant above."}</p>
+        <label className="block"><span className="label-eyebrow text-[9px]">Proposed price (USD)</span><input required min="0.01" step="0.01" type="number" value={priceUsd} onChange={(e) => { if (attemptTerminal && e.target.value !== priceUsd) { setRequestId(crypto.randomUUID()); setAttemptTerminal(false); } setPriceUsd(e.target.value); }} className="mt-1 w-full rounded-lg border border-line bg-void px-3 py-2 text-sm text-ink" /></label>
+        <button disabled={busy || !requestId} className="rounded-lg bg-signal/15 px-4 py-2 text-sm font-semibold text-signal ring-1 ring-signal/30 disabled:opacity-50">{busy ? "Verifying CJ…" : "Verify & request approval"}</button>
+        <p className="md:col-span-3 text-[12px] leading-relaxed text-ink-faint">The server refreshes the selected CJ facts, persists one trace and server-derived economics, then opens one human approval for a Shopify DRAFT only. Nothing publishes or imports automatically.</p>
+        {state && <p className="md:col-span-3 text-[12px] text-ink-dim">{state}</p>}
+      </form>
+    </section>
+  );
+}
 
 function ExperimentsSection({ siteId }: { siteId: Id<"sites"> }) {
   const experiments = useQuery(api.experiments.listBySite, { siteId, limit: 50 });
@@ -169,6 +244,7 @@ export function ResearchTab({ siteId }: { siteId: Id<"sites"> }) {
         </div>
       </aside>
     </div>
+    <SourceCjCandidate siteId={siteId} />
     <ExperimentsSection siteId={siteId} />
     </>
   );

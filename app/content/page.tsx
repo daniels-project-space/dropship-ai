@@ -1,8 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
+import type { Id } from "@/convex/_generated/dataModel";
+import { normalizeCreativeGenerationInput } from "@/src/lib/creativeGeneration";
+import { confirmPendingCreativeRequest, getOrCreatePendingCreativeRequest } from "@/src/lib/creativeRequestIdentity";
+import { presentCreativeGenerationSuccess } from "@/src/lib/creativeGenerationPresentation";
 import { CreativeCard, type ReviewCreative } from "../components/CreativeCard";
 import { EmptyState } from "../components/EmptyState";
 import { StatusDot } from "../components/StatusDot";
@@ -26,15 +30,21 @@ function GenerateBar({
     setState("running");
     setMsg(null);
     try {
+      const normalized = normalizeCreativeGenerationInput({ siteId, variants: 3 });
+      const pending = getOrCreatePendingCreativeRequest(sessionStorage, normalized, () => crypto.randomUUID());
       const r = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ siteId, variants: 3 }),
+        body: JSON.stringify({ ...normalized, requestId: pending.requestId, inputDigest: pending.inputDigest }),
       });
       const d = await r.json();
       if (r.ok) {
+        if (d.durable === true && typeof d.intentId === "string" && d.intentId
+          && d.requestId === pending.requestId) {
+          confirmPendingCreativeRequest(sessionStorage, pending);
+        }
         setState("done");
-        setMsg(`Batch queued · run ${String(d.runId ?? "").slice(0, 12)}`);
+        setMsg(presentCreativeGenerationSuccess(d.intentId, d.state));
       } else {
         setState("error");
         setMsg(d.error ?? "Generation could not be queued");
@@ -59,7 +69,7 @@ function GenerateBar({
         <div className="relative">
           <select
             value={siteId}
-            onChange={(e) => setSiteId(e.target.value)}
+            onChange={(e) => { setSiteId(e.target.value); setState(null); setMsg(null); }}
             className="w-full appearance-none rounded-lg border border-line bg-panel-2 px-4 py-2.5 pr-9 text-[13px] text-ink outline-none transition focus:border-signal/50 sm:w-52"
           >
             <option value="">Select brand…</option>
@@ -92,12 +102,55 @@ function GenerateBar({
   );
 }
 
+type GenerationProjection = {
+  intentId: Id<"creativeGenerationIntents">;
+  requested: number; active: number; ready: number; failed: number; needsAttention: number;
+  status: string; handoffStatus: string; updatedAt: number;
+  variants: Array<{ variantId: Id<"creativeGenerationVariants">; index: number; stage: string; retryEligible: boolean; lastErrorCode?: string }>;
+};
+
+function GenerationStatus({ rows }: { rows: GenerationProjection[] }) {
+  const retry = useMutation(api.creativeGenerations.retryFailedVariant);
+  const [retrying, setRetrying] = useState<string | null>(null);
+  if (!rows.length) return null;
+  return (
+    <div className="mb-10 space-y-3">
+      <span className="label-eyebrow text-ink-faint">Durable generation state</span>
+      {rows.map((row) => (
+        <div key={row.intentId} className="panel rounded-xl px-5 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[12px]">
+            <span className="font-mono text-ink">{String(row.intentId).slice(0, 12)} · {row.status.replace(/_/g, " ")}</span>
+            <span className="font-mono text-ink-dim">requested {row.requested} · active {row.active} · ready {row.ready} · failed {row.failed} · attention {row.needsAttention}</span>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {row.variants.map((variant) => (
+              <span key={variant.variantId} className="rounded-md border border-line px-2.5 py-1 font-mono text-[10px] text-ink-dim">
+                v{variant.index + 1} · {variant.stage.replace(/_/g, " ")}
+                {variant.retryEligible && (
+                  <button
+                    type="button"
+                    disabled={retrying === variant.variantId}
+                    onClick={async () => { setRetrying(variant.variantId); try { await retry({ variantId: variant.variantId }); } finally { setRetrying(null); } }}
+                    className="ml-2 text-signal hover:text-signal-deep disabled:opacity-50"
+                  >retry proven pre-submit failure</button>
+                )}
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function CreativeStudioPage() {
   const reviews = useQuery(api.creatives.listForReview, {});
-  const portfolio = useQuery(api.dashboard.portfolio);
+  const publicationAuthorizations = useQuery(api.creatives.listForPublicationAuthorization, {});
+  const portfolio = useQuery(api.dashboard.portfolio, {});
+  const generations = useQuery(api.creativeGenerations.listOperatorProjection, { limit: 10 });
 
-  const loading = reviews === undefined;
-  const creatives = (reviews ?? []) as ReviewCreative[];
+  const loading = reviews === undefined || publicationAuthorizations === undefined;
+  const creatives = ([...(reviews ?? []), ...(publicationAuthorizations ?? [])]) as ReviewCreative[];
   const isEmpty = !loading && creatives.length === 0;
   const sites = (portfolio?.sites ?? []).map((s) => ({ siteId: s.siteId, name: s.name }));
   const aiCount = creatives.filter((c) => c.aiLabelRequired).length;
@@ -116,14 +169,15 @@ export default function CreativeStudioPage() {
           </h1>
           <p className="mt-5 max-w-xl text-[15px] leading-relaxed text-ink-dim">
             The factory builds hero assets around the product itself — never uncanny AI dogs. Every
-            AI-touched frame carries a mandatory disclosure label, enforced in code. Approve to push
-            it down the distribution pipeline; reject to discard.
+            AI-touched frame carries a mandatory disclosure label, enforced in code. Approve
+            the content first; publication remains blocked until a separate exact caption, platform,
+            and target-account authorization.
           </p>
 
           {!isEmpty && !loading && (
             <div className="mt-7 flex flex-wrap items-center gap-x-8 gap-y-3 font-mono text-[13px] text-ink-dim">
               <span>
-                <span className="font-display text-2xl text-ink">{creatives.length}</span> in review
+                <span className="font-display text-2xl text-ink">{creatives.length}</span> awaiting a decision
               </span>
               <span className="flex items-center gap-2">
                 <StatusDot className="bg-cyan" hex="#5cc6e8" size={7} />
@@ -134,6 +188,8 @@ export default function CreativeStudioPage() {
 
           <GenerateBar sites={sites} />
         </section>
+
+        <GenerationStatus rows={(generations ?? []) as GenerationProjection[]} />
 
         {loading ? (
           <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">

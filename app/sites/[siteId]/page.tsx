@@ -125,7 +125,7 @@ export default function BrandDetailPage({
       {tab === "orders" && <TabPanel><OrdersTab siteId={siteId} /></TabPanel>}
       {tab === "research" && <TabPanel><ResearchTab siteId={siteId} /></TabPanel>}
       {tab === "activity" && <TabPanel><ActivityTab siteId={siteId} /></TabPanel>}
-      {tab === "settings" && site && <TabPanel><SettingsTab site={site} /></TabPanel>}
+      {tab === "settings" && site && detail && <TabPanel><SettingsTab site={site} detail={detail} /></TabPanel>}
     </PageContainer>
   );
 }

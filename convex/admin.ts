@@ -5,12 +5,14 @@
 // Once the real Calm-Collar creative exists we purge that demo data so the dashboard shows ONLY
 // real, generated assets. These mutations are deliberately explicit (delete by id) rather than a
 // blanket wipe, so they can never touch a real site.
-import { mutation } from "./_generated/server";
+import { mutation } from "./authz";
 import { v } from "convex/values";
+import { deleteSiteProjections, projectActionTransition, projectCreativeTransition, projectProductTransition } from "./dashboardProjections";
 
 /**
  * Cascade-delete a single site and everything scoped to it: creatives, posts, actions, auditLog,
- * products, signals, metrics, siteSecrets, experiments, orders. Index-driven (no full scans).
+ * generation intents/variants, products, signals, metrics, siteSecrets, experiments, orders.
+ * Index-driven (no full scans).
  */
 export const deleteSiteCascade = mutation({
   args: { siteId: v.id("sites") },
@@ -27,6 +29,8 @@ export const deleteSiteCascade = mutation({
     };
 
     await delAll(await ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
+    await delAll(await ctx.db.query("creativeGenerationVariants").withIndex("by_site_updated", (q) => q.eq("siteId", siteId)).collect());
+    await delAll(await ctx.db.query("creativeGenerationIntents").withIndex("by_site_updated", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("posts").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("actions").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("auditLog").withIndex("by_site_at", (q) => q.eq("siteId", siteId)).collect());
@@ -37,6 +41,7 @@ export const deleteSiteCascade = mutation({
     await delAll(await ctx.db.query("experiments").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect());
 
+    await deleteSiteProjections(ctx, site);
     await ctx.db.delete(siteId);
     removed++;
     return { deleted: true, site: site.name, rowsRemoved: removed };
@@ -50,6 +55,7 @@ export const deleteCreative = mutation({
     const c = await ctx.db.get(creativeId);
     if (!c) return { deleted: false };
     await ctx.db.delete(creativeId);
+    await projectCreativeTransition(ctx, c, null);
     return { deleted: true, r2Key: c.r2Key };
   },
 });
@@ -61,6 +67,7 @@ export const deleteAction = mutation({
     const a = await ctx.db.get(actionId);
     if (!a) return { deleted: false };
     await ctx.db.delete(actionId);
+    await projectActionTransition(ctx, a, null);
     return { deleted: true, type: a.type };
   },
 });
@@ -88,6 +95,7 @@ export const deleteProduct = mutation({
       }
     }
     await ctx.db.delete(productId);
+    await projectProductTransition(ctx, p, null);
     return { deleted: true, title: p.title, auditRemoved };
   },
 });

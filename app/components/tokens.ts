@@ -73,7 +73,7 @@ export const PRODUCT_STATUS: Record<ProductStatus, Tone> = {
 
 // ── action lifecycle (full set, for per-brand activity) ─────────────────────
 export type ActionStatus =
-  | "proposed" | "pending_approval" | "approved" | "rejected" | "executing" | "executed" | "failed";
+  | "proposed" | "pending_approval" | "approved" | "rejected" | "executing" | "executed" | "failed" | "superseded";
 export const ACTION_STATUS: Record<ActionStatus, Tone> = {
   pending_approval: { label: "Pending", text: "text-pending", dot: "bg-pending", hex: "#f0a93b", ring: "bg-pending/10 text-pending ring-1 ring-pending/30" },
   proposed: { label: "Proposed", text: "text-cyan", dot: "bg-cyan", hex: "#5cc6e8", ring: "bg-cyan/10 text-cyan ring-1 ring-cyan/25" },
@@ -82,6 +82,7 @@ export const ACTION_STATUS: Record<ActionStatus, Tone> = {
   executed: { label: "Executed", text: "text-live", dot: "bg-live", hex: "#44d6a0", ring: "bg-live/10 text-live ring-1 ring-live/25" },
   rejected: { label: "Rejected", text: "text-ink-dim", dot: "bg-ink-faint", hex: "#5d6878", ring: "bg-white/5 text-ink-dim ring-1 ring-white/10" },
   failed: { label: "Failed", text: "text-danger", dot: "bg-danger", hex: "#ef6b6b", ring: "bg-danger/10 text-danger ring-1 ring-danger/25" },
+  superseded: { label: "Superseded", text: "text-ink-dim", dot: "bg-ink-faint", hex: "#5d6878", ring: "bg-white/5 text-ink-dim ring-1 ring-white/10" },
 };
 
 // ── distribution: platforms + post status + fulfillment ─────────────────────

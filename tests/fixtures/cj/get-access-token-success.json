@@ -1,0 +1,15 @@
+{
+  "code": 200,
+  "result": true,
+  "message": "Success",
+  "data": {
+    "openId": 123456789,
+    "accessToken": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "accessTokenExpiryDate": "2021-08-18T09:16:33+08:00",
+    "refreshToken": "f7edabe65c3b4a198b50ca8f969e36eb",
+    "refreshTokenExpiryDate": "2022-02-07T09:16:33+08:00",
+    "createDate": "2021-08-11T09:16:33+08:00"
+  },
+  "requestId": "8b3d9ea1-00c3-4d10-9e2b-d18041d98080",
+  "success": true
+}

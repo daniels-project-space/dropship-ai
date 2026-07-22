@@ -1,17 +1,11 @@
-// POST /api/webhooks/shopify — inbound Shopify webhook (Phase 2a: built but DORMANT).
-//
-// Activated later, once webhooks are registered in Shopify and SHOPIFY_WEBHOOK_SECRET is in place
-// (env or vault service "shopify" key "WEBHOOK_SECRET"). Until the secret exists, every request is
-// rejected 401 — it ships safe.
-//
-// Verifies the HMAC over the RAW body, resolves the site by the X-Shopify-Shop-Domain header, and
-// upserts the single order for topics orders/create, orders/updated, fulfillments/update. Responds
-// 200 quickly. It performs NO CJ/fulfillment action (that's Phase 2b).
+// POST /api/webhooks/shopify — signed, bounded Shopify intake. The receipt, mirror and optional
+// CJ staging intent are one Convex transaction; provider work runs later in a scheduled worker.
 import { NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { getKey } from "@/src/lib/vault";
 import { convexClient, api } from "@/src/lib/convexClient";
 import type { Id } from "@/convex/_generated/dataModel";
+import { creditAdjustmentState, normalizeCurrencyCode } from "@/src/lib/shopifyOrder";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,86 +15,124 @@ async function webhookSecret(): Promise<string | null> {
   return getKey("shopify", "WEBHOOK_SECRET").catch(() => null);
 }
 
-function verifyHmac(secret: string, rawBody: string, hmacHeader: string): boolean {
-  const digest = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("base64");
+export function verifyShopifyHmac(secret: string, rawBody: Buffer, hmacHeader: string): boolean {
+  const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("base64");
   try {
     return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
   } catch {
-    return false; // length mismatch → not equal
+    return false;
   }
 }
 
 type FulfillmentStatus = "received" | "sent_to_cj" | "shipped" | "delivered" | "error";
+type ShopifyCjLine = { product_id?: unknown; variant_id?: unknown; productId?: unknown; variantId?: unknown; quantity?: unknown };
+type ShopifyOrderPayload = {
+  id?: number | string; order_id?: number | string; admin_graphql_api_id?: string;
+  current_total_price?: string; currency?: string; financial_status?: string; test?: boolean; cancelled_at?: string | null;
+  refunds?: unknown[]; fulfillment_status?: string | null; status?: string | null; created_at?: string;
+  shipping_address?: { zip?: unknown; country_code?: unknown; country?: unknown; province?: unknown; city?: unknown; address1?: unknown; address2?: unknown; name?: unknown; phone?: unknown } | null;
+  line_items?: ShopifyCjLine[];
+};
+
+function shopifyGid(kind: "Product" | "ProductVariant", value: unknown): string | null {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return `gid://shopify/${kind}/${value}`;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (new RegExp(`^gid://shopify/${kind}/[0-9]+$`).test(trimmed)) return trimmed;
+  return /^[0-9]+$/.test(trimmed) ? `gid://shopify/${kind}/${trimmed}` : null;
+}
+
+// Shopify SKU is merchant-editable and cannot identify supplier lineage. Signed product+variant
+// IDs are resolved again inside Convex against this site's DRAFT import mapping.
+function cjStagingInputFromShopify(payload: ShopifyOrderPayload) {
+  const shipping = payload.shipping_address;
+  const lines = payload.line_items;
+  if (!shipping || !Array.isArray(lines) || lines.length === 0) return null;
+  const shopifyLines = lines.map((line) => {
+    const quantity = typeof line.quantity === "number" ? line.quantity : Number(line.quantity);
+    return { productId: shopifyGid("Product", line.product_id ?? line.productId), variantId: shopifyGid("ProductVariant", line.variant_id ?? line.variantId), quantity };
+  });
+  if (shopifyLines.some((line) => !line.productId || !line.variantId || !Number.isInteger(line.quantity) || line.quantity < 1)) return null;
+  const string = (value: unknown) => typeof value === "string" ? value.trim() : "";
+  const address = [string(shipping.address1), string(shipping.address2)].filter(Boolean).join(", ");
+  const shippingInput = { shippingZip: string(shipping.zip), shippingCountryCode: string(shipping.country_code), shippingCountry: string(shipping.country), shippingProvince: string(shipping.province), shippingCity: string(shipping.city), shippingAddress: address, shippingCustomerName: string(shipping.name), shippingPhone: string(shipping.phone) };
+  return shippingInput.shippingCountryCode && shippingInput.shippingCountry && shippingInput.shippingProvince && shippingInput.shippingCity && shippingInput.shippingAddress && shippingInput.shippingCustomerName ? { shipping: shippingInput, shopifyLines: shopifyLines as Array<{ productId: string; variantId: string; quantity: number }> } : null;
+}
 function mapTopicToStatus(topic: string, payload: { fulfillment_status?: string | null; status?: string | null }): FulfillmentStatus {
   if (topic === "fulfillments/update") {
-    const s = (payload.status ?? "").toLowerCase();
-    return s === "success" || s === "delivered" ? "shipped" : "received";
+    const status = (payload.status ?? "").toLowerCase();
+    return status === "success" || status === "delivered" ? "shipped" : "received";
   }
-  // orders/create | orders/updated → order-level fulfillment_status ("fulfilled" | null | "partial")
   return (payload.fulfillment_status ?? "").toLowerCase() === "fulfilled" ? "shipped" : "received";
 }
 
 export async function POST(req: Request) {
   const secret = await webhookSecret();
-  if (!secret) {
-    // Dormant until the secret is provisioned — never silently accept unverified webhooks.
-    return NextResponse.json({ error: "webhook not configured" }, { status: 401 });
-  }
+  if (!secret) return NextResponse.json({ error: "webhook not configured" }, { status: 401 });
 
-  const raw = await req.text();
+  const raw = Buffer.from(await req.arrayBuffer());
   const hmac = req.headers.get("x-shopify-hmac-sha256") ?? "";
-  if (!hmac || !verifyHmac(secret, raw, hmac)) {
+  if (!hmac || !verifyShopifyHmac(secret, raw, hmac)) {
     return NextResponse.json({ error: "invalid HMAC" }, { status: 401 });
   }
 
   const topic = req.headers.get("x-shopify-topic") ?? "";
+  if (topic !== "orders/create" && topic !== "orders/updated" && topic !== "fulfillments/update") {
+    return NextResponse.json({ ok: true, ignored: "unsupported topic" });
+  }
   const shopDomain = req.headers.get("x-shopify-shop-domain") ?? "";
-
-  let payload: {
-    id?: number | string;
-    order_id?: number | string;
-    admin_graphql_api_id?: string;
-    total_price?: string;
-    fulfillment_status?: string | null;
-    status?: string | null;
-    created_at?: string;
-  };
+  let payload: ShopifyOrderPayload;
   try {
-    payload = JSON.parse(raw);
+    payload = JSON.parse(raw.toString("utf8"));
   } catch {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
 
-  // Resolve the tenant by connected domain.
   const convex = convexClient();
   const site = await convex.query(api.sites.getByDomain, { shopifyDomain: shopDomain });
-  if (!site) {
-    // Ack 200 so Shopify doesn't retry forever for an unknown/unconnected shop.
-    return NextResponse.json({ ok: true, ignored: "unknown shop" });
-  }
+  if (!site) return NextResponse.json({ ok: true, ignored: "unknown shop" });
 
-  // Build the Shopify order gid. orders/* payloads carry numeric id; fulfillments/* carry order_id.
-  const numericId =
-    topic === "fulfillments/update" ? payload.order_id : payload.id;
-  const shopifyOrderId =
-    payload.admin_graphql_api_id ?? (numericId != null ? `gid://shopify/Order/${numericId}` : null);
-  if (!shopifyOrderId) {
-    return NextResponse.json({ ok: true, ignored: "no order id" });
-  }
+  const numericId = topic === "fulfillments/update" ? payload.order_id : payload.id;
+  const shopifyOrderId = payload.admin_graphql_api_id ?? (numericId != null ? `gid://shopify/Order/${numericId}` : null);
+  if (!shopifyOrderId) return NextResponse.json({ ok: true, ignored: "no order id" });
 
-  const status = mapTopicToStatus(topic, payload);
-  const totalUsd = Number(payload.total_price ?? 0) || 0;
-  const createdAt = payload.created_at ? Date.parse(payload.created_at) : Date.now();
-
+  const parsedCreatedAt = payload.created_at ? Date.parse(payload.created_at) : NaN;
+  const payloadHash = crypto.createHash("sha256").update(raw).digest("hex");
+  // Shopify provides the webhook id. The digest fallback is only for a manually generated test.
+  const deliveryId = req.headers.get("x-shopify-webhook-id") ?? `digest:${topic}:${payloadHash}`;
+  const has = (key: keyof ShopifyOrderPayload) => Object.prototype.hasOwnProperty.call(payload, key);
+  const parsedTotal = has("current_total_price") && payload.current_total_price !== null
+    ? Number(payload.current_total_price) : undefined;
+  const financialStatus = has("financial_status") && typeof payload.financial_status === "string"
+    ? payload.financial_status.toUpperCase() : undefined;
+  const adjustmentState = has("financial_status") || has("refunds")
+    ? creditAdjustmentState(financialStatus, Array.isArray(payload.refunds) && payload.refunds.length > 0)
+    : undefined;
   try {
-    await convex.mutation(api.orders.upsertFromShopify, {
+    const result = await convex.mutation(api.webhooks.recordShopifyOrder, {
       siteId: site._id as Id<"sites">,
-      orders: [{ shopifyOrderId, totalUsd, fulfillmentStatus: status, createdAt }],
+      deliveryId,
+      topic,
+      payloadHash,
+      shopifyOrderId,
+      currencyCode: has("currency") ? normalizeCurrencyCode(payload.currency) : undefined,
+      currentTotal: parsedTotal !== undefined && Number.isFinite(parsedTotal) && parsedTotal >= 0 ? parsedTotal : undefined,
+      financialStatus,
+      test: has("test") && typeof payload.test === "boolean" ? payload.test : undefined,
+      cancelled: has("cancelled_at") ? payload.cancelled_at != null : undefined,
+      creditAdjustmentState: adjustmentState,
+      fulfillmentStatus: mapTopicToStatus(topic, payload),
+      createdAt: Number.isFinite(parsedCreatedAt) ? parsedCreatedAt : Date.now(),
+      // PII remains in Convex's intent row. It never becomes part of the webhook response or a
+      // Trigger/task payload; the scheduled worker receives the intent ID from its own query.
+      stagingInput: topic !== "fulfillments/update" ? cjStagingInputFromShopify(payload) ?? undefined : undefined,
     });
+    // Shopify gets a 2xx as soon as its signed delivery is durable. Do not make CJ, Trigger, or
+    // approval-waitpoint calls here: Shopify retries transport failures and expects this path to
+    // finish quickly.
+    return NextResponse.json({ ok: true, topic, duplicate: result.duplicate, intake: "durable", cjStaging: result.intentId ? "queued" : "not-eligible" });
   } catch {
-    // Swallow → still ack 200; Shopify will retry on a non-2xx and we don't want a poison loop.
-    return NextResponse.json({ ok: true, deferred: true });
+    // A non-2xx tells Shopify to retry an uncommitted local mutation. No supplier call exists here.
+    return NextResponse.json({ error: "local webhook processing failed" }, { status: 503 });
   }
-
-  return NextResponse.json({ ok: true, topic });
 }

@@ -1,112 +1,153 @@
-// fal.ai generation adapter — product-first imagery + short B-roll clips.
-//
-// PRODUCT-FIRST DOCTRINE (locked, do not relitigate): the hero asset must be the PRODUCT
-// (lick/snuffle mat ASMR, freeze-mold pour, hands-only demo, before/after). AI-generated
-// dog footage is uncanny-valley poison as a hero — only ever a brief stylized supporting
-// b-roll. `falProductImage`/`falProductClip` are the hero generators; `falBrollClip` is the
-// supporting-only path and is hard-flagged aiGenerated:true so the assembler burns the label.
-//
-// Keys: vault `fal` service, key `FAL_KEY` (verified present 2026-06-14). Outputs land in R2
-// via storage.putObject; the function returns the R2 key (never a hosted fal URL — those expire).
+// Durable fal queue adapter. Submission returns immediately and every later operation is a
+// receipt-bound status/result read that can run in a different process.
 import { getKey } from "../vault";
-import { putObject } from "../storage";
+import { putDeterministicObject, type StoredObjectReceipt } from "../storage";
+import type { FalQueueState } from "../creativeGeneration";
+import { readJsonResponseBounded, readResponseBodyBounded } from "../boundedBody";
 
-const FAL_BASE = "https://fal.run";
+const QUEUE_BASE = "https://queue.fal.run";
+export const FAL_IMAGE_MODEL = process.env.FAL_MODEL_IMAGE ?? "fal-ai/flux/schnell";
+export const FAL_CLIP_MODEL = process.env.FAL_MODEL_CLIP ?? "fal-ai/kling-video/v1/standard/image-to-video";
+export const FAL_CLIP_START_TIMEOUT_SECONDS = 120;
+export const FAL_INPUT_URL_MARGIN_SECONDS = 60;
+// Queue receipts/status are tiny even with normal metadata; results contain URLs, not media.
+export const FAL_SUBMIT_METADATA_MAX_BYTES = 32 * 1024;
+export const FAL_STATUS_METADATA_MAX_BYTES = 64 * 1024;
+export const FAL_RESULT_METADATA_MAX_BYTES = 256 * 1024;
 
-// Product-first models. Flux for stills; Kling/Veo for short motion. Overridable via env for
-// cost tuning without a redeploy (e.g. swap kling-video for a cheaper preview model in dev).
-const MODEL_IMAGE = process.env.FAL_MODEL_IMAGE ?? "fal-ai/flux/schnell";
-const MODEL_CLIP = process.env.FAL_MODEL_CLIP ?? "fal-ai/kling-video/v1/standard/image-to-video";
+export type FalQueueReceipt = {
+  requestId: string;
+  model: string;
+  statusUrl: string;
+  resultUrl: string;
+};
 
-export type FalResult = { r2Key: string; bytes: number; model: string; costNote: string };
-
-async function falKey(): Promise<string> {
-  const k = await getKey("fal", "FAL_KEY");
-  if (!k) throw new Error("fal: FAL_KEY missing from vault `fal` service");
-  return k;
+export class FalSubmissionAmbiguousError extends Error {
+  constructor() { super("fal queue submission receipt is ambiguous"); this.name = "FalSubmissionAmbiguousError"; }
 }
 
-/** Low-level fal.run call. Returns the first output media URL the model emits. */
-async function falRun(model: string, input: Record<string, unknown>): Promise<string> {
-  const key = await falKey();
-  const res = await fetch(`${FAL_BASE}/${model}`, {
-    method: "POST",
-    headers: { Authorization: `Key ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify(input),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`fal ${model} failed: HTTP ${res.status} ${body.slice(0, 240)}`);
+export class FalDefinitiveSubmissionError extends Error {
+  constructor(public readonly status: number) { super(`fal queue rejected submission with HTTP ${status}`); this.name = "FalDefinitiveSubmissionError"; }
+}
+
+export async function getFalApiKey(): Promise<string> {
+  const key = await getKey("fal", "FAL_KEY");
+  if (!key) throw new Error("fal_key_unavailable");
+  return key;
+}
+
+function exactQueueUrls(model: string, requestId: string) {
+  if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+$/.test(model) || model.length > 200 || !/^[A-Za-z0-9-]{8,128}$/.test(requestId)) {
+    throw new Error("fal_receipt_identity_invalid");
   }
-  const json = (await res.json()) as {
-    images?: Array<{ url: string }>;
-    video?: { url: string };
-    image?: { url: string };
-  };
-  const url = json.images?.[0]?.url ?? json.video?.url ?? json.image?.url;
-  if (!url) throw new Error(`fal ${model}: no media URL in response`);
-  return url;
+  const root = `${QUEUE_BASE}/${model}/requests/${requestId}`;
+  return { statusUrl: `${root}/status`, resultUrl: `${root}/response` };
 }
 
-async function fetchToR2(url: string, r2Key: string, contentType: string): Promise<number> {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`fal: download of output failed HTTP ${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  await putObject(r2Key, buf, contentType);
-  return buf.byteLength;
+export async function submitFalQueue(args: {
+  model: string;
+  input: Record<string, unknown>;
+  apiKey: string;
+  startTimeoutSeconds?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<FalQueueReceipt> {
+  const fetcher = args.fetchImpl ?? fetch;
+  let response: Response;
+  try {
+    response = await fetcher(`${QUEUE_BASE}/${args.model}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Key ${args.apiKey}`,
+        "Content-Type": "application/json",
+        ...(args.startTimeoutSeconds ? { "X-Fal-Request-Timeout": String(args.startTimeoutSeconds) } : {}),
+      },
+      body: JSON.stringify(args.input),
+    });
+  } catch {
+    throw new FalSubmissionAmbiguousError();
+  }
+  if (!response.ok) {
+    if (response.status >= 500 || response.status === 408 || response.status === 429) throw new FalSubmissionAmbiguousError();
+    throw new FalDefinitiveSubmissionError(response.status);
+  }
+  let body: { request_id?: unknown; status_url?: unknown; response_url?: unknown };
+  try {
+    body = await readJsonResponseBounded(response, FAL_SUBMIT_METADATA_MAX_BYTES, "fal submission metadata");
+  } catch {
+    // The successful HTTP response proves the POST may have been accepted even when its receipt
+    // metadata is malformed, truncated, or oversized.
+    throw new FalSubmissionAmbiguousError();
+  }
+  if (typeof body.request_id !== "string" || !/^[A-Za-z0-9-]{8,128}$/.test(body.request_id)) throw new FalSubmissionAmbiguousError();
+  const exact = exactQueueUrls(args.model, body.request_id);
+  if (body.status_url !== exact.statusUrl || body.response_url !== exact.resultUrl) throw new FalSubmissionAmbiguousError();
+  return { requestId: body.request_id, model: args.model, ...exact };
 }
 
-/**
- * Product-first hero STILL (Flux). `prompt` should describe the PRODUCT in scene — never a
- * realistic dog as the subject. The caller owns prompt discipline; this adapter does not
- * synthesize animal footage.
- */
-export async function falProductImage(
-  prompt: string,
-  r2Key: string,
-  opts?: { width?: number; height?: number },
-): Promise<FalResult> {
-  const url = await falRun(MODEL_IMAGE, {
-    prompt,
-    image_size: opts?.width && opts?.height
-      ? { width: opts.width, height: opts.height }
-      : "portrait_16_9", // 9:16-leaning vertical for Reels/Shorts/TikTok
-    num_images: 1,
-  });
-  const bytes = await fetchToR2(url, r2Key, "image/jpeg");
-  return { r2Key, bytes, model: MODEL_IMAGE, costNote: "flux-schnell ≈ $0.003/img" };
+async function safeQueueRead(url: string, apiKey: string, fetchImpl?: typeof fetch): Promise<Response> {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "https:" || parsed.hostname !== "queue.fal.run" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("fal_receipt_endpoint_invalid");
+  }
+  const response = await (fetchImpl ?? fetch)(url, { headers: { Authorization: `Key ${apiKey}` } });
+  if (!response.ok) throw new Error(`fal_queue_read_http_${response.status}`);
+  return response;
 }
 
-/**
- * Product-first hero CLIP — image-to-video from a product still, so motion stays anchored to a
- * REAL product frame (mat texture, pour, spread). `imageUrl` should be a presigned R2 URL of a
- * product still (or a fal still URL within the same run).
- */
-export async function falProductClip(
-  imageUrl: string,
-  prompt: string,
-  r2Key: string,
-): Promise<FalResult> {
-  const url = await falRun(MODEL_CLIP, {
-    image_url: imageUrl,
-    prompt,
-    duration: "5",
-    aspect_ratio: "9:16",
-  });
-  const bytes = await fetchToR2(url, r2Key, "video/mp4");
-  return { r2Key, bytes, model: MODEL_CLIP, costNote: "kling-std 5s ≈ $0.10/clip" };
+export async function readFalQueueStatus(args: { receipt: FalQueueReceipt; apiKey: string; fetchImpl?: typeof fetch }): Promise<{ status: FalQueueState; failed: boolean }> {
+  const exact = exactQueueUrls(args.receipt.model, args.receipt.requestId);
+  if (args.receipt.statusUrl !== exact.statusUrl || args.receipt.resultUrl !== exact.resultUrl) throw new Error("fal_receipt_endpoint_invalid");
+  const body = await readJsonResponseBounded<{ status?: unknown; request_id?: unknown; error?: unknown }>(
+    await safeQueueRead(args.receipt.statusUrl, args.apiKey, args.fetchImpl),
+    FAL_STATUS_METADATA_MAX_BYTES,
+    "fal status metadata",
+  );
+  if (body.request_id !== args.receipt.requestId || (body.status !== "IN_QUEUE" && body.status !== "IN_PROGRESS" && body.status !== "COMPLETED")) {
+    throw new Error("fal_queue_status_invalid");
+  }
+  return { status: body.status, failed: body.status === "COMPLETED" && typeof body.error === "string" && body.error.length > 0 };
 }
 
-/**
- * Supporting-only stylized B-roll (e.g. a brief animated dog). HARD-FLAGGED ai: callers MUST
- * persist the creative with aiGenerated:true + aiLabelRequired:true. Never use as a hero frame.
- */
-export async function falBrollClip(prompt: string, r2Key: string): Promise<FalResult & { aiGenerated: true }> {
-  const url = await falRun(MODEL_CLIP, {
-    prompt: `stylized illustrated supporting b-roll, clearly non-photoreal: ${prompt}`,
-    duration: "5",
-    aspect_ratio: "9:16",
-  });
-  const bytes = await fetchToR2(url, r2Key, "video/mp4");
-  return { r2Key, bytes, model: MODEL_CLIP, costNote: "kling-std 5s ≈ $0.10/clip", aiGenerated: true };
+function mediaUrlFromResult(body: any, kind: "image" | "clip"): string {
+  const value = kind === "image" ? body?.images?.[0]?.url ?? body?.image?.url : body?.video?.url;
+  if (typeof value !== "string") throw new Error("fal_result_media_missing");
+  const parsed = new URL(value);
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || (parsed.hostname !== "fal.media" && !parsed.hostname.endsWith(".fal.media"))) {
+    throw new Error("fal_result_media_invalid");
+  }
+  return value;
+}
+
+export async function copyFalQueueResult(args: {
+  kind: "image" | "clip";
+  receipt: FalQueueReceipt;
+  apiKey: string;
+  r2Key: string;
+  fetchImpl?: typeof fetch;
+  putObject?: typeof putDeterministicObject;
+}): Promise<StoredObjectReceipt> {
+  const exact = exactQueueUrls(args.receipt.model, args.receipt.requestId);
+  if (args.receipt.resultUrl !== exact.resultUrl) throw new Error("fal_receipt_endpoint_invalid");
+  const result = await readJsonResponseBounded(
+    await safeQueueRead(args.receipt.resultUrl, args.apiKey, args.fetchImpl),
+    FAL_RESULT_METADATA_MAX_BYTES,
+    "fal result metadata",
+  );
+  const mediaUrl = mediaUrlFromResult(result, args.kind);
+  const media = await (args.fetchImpl ?? fetch)(mediaUrl);
+  if (!media.ok) throw new Error(`fal_media_download_http_${media.status}`);
+  const expectedType = args.kind === "image" ? "image/jpeg" : "video/mp4";
+  const maxBytes = args.kind === "image" ? 20 * 1024 * 1024 : 200 * 1024 * 1024;
+  const receivedType = media.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
+  if (receivedType !== expectedType) throw new Error("fal_media_type_invalid");
+  const body = await readResponseBodyBounded(media, maxBytes, "fal media");
+  return (args.putObject ?? putDeterministicObject)(args.r2Key, body, expectedType, maxBytes);
+}
+
+export function imageQueueInput(prompt: string): Record<string, unknown> {
+  return { prompt, image_size: "portrait_16_9", num_images: 1, output_format: "jpeg" };
+}
+
+export function clipQueueInput(imageUrl: string, prompt: string): Record<string, unknown> {
+  return { image_url: imageUrl, prompt, duration: "5", aspect_ratio: "9:16" };
 }

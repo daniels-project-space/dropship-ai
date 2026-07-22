@@ -1,5 +1,5 @@
 // CRO experiments reads. Index-driven (by_site_status).
-import { query } from "./_generated/server";
+import { query } from "./authz";
 import { v } from "convex/values";
 
 const expStatus = v.union(v.literal("running"), v.literal("concluded"));

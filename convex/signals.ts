@@ -1,5 +1,5 @@
 // Rolled-up product/trend signals. Daily buckets only (never raw-event spam).
-import { query, mutation } from "./_generated/server";
+import { query, mutation } from "./authz";
 import { v } from "convex/values";
 
 // Insert a daily-rollup signal point.

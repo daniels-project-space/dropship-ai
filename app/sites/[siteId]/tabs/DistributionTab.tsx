@@ -140,7 +140,7 @@ export function DistributionTab({ siteId }: { siteId: Id<"sites"> }) {
           empty={{
             glyph: <Icon.distribution size={26} />,
             title: "Nothing distributed yet",
-            body: "Approve a creative in the Content tab to push it down the pipeline. Each platform gets a row here — semi-manual at cold-start, automated once Ayrshare is connected — and views feed the gate above.",
+            body: "Approve content, then separately authorize its exact caption, platforms and target accounts. Only that second action can create rows here; automated mode also requires verified targets and the deployment live-effects gate.",
           }}
         />
       </div>

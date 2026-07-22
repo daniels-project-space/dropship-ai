@@ -63,18 +63,17 @@ function AppShellInner({
   // close the mobile drawer on route change
   useEffect(() => setMobileOpen(false), [pathname]);
 
-  const portfolio = useQuery(api.dashboard.portfolio);
-  const gate = useQuery(api.dashboard.contentFitGate, {});
+  const shell = useQuery(api.dashboard.shellSnapshot, {});
 
-  const pending = portfolio?.totalPendingActions ?? 0;
-  const brandsLoading = portfolio === undefined;
-  const brands: BrandOption[] = (portfolio?.sites ?? []).map((s) => ({
+  const pending = shell?.totalPendingActions ?? 0;
+  const brandsLoading = shell === undefined;
+  const brands: BrandOption[] = (shell?.brands ?? []).map((s) => ({
     siteId: s.siteId,
     name: s.name,
     status: s.status,
     pendingActionCount: s.pendingActionCount,
   }));
-  const gatePassed = gate === undefined ? null : gate.passed;
+  const gatePassed = shell === undefined ? null : shell.contentFit.passed;
   const crumbs = deriveCrumbs(pathname, crumbOverride);
   const railWidth = collapsed ? RAIL_W_COLLAPSED : RAIL_W;
 
@@ -134,6 +133,8 @@ function AppShellInner({
           crumbs={crumbs}
           pending={pending}
           gatePassed={gatePassed}
+          sampleStatus={shell?.sampleStatus}
+          controlPlane={shell?.controlPlane}
           onOpenMenu={() => setMobileOpen(true)}
         />
         <main>{children}</main>

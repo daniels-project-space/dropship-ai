@@ -1,5 +1,5 @@
 import { defineConfig } from "@trigger.dev/sdk/v3";
-import { syncEnvVars } from "@trigger.dev/build/extensions/core";
+import { ffmpeg, syncEnvVars } from "@trigger.dev/build/extensions/core";
 
 // Trigger.dev v3/v4 project config.
 // project: dropship-ai-jobs (proj_ebwgqvfufapbqnhjxhnc) — own project since 2026-07-03 (was the org DEFAULT project, whose deploy clobbered remote-work-hub's chat-dispatcher; every app gets its OWN Trigger project).
@@ -10,9 +10,21 @@ export default defineConfig({
   maxDuration: 600, // 10 min default ceiling per run
   build: {
     extensions: [
-      syncEnvVars(() => process.env.VAULT_ACCESS_TOKEN
-        ? { VAULT_ACCESS_TOKEN: process.env.VAULT_ACCESS_TOKEN }
-        : undefined),
+      ffmpeg(),
+      // Server-to-Convex calls are authenticated too. Keep this scoped service JWT in the
+      // Trigger project; it is never a browser credential and is not written to source.
+      syncEnvVars(() => {
+        const names = [
+          "VAULT_ACCESS_TOKEN", "NEXT_PUBLIC_CONVEX_URL", "CONVEX_URL",
+          "DROPSHIP_AI_AUTH_ISSUER", "DROPSHIP_AI_AUTH_AUDIENCE", "DROPSHIP_AI_AUTH_KID", "DROPSHIP_AI_AUTH_PRIVATE_KEY",
+          "TRIGGER_CJ_DISPATCH_LEASE_SECRET",
+          "CREATIVE_GENERATION_CONCURRENCY",
+          // Non-secret dual-control flag required before a Trigger worker can issue any live write.
+          "DROPSHIP_AI_LIVE_EFFECTS", "DROPSHIP_AI_LIVE_EFFECTS_CONFIRM",
+        ] as const;
+        const values = Object.fromEntries(names.flatMap((name) => process.env[name] ? [[name, process.env[name]!]] : []));
+        return Object.keys(values).length ? values : undefined;
+      }),
     ],
   },
   retries: {

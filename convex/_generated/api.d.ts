@@ -12,17 +12,22 @@ import type * as actions from "../actions.js";
 import type * as admin from "../admin.js";
 import type * as audit from "../audit.js";
 import type * as creatives from "../creatives.js";
+import type * as creativeGenerations from "../creativeGenerations.js";
 import type * as dashboard from "../dashboard.js";
+import type * as dashboardMigration from "../dashboardMigration.js";
 import type * as experiments from "../experiments.js";
 import type * as insights from "../insights.js";
 import type * as metrics from "../metrics.js";
 import type * as orders from "../orders.js";
+import type * as ops from "../ops.js";
 import type * as posts from "../posts.js";
 import type * as products from "../products.js";
 import type * as seed from "../seed.js";
+import type * as shopifyEconomicsExpiry from "../shopifyEconomicsExpiry.js";
 import type * as signals from "../signals.js";
 import type * as siteSecrets from "../siteSecrets.js";
 import type * as sites from "../sites.js";
+import type * as webhooks from "../webhooks.js";
 
 import type {
   ApiFromModules,
@@ -35,17 +40,22 @@ declare const fullApi: ApiFromModules<{
   admin: typeof admin;
   audit: typeof audit;
   creatives: typeof creatives;
+  creativeGenerations: typeof creativeGenerations;
   dashboard: typeof dashboard;
+  dashboardMigration: typeof dashboardMigration;
   experiments: typeof experiments;
   insights: typeof insights;
   metrics: typeof metrics;
   orders: typeof orders;
+  ops: typeof ops;
   posts: typeof posts;
   products: typeof products;
   seed: typeof seed;
+  shopifyEconomicsExpiry: typeof shopifyEconomicsExpiry;
   signals: typeof signals;
   siteSecrets: typeof siteSecrets;
   sites: typeof sites;
+  webhooks: typeof webhooks;
 }>;
 
 /**

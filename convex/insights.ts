@@ -4,9 +4,11 @@
 // (labelled "computed"). Each insight carries an icon key, headline, supporting
 // stat, tone, and an optional suggested action (route + label).
 
-import { query } from "./_generated/server";
+import { query } from "./authz";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
+import { matchesDataMode } from "./sampleScope";
+import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -20,14 +22,15 @@ type Insight = {
 };
 
 export const list = query({
-  args: { scope: v.optional(v.string()), days: v.optional(v.number()) },
-  handler: async (ctx, { scope, days }) => {
+  args: { scope: v.optional(v.string()), days: v.optional(v.number()), dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
+  handler: async (ctx, { scope, days, dataMode }) => {
     const window = Math.min(days ?? 30, 180);
     const since = Date.now() - window * DAY_MS;
-    const sites =
+    const candidates =
       scope && scope !== "all"
         ? [await ctx.db.get(scope as Id<"sites">)].filter((s): s is NonNullable<typeof s> => !!s)
         : await ctx.db.query("sites").take(200);
+    const sites = candidates.filter((site) => matchesDataMode(site, dataMode));
 
     const insights: Insight[] = [];
 
@@ -68,12 +71,14 @@ export const list = query({
       }
 
       for (const o of orders) {
-        if (o.createdAt >= since) revenue += o.totalUsd;
-        if (o.fulfillmentStatus === "received") openOrders++;
+        if (o.createdAt >= since && eligibleUsdOrder(o, s.storeCurrency)) revenue += o.currentTotal!;
+        if (o.fulfillmentStatus === "received" && eligibleUsdOrder(o, s.storeCurrency)) openOrders++;
       }
 
       for (const p of products) {
-        const m = p.contributionMarginPct ?? (p.priceUsd > 0 ? ((p.priceUsd - p.cogsUsd - p.shippingUsd) / p.priceUsd) * 100 : null);
+        // Synced Shopify rows retain zero placeholders for unknown supplier costs. Only the
+        // sourced-draft gate writes this field, so unknown costs cannot create an insight.
+        const m = p.contributionMarginPct ?? null;
         if (m != null && (!bestMargin || m > bestMargin.margin)) bestMargin = { title: p.title, margin: m };
       }
     }

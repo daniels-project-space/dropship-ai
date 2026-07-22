@@ -1,5 +1,5 @@
 // Conversion metrics reads (daily rollups). Index-driven only (by_site_day / by_product_day).
-import { query } from "./_generated/server";
+import { query } from "./authz";
 import { v } from "convex/values";
 
 export const listBySite = query({

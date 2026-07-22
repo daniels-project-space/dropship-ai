@@ -12,7 +12,7 @@ function RowSkeleton() {
 
 export default function ApprovalsPage() {
   const pending = useQuery(api.actions.listPending, {});
-  const portfolio = useQuery(api.dashboard.portfolio);
+  const portfolio = useQuery(api.dashboard.portfolio, {});
 
   const loading = pending === undefined;
   const actions = (pending ?? []) as PendingAction[];

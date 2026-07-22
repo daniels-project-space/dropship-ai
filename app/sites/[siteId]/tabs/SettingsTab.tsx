@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
+import { useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { SectionHeader } from "../../../components/ui/SectionHeader";
@@ -15,10 +15,12 @@ const LABEL = "label-eyebrow mb-2 block text-[10px]";
 
 // ── Connect Shopify card ─────────────────────────────────────────────────────
 // Not connected → domain + admin token form → POST /api/shopify/connect.
-// Connected     → domain, live product/order counts, "Sync now" → POST /api/shopify/sync.
-function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
-  const detail = useQuery(api.dashboard.brandDetail, { siteId: site._id as Id<"sites"> });
-  const connected = !!site.shopifyDomain;
+// Recurring access verified → domain, current economic counts, "Sync now".
+// Legacy domain only        → visible re-verification form; never presented as connected.
+function ConnectShopifyCard({ site, detail }: { site: BrandDetail["site"]; detail: BrandDetail }) {
+  const recurringVerified = !!site.shopifyDomain && site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt;
+  const needsReverification = !!site.shopifyDomain && !recurringVerified;
+  const economicsSync = detail.economicsReadiness;
 
   const [domain, setDomain] = useState(site.shopifyDomain ?? "");
   const [token, setToken] = useState("");
@@ -90,18 +92,25 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
           <Icon.store size={15} className="text-cyan" />
           <span className="text-[13px] font-medium text-ink">Shopify store</span>
         </div>
-        {connected ? (
+        {recurringVerified ? (
           <Badge ring="bg-live/10 text-live ring-1 ring-live/25" dot="bg-live" hex="#44d6a0" live>
-            Connected
+            Recurring access verified
+          </Badge>
+        ) : needsReverification ? (
+          <Badge ring="bg-pending/10 text-pending ring-1 ring-pending/30" dot="bg-pending" hex="#f0a93b">
+            Needs re-verification
           </Badge>
         ) : (
           <Badge>Not connected</Badge>
         )}
       </div>
 
-      {connected ? (
+      {recurringVerified ? (
         <div className="flex flex-col gap-3">
           <p className="font-mono text-[11px] text-ink-dim">{site.shopifyDomain}</p>
+          <p className={`rounded-lg border px-3 py-2 text-[11px] ${economicsSync === "current" ? "border-live/25 bg-live/5 text-live" : "border-pending/25 bg-pending/5 text-pending"}`}>
+            Economics sync: {economicsSync.replaceAll("_", " ")}. {economicsSync === "current" ? "Complete bounded catalogue and commerce writes are current." : "Revenue and zero-order values are not launch-ready evidence."}
+          </p>
           <div className="grid grid-cols-2 gap-2">
             <div className="rounded-lg border border-line-soft bg-void/30 px-3 py-2.5">
               <span className="label-eyebrow text-[9px]">Products</span>
@@ -128,11 +137,16 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
           {result?.kind === "err" && <p className="font-mono text-[10px] text-danger">{result.text}</p>}
           <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-ink-faint">
             <Icon.lock size={12} className="mt-0.5 shrink-0" />
-            Read-only — fulfillment wires up with CJ later.
+            Recurring vault access and USD store identity were verified. Sync remains read-only.
           </p>
         </div>
       ) : (
         <form onSubmit={connect} className="flex flex-col gap-3">
+          {needsReverification && (
+            <p className="rounded-lg border border-pending/25 bg-pending/5 px-3 py-2 text-[11px] leading-relaxed text-pending">
+              This legacy connection has no current recurring-access/currency proof. Re-verify it before revenue or order readiness is shown.
+            </p>
+          )}
           <div>
             <label className={LABEL}>*.myshopify.com domain</label>
             <input
@@ -154,7 +168,7 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
               autoComplete="off"
             />
             <p className="mt-1.5 font-mono text-[9.5px] text-ink-faint">
-              Needs scopes read_products, read_orders. Used once to connect; store it in the vault for recurring sync.
+              Needs read_products and read_orders. First place this same token at the displayed store&apos;s deterministic server-vault reference; a one-time token check alone does not connect the site.
             </p>
           </div>
           <button
@@ -162,11 +176,11 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
             disabled={busy || !domain.trim() || !token.trim()}
             className="rounded-lg bg-signal px-5 py-2.5 text-[14px] font-semibold text-void transition hover:bg-signal-deep disabled:opacity-50"
           >
-            {busy ? "Connecting…" : "Connect store"}
+            {busy ? "Verifying…" : needsReverification ? "Verify recurring access" : "Connect recurring access"}
           </button>
           {result?.kind === "ok" && (
             <p className="font-mono text-[10px] text-live">
-              {result.shopName} connected · {result.products} products · {result.orders} orders
+              {result.shopName} recurring access verified · {result.products} products · {result.orders} orders
               {result.currency ? ` · ${result.currency}` : ""}
             </p>
           )}
@@ -197,7 +211,7 @@ function ConnRow({ label, hint, connected }: { label: string; hint: string; conn
   );
 }
 
-export function SettingsTab({ site }: { site: Site }) {
+export function SettingsTab({ site, detail }: { site: Site; detail: BrandDetail }) {
   const update = useMutation(api.sites.update);
   const [distributionMode, setDistributionMode] = useState<Site["distributionMode"]>(site.distributionMode);
   const [minKitPriceUsd, setMinKitPriceUsd] = useState(String(site.minKitPriceUsd));
@@ -252,6 +266,9 @@ export function SettingsTab({ site }: { site: Site }) {
                 </button>
               ))}
             </div>
+            <p className="mt-2 font-mono text-[10px] leading-relaxed text-ink-faint">
+              Automated never means approval-free: every creative still needs a separate exact publication authorization, verified target accounts, and the deployment live-effects acknowledgement.
+            </p>
           </div>
           <div>
             <label className={LABEL}>Min kit price (USD)</label>
@@ -287,7 +304,7 @@ export function SettingsTab({ site }: { site: Site }) {
       {/* connected accounts */}
       <aside>
         <SectionHeader eyebrow="Connected accounts" accent="text-cyan" />
-        <ConnectShopifyCard site={site} />
+        <ConnectShopifyCard site={site} detail={detail} />
         <div className="mt-2.5 flex flex-col gap-2.5">
           <ConnRow label="CJ Dropshipping" hint="fulfillment + tracking" connected={false} />
           <ConnRow label="Ayrshare" hint="automated publishing" connected={false} />
@@ -295,7 +312,7 @@ export function SettingsTab({ site }: { site: Site }) {
         </div>
         <p className="mt-4 flex items-start gap-2 text-[12px] leading-relaxed text-ink-faint">
           <Icon.settings size={14} className="mt-0.5 shrink-0" />
-          CJ fulfillment + automated publishing wire up in a later pass. Until then, distribution stays semi-manual.
+          Account rows are configuration hints, not verification. Use launch readiness for fresh proof; publication always retains its separate exact operator authorization.
         </p>
       </aside>
     </div>

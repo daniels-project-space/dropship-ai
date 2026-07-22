@@ -7,7 +7,7 @@ import { Badge } from "../components/ui/Badge";
 import { StatusDot } from "../components/StatusDot";
 import { Icon } from "../components/Icons";
 
-type ReadyState = "ready" | "action_needed" | "warn";
+type ReadyState = "configured" | "unverified" | "verified" | "blocked";
 type CheckItem = {
   id: string;
   group: string;
@@ -18,14 +18,15 @@ type CheckItem = {
 };
 type StatusResponse = {
   checkedAt: number;
-  summary: { total: number; ready: number; warn: number; blocking: number; goLive: boolean };
+  summary: { total: number; verified: number; configured: number; unverified: number; blocked: number; goLive: boolean };
   checks: CheckItem[];
 };
 
 const STATE_TONE: Record<ReadyState, { ring: string; dot: string; hex: string; label: string }> = {
-  ready: { ring: "bg-live/10 text-live ring-1 ring-live/25", dot: "bg-live", hex: "#44d6a0", label: "Ready" },
-  warn: { ring: "bg-pending/10 text-pending ring-1 ring-pending/30", dot: "bg-pending", hex: "#f0a93b", label: "Verify" },
-  action_needed: { ring: "bg-danger/10 text-danger ring-1 ring-danger/25", dot: "bg-danger", hex: "#ef6b6b", label: "Action needed" },
+  verified: { ring: "bg-live/10 text-live ring-1 ring-live/25", dot: "bg-live", hex: "#44d6a0", label: "Verified" },
+  configured: { ring: "bg-cyan/10 text-cyan ring-1 ring-cyan/25", dot: "bg-cyan", hex: "#5cc6e8", label: "Configured" },
+  unverified: { ring: "bg-pending/10 text-pending ring-1 ring-pending/30", dot: "bg-pending", hex: "#f0a93b", label: "Unverified" },
+  blocked: { ring: "bg-danger/10 text-danger ring-1 ring-danger/25", dot: "bg-danger", hex: "#ef6b6b", label: "Blocked" },
 };
 
 const GROUP_ACCENT: Record<string, string> = {
@@ -41,19 +42,19 @@ function CheckRow({ item }: { item: CheckItem }) {
     <div className="flex items-start justify-between gap-4 rounded-xl border border-line-soft bg-void/30 px-4 py-3.5">
       <div className="flex min-w-0 items-start gap-3">
         <span className="mt-1 shrink-0">
-          <StatusDot className={tone.dot} hex={tone.hex} live={item.state === "ready"} size={7} />
+          <StatusDot className={tone.dot} hex={tone.hex} live={item.state === "verified"} size={7} />
         </span>
         <div className="min-w-0">
           <p className="text-[13.5px] text-ink">{item.label}</p>
           <p className="mt-0.5 font-mono text-[10.5px] text-ink-faint">{item.detail}</p>
-          {item.state !== "ready" && (
+          {item.state !== "verified" && (
             <p className="mt-1.5 text-[12px] leading-relaxed text-ink-dim">
               <span className="text-ink-faint">Next →</span> {item.next}
             </p>
           )}
         </div>
       </div>
-      <Badge ring={tone.ring} dot={tone.dot} hex={tone.hex} live={item.state === "ready"}>
+      <Badge ring={tone.ring} dot={tone.dot} hex={tone.hex} live={item.state === "verified"}>
         {tone.label}
       </Badge>
     </div>
@@ -62,7 +63,7 @@ function CheckRow({ item }: { item: CheckItem }) {
 
 function ReadinessHeader({ status, loading }: { status: StatusResponse | null; loading: boolean }) {
   const goLive = status?.summary.goLive ?? false;
-  const blocking = status?.summary.blocking ?? 0;
+  const blocking = status?.summary.blocked ?? 0;
   return (
     <div className={`panel relative overflow-hidden rounded-2xl p-6 sm:p-8 ${goLive ? "ring-1 ring-live/30" : ""}`}>
       <div
@@ -87,14 +88,17 @@ function ReadinessHeader({ status, loading }: { status: StatusResponse | null; l
               ? "Probing the vault and live integrations…"
               : goLive
                 ? "Every required connection is live. The brain can source, build, distribute and fulfil end-to-end."
-                : `${blocking} connection${blocking === 1 ? "" : "s"} ${blocking === 1 ? "is" : "are"} blocking go-live. Clear the red items below.`}
+                : blocking > 0
+                  ? `${blocking} connection${blocking === 1 ? "" : "s"} ${blocking === 1 ? "is" : "are"} blocked. Clear the red items below.`
+                  : "No connection is hard-blocked, but configured or unverified integrations still need fresh proof before launch."}
           </p>
         </div>
         <div className="flex shrink-0 items-stretch gap-3">
           {[
-            { k: "ready", label: "Ready", color: "text-live" },
-            { k: "warn", label: "Verify", color: "text-pending" },
-            { k: "blocking", label: "Blocking", color: "text-danger" },
+            { k: "verified", label: "Verified", color: "text-live" },
+            { k: "configured", label: "Configured", color: "text-cyan" },
+            { k: "unverified", label: "Unverified", color: "text-pending" },
+            { k: "blocked", label: "Blocked", color: "text-danger" },
           ].map((c) => (
             <div key={c.k} className="flex min-w-[88px] flex-col justify-center rounded-xl border border-line bg-panel-2/60 px-5 py-4">
               <span className={`font-display text-4xl font-medium tabular-nums leading-none ${c.color}`}>
@@ -145,8 +149,8 @@ export default function SettingsPage() {
         </h1>
         <p className="mt-5 max-w-xl text-[15px] leading-relaxed text-ink-dim">
           The single source of truth for what is blocking launch. Each row is checked live against the
-          vault and the real integrations — connection state only, never a secret. Green means ready;
-          anything else carries the exact next step.
+          runtime and real integrations without returning secrets. Green requires fresh proof;
+          configured and unverified states remain explicit until that proof exists.
         </p>
       </section>
 
@@ -216,9 +220,7 @@ export default function SettingsPage() {
               </div>
             </div>
             <div className="border-t border-line-soft pt-4">
-              <Badge ring="bg-live/10 text-live ring-1 ring-live/25" dot="bg-live" hex="#44d6a0" live>
-                Brain online
-              </Badge>
+              <Badge>Freshness shown in the status bar</Badge>
             </div>
           </div>
         </div>
