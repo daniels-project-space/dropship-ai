@@ -15,6 +15,7 @@ const modules = {
   "../convex/ops.ts": () => import("../convex/ops.ts"),
   "../convex/products.ts": () => import("../convex/products.ts"),
   "../convex/sites.ts": () => import("../convex/sites.ts"),
+  "../convex/shopifyEconomics.ts": () => import("../convex/shopifyEconomics.ts"),
   "../convex/audit.ts": () => import("../convex/audit.ts"),
   "../convex/creatives.ts": () => import("../convex/creatives.ts"),
   "../convex/posts.ts": () => import("../convex/posts.ts"),
@@ -512,7 +513,7 @@ test("provider intake and runtime primitives reject anonymous and operator ident
   const order = await t.run((ctx) => ctx.db.get(orderId));
   const claim = await claimDispatch(t, actionId);
   const calls = [
-    () => operator.mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "operator", snapshotReadAt: Date.now(), products: [], orders: [] }),
+    () => operator.mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "operator", products: [], orders: [] }),
     () => operator.mutation(api.orders.record, { siteId, shopifyOrderId: "gid://shopify/Order/x", totalUsd: 1 }),
     () => operator.mutation(api.orders.applyTracking, { siteId, cjOrderNumber: order.cjOrderNumber, status: "shipped" }),
     () => operator.mutation(api.orders.claimSandboxCjDispatch, { actionId, triggerRunId: "run", leaseToken: "t".repeat(64) }),

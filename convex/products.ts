@@ -6,6 +6,7 @@ import { evaluatePersistedCjEvidence } from "../src/lib/sourcingPolicy";
 import { hasVerifiedInternalShopifyDraftLineage } from "../src/lib/shopifyDraftLineage";
 import { reuseSourceSelectionLineage, sourceSelectionDecision } from "../src/lib/sourceSelectionState";
 import { actionMatchesApprovedDraftImport, shopifyDraftTraceDetail } from "../src/lib/draftImportLineage";
+import { invalidateShopifyEconomicsForObservation } from "./shopifyEconomics";
 
 const productStatus = v.union(
   v.literal("draft"),
@@ -405,10 +406,7 @@ export const completeApprovedShopifyDraftImport = mutation({
       shopifyDraftImportStatus: "created", shopifyObservedAt: now,
       shopifyEconomicsSnapshotAttemptId: undefined, shopifyEconomicsExcludedAt: now,
     });
-    const site = await ctx.db.get(args.siteId);
-    if (site?.shopifyEconomicsSyncStatus === "current") {
-      await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
-    }
+    await invalidateShopifyEconomicsForObservation(ctx, args.siteId, "shopify_draft_import_observation");
     await ctx.db.patch(args.actionId, { status: "executed", resolvedAt: now });
     const traceDetail = typeof trace.detail === "object" && trace.detail !== null ? trace.detail as Record<string, unknown> : {};
     await ctx.db.patch(trace._id, { status: "succeeded", detail: { ...traceDetail, productId: args.productId, actionId: args.actionId, evidenceId: product.cjEvidenceId, shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, published: false }, finishedAt: now });

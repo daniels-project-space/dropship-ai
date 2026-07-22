@@ -48,7 +48,6 @@ type ShopifySyncDependencies = {
   readShop?: typeof getShop;
   readProducts?: typeof listProductsWithCoverage;
   readOrders?: typeof listOrdersWithCoverage;
-  now?: () => number;
 };
 
 /** Run the read-only products+orders sync after durably recording the attempt. */
@@ -63,7 +62,11 @@ export async function syncShopify(
   const boundedSinceDays = boundedShopifySinceDays(sinceDays);
 
   const attemptId = (dependencies.createAttemptId ?? randomUUID)();
-  await convex.mutation(api.sites.beginEconomicsSync, { siteId: sid, attemptId, sinceDays: boundedSinceDays });
+  const attempt = await convex.mutation(api.sites.beginEconomicsSync, {
+    siteId: sid, attemptId, sinceDays: boundedSinceDays,
+  });
+  let observedProductCount = 0;
+  let observedOrderCount = 0;
 
   try {
     // Resolve recurring vault access only after the durable attempt begins, so missing/failed
@@ -81,27 +84,32 @@ export async function syncShopify(
 
     const [productRead, orderRead] = await Promise.all([
       (dependencies.readProducts ?? listProductsWithCoverage)(cfg, { limit: 250 }),
-      (dependencies.readOrders ?? listOrdersWithCoverage)(cfg, { sinceDays: boundedSinceDays, limit: 250 }),
+      (dependencies.readOrders ?? listOrdersWithCoverage)(cfg, { createdAtMin: attempt.orderCutoffAt, limit: 250 }),
     ]);
     const products = productRead.items;
     const orders = orderRead.items;
-    const snapshotReadAt = (dependencies.now ?? Date.now)();
+    observedProductCount = products.length;
+    observedOrderCount = orders.length;
 
     // No mirror mutation is reachable until both reads prove complete canonical coverage.
     if (!productRead.complete || !orderRead.complete || boundedSinceDays !== SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS) {
-      await convex.mutation(api.sites.markEconomicsSyncNotCurrent, {
+      const incomplete = await convex.mutation(api.sites.markEconomicsSyncNotCurrent, {
         siteId: sid, attemptId, status: "incomplete",
         reason: boundedSinceDays !== SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS
           ? "noncanonical_window"
           : !productRead.complete ? "product_truncation" : "order_truncation",
       });
-      return { productCount: products.length, orderCount: orders.length, lastSyncedAt: snapshotReadAt, economicsSync: "incomplete" };
+      return {
+        productCount: products.length,
+        orderCount: orders.length,
+        lastSyncedAt: incomplete.finishedAt,
+        economicsSync: "incomplete",
+      };
     }
 
     const committed = await convex.mutation(api.sites.commitEconomicsSnapshot, {
       siteId: sid,
       attemptId,
-      snapshotReadAt,
       products: products.map((p) => ({
         shopifyProductId: p.id, title: p.title, priceUsd: p.priceUsd,
         status: mapProductStatus(p.status), imageUrl: p.imageUrl ?? undefined,
@@ -120,7 +128,17 @@ export async function syncShopify(
       economicsSync: committed.status,
     };
   } catch (error) {
-    await convex.mutation(api.sites.markEconomicsSyncNotCurrent, { siteId: sid, attemptId, status: "failed", reason: "provider_or_commit_failure" });
+    const marked = await convex.mutation(api.sites.markEconomicsSyncNotCurrent, {
+      siteId: sid, attemptId, status: "failed", reason: "provider_or_commit_failure",
+    });
+    if (marked.attemptMatched && marked.status === "incomplete") {
+      return {
+        productCount: observedProductCount,
+        orderCount: observedOrderCount,
+        lastSyncedAt: marked.finishedAt,
+        economicsSync: "incomplete",
+      };
+    }
     throw error;
   }
 }

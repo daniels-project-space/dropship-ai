@@ -48,10 +48,14 @@ export default defineSchema({
     shopifyEconomicsSyncStatus: v.optional(v.union(v.literal("pending"), v.literal("current"), v.literal("failed"), v.literal("incomplete"))),
     shopifyEconomicsSyncAttemptId: v.optional(v.string()),
     shopifyEconomicsSyncAttemptedAt: v.optional(v.number()),
+    // Exact Convex-owned lower bound used by both the provider query and snapshot reducer.
+    shopifyEconomicsSyncOrderCutoffAt: v.optional(v.number()),
     shopifyEconomicsSyncSucceededAt: v.optional(v.number()),
     shopifyEconomicsSyncSinceDays: v.optional(v.number()),
     shopifyEconomicsSyncProductCount: v.optional(v.number()),
     shopifyEconomicsSyncOrderCount: v.optional(v.number()),
+    shopifyEconomicsSyncInvalidatedAt: v.optional(v.number()),
+    shopifyEconomicsSyncInvalidationReason: v.optional(v.string()),
     customDomain: v.optional(v.string()),
     // brand/margin guardrails (enforced by the brain)
     minKitPriceUsd: v.number(),                   // §8.2 never below this (e.g. 35–55)
@@ -107,7 +111,10 @@ export default defineSchema({
     status: v.union(v.literal("draft"), v.literal("active"), v.literal("archived"), v.literal("killed")),
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
-  }).index("by_site", ["siteId"]).index("by_site_status", ["siteId", "status"]).index("by_site_shopify_product_variant", ["siteId", "shopifyProductId", "shopifyVariantId"]),
+  }).index("by_site", ["siteId"])
+    .index("by_site_status", ["siteId", "status"])
+    .index("by_site_shopify_product", ["siteId", "shopifyProductId"])
+    .index("by_site_shopify_product_variant", ["siteId", "shopifyProductId", "shopifyVariantId"]),
 
   // Parsed, server-read CJ evidence. Optional costs mean "unknown", never zero; candidates
   // using them fail closed. This row is the lineage anchor for a sourced product and its trace.
@@ -252,8 +259,8 @@ export default defineSchema({
     shopifyObservedAt: v.optional(v.number()),
     shopifyEconomicsSnapshotAttemptId: v.optional(v.string()),
     shopifyEconomicsExcludedAt: v.optional(v.number()),
-    // Per-field webhook fences let a snapshot merge complete economic reads without overwriting
-    // a newer partial orders/updated observation.
+    // Server-owned per-field observation lineage. Snapshot races are fenced transactionally on
+    // the site row; these timestamps remain evidence and never authorize a caller-clock merge.
     shopifyEconomicFieldObservedAt: v.optional(v.object({
       currencyCode: v.optional(v.number()),
       currentTotal: v.optional(v.number()),
@@ -309,6 +316,7 @@ export default defineSchema({
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
   }).index("by_site", ["siteId"])
+    .index("by_site_created_at", ["siteId", "createdAt"])
     .index("by_site_shopify_order", ["siteId", "shopifyOrderId"])
     .index("by_site_cj_order_number", ["siteId", "cjOrderNumber"])
     // CJ supports one callback per topic. This dedicated global routing index is used only by

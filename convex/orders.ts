@@ -4,6 +4,7 @@ import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { cjFreightQuoteDigest, cjOrderInputHash, normalizeCjOrderInput, sandboxDispatchDecision, sandboxOrderNumber, stableSha256 } from "../src/lib/cjOrder";
 import { hasVerifiedShopifyCjLineage } from "../src/lib/orderLineageState";
+import { invalidateShopifyEconomicsForObservation } from "./shopifyEconomics";
 import { hasCurrentSandboxCjDispatchReceipt, hasValidSandboxCjApprovalBinding } from "../src/lib/sandboxCjBinding";
 import { CJ_STAGING_MAX_ATTEMPTS, cjStagingFailureTransition, cjStagingGenerationFingerprint, hasExactCjStagingGeneration, legacyCjStagingRunnableAt, type CjStagingPhase } from "../src/lib/cjStagingState";
 
@@ -130,8 +131,7 @@ export const record = mutation({
       }
       if (args.currentTotal !== undefined && args.currencyCode === "USD") patch.totalUsd = args.currentTotal;
       await ctx.db.patch(existing._id, patch);
-      const site = await ctx.db.get(args.siteId);
-      if (site?.shopifyEconomicsSyncStatus === "current") await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
+      await invalidateShopifyEconomicsForObservation(ctx, args.siteId, "shopify_order_observation");
       return existing._id;
     }
     const orderId = await ctx.db.insert("orders", {
@@ -151,8 +151,7 @@ export const record = mutation({
       shopifyEconomicFieldObservedAt: economicFieldObservationTimes(args, observedAt),
       createdAt: observedAt,
     });
-    const site = await ctx.db.get(args.siteId);
-    if (site?.shopifyEconomicsSyncStatus === "current") await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
+    await invalidateShopifyEconomicsForObservation(ctx, args.siteId, "shopify_order_observation");
     await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { orderId } });
     return orderId;
   },

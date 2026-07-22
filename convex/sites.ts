@@ -22,6 +22,7 @@ const snapshotFulfillmentStatus = v.union(
 const snapshotCreditAdjustmentState = v.union(v.literal("none"), v.literal("partial"), v.literal("full"));
 const SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS = 60;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const SHOPIFY_ECONOMICS_SNAPSHOT_CAP = 250;
 const ADVANCED_ORDER = { received: 0, sent_to_cj: 1, shipped: 2, delivered: 3, error: 0 } as const;
 
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }) {
@@ -165,14 +166,18 @@ export const beginEconomicsSync = mutation({
     if (!/^[A-Za-z0-9-]{1,100}$/.test(attemptId)) throw new Error("invalid Shopify sync attempt identity");
     if (!Number.isInteger(sinceDays) || sinceDays < 1 || sinceDays > 60) throw new Error("invalid Shopify sync coverage window");
     const attemptedAt = Date.now();
+    const orderCutoffAt = attemptedAt - sinceDays * DAY_MS;
     await ctx.db.patch(siteId, {
       shopifyEconomicsSyncStatus: "pending",
       shopifyEconomicsSyncAttemptId: attemptId,
       shopifyEconomicsSyncAttemptedAt: attemptedAt,
+      shopifyEconomicsSyncOrderCutoffAt: orderCutoffAt,
       shopifyEconomicsSyncSinceDays: sinceDays,
+      shopifyEconomicsSyncInvalidatedAt: undefined,
+      shopifyEconomicsSyncInvalidationReason: undefined,
     });
     await appendAudit(ctx, { siteId, event: "shopify_economics_sync_started", detail: { attemptId, sinceDays } });
-    return { attemptedAt };
+    return { attemptedAt, orderCutoffAt };
   },
 });
 
@@ -185,7 +190,6 @@ export const commitEconomicsSnapshot = mutation({
   args: {
     siteId: v.id("sites"),
     attemptId: v.string(),
-    snapshotReadAt: v.number(),
     products: v.array(v.object({
       shopifyProductId: v.string(), title: v.string(), priceUsd: v.number(), status: snapshotProductStatus,
       imageUrl: v.optional(v.string()),
@@ -197,11 +201,24 @@ export const commitEconomicsSnapshot = mutation({
       fulfillmentStatus: snapshotFulfillmentStatus, createdAt: v.number(),
     })),
   },
-  handler: async (ctx, { siteId, attemptId, snapshotReadAt, products, orders }) => {
+  handler: async (ctx, { siteId, attemptId, products, orders }) => {
     await requireServiceIdentity(ctx);
     const site = await ctx.db.get(siteId);
     if (!site || site.shopifyEconomicsSyncAttemptId !== attemptId) {
       throw new Error("Shopify economics sync attempt was superseded");
+    }
+    const finishedAt = Date.now();
+    // An observation owns the canonical result once it atomically invalidates this attempt.
+    // Returning it as incomplete keeps the route on its established 409 contract and ensures a
+    // later provider/read failure cannot disguise the causal race as an opaque failure.
+    if (site.shopifyEconomicsSyncStatus === "incomplete") {
+      return {
+        status: "incomplete" as const,
+        productCount: products.length,
+        orderCount: orders.length,
+        finishedAt,
+        reason: site.shopifyEconomicsSyncInvalidationReason,
+      };
     }
     if (site.shopifyEconomicsSyncStatus !== "pending") throw new Error("Shopify economics sync attempt is not active");
     if (!site.shopifyDomain || site.sample === true || site.storeCurrency !== "USD" || !Number.isFinite(site.shopifyAccessVerifiedAt)) {
@@ -209,9 +226,10 @@ export const commitEconomicsSnapshot = mutation({
     }
     const attemptedAt = site.shopifyEconomicsSyncAttemptedAt;
     if (!Number.isFinite(attemptedAt)) throw new Error("Shopify economics sync attempt has no durable start fence");
-    const finishedAt = Date.now();
-    if (!Number.isFinite(snapshotReadAt) || snapshotReadAt < attemptedAt! || snapshotReadAt > finishedAt) {
-      throw new Error("Shopify economics snapshot read fence is invalid");
+    const cutoff = site.shopifyEconomicsSyncOrderCutoffAt;
+    if (!Number.isFinite(cutoff)
+      || cutoff !== attemptedAt! - (site.shopifyEconomicsSyncSinceDays ?? 0) * DAY_MS) {
+      throw new Error("Shopify economics sync attempt has no valid durable order cutoff");
     }
 
     // A diagnostic window can be read, but it can never mutate or become launch-current.
@@ -220,7 +238,9 @@ export const commitEconomicsSnapshot = mutation({
       await appendAudit(ctx, { siteId, event: "shopify_economics_sync_incomplete", detail: { attemptId, reason: "noncanonical_window", sinceDays: site.shopifyEconomicsSyncSinceDays } });
       return { status: "incomplete" as const, productCount: products.length, orderCount: orders.length, finishedAt };
     }
-    if (products.length > 250 || orders.length > 250) throw new Error("Shopify economics snapshot exceeds the bounded provider read cap");
+    if (products.length > SHOPIFY_ECONOMICS_SNAPSHOT_CAP || orders.length > SHOPIFY_ECONOMICS_SNAPSHOT_CAP) {
+      throw new Error("Shopify economics snapshot exceeds the bounded provider read cap");
+    }
 
     const productIds = new Set<string>();
     for (const product of products) {
@@ -233,21 +253,38 @@ export const commitEconomicsSnapshot = mutation({
       productIds.add(product.shopifyProductId);
     }
     const orderIds = new Set<string>();
-    const cutoff = attemptedAt! - SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS * DAY_MS;
     for (const order of orders) {
       if (!order.shopifyOrderId.startsWith("gid://shopify/Order/") || orderIds.has(order.shopifyOrderId)) {
         throw new Error("complete Shopify order snapshot contains an invalid or duplicate order identity");
       }
       if (order.currencyCode !== "USD" || !Number.isFinite(order.currentTotal) || order.currentTotal < 0
-        || !Number.isFinite(order.createdAt) || order.createdAt < cutoff || order.createdAt > finishedAt + DAY_MS
+        || !Number.isFinite(order.createdAt) || order.createdAt < cutoff! || order.createdAt > finishedAt + DAY_MS
         || !order.financialStatus.trim()) {
         throw new Error("complete Shopify order snapshot contains invalid or out-of-window facts");
       }
       orderIds.add(order.shopifyOrderId);
     }
 
-    const existingProducts = await ctx.db.query("products").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect();
-    const existingOrders = await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect();
+    // Only provider-backed catalogue rows and the exact durable order window participate. The
+    // extra row proves whether local reconciliation itself fits the same established cap.
+    const existingProducts = await ctx.db.query("products")
+      .withIndex("by_site_shopify_product", (q) => q.eq("siteId", siteId).gt("shopifyProductId", ""))
+      .take(SHOPIFY_ECONOMICS_SNAPSHOT_CAP + 1);
+    const existingOrders = await ctx.db.query("orders")
+      .withIndex("by_site_created_at", (q) => q.eq("siteId", siteId).gte("createdAt", cutoff!))
+      .take(SHOPIFY_ECONOMICS_SNAPSHOT_CAP + 1);
+    if (existingProducts.length > SHOPIFY_ECONOMICS_SNAPSHOT_CAP
+      || existingOrders.length > SHOPIFY_ECONOMICS_SNAPSHOT_CAP) {
+      const reason = existingProducts.length > SHOPIFY_ECONOMICS_SNAPSHOT_CAP
+        ? "local_provider_catalogue_exceeds_cap" : "local_order_window_exceeds_cap";
+      await ctx.db.patch(siteId, { shopifyEconomicsSyncStatus: "incomplete" });
+      await appendAudit(ctx, {
+        siteId,
+        event: "shopify_economics_sync_incomplete",
+        detail: { attemptId, reason, cap: SHOPIFY_ECONOMICS_SNAPSHOT_CAP },
+      });
+      return { status: "incomplete" as const, productCount: products.length, orderCount: orders.length, finishedAt, reason };
+    }
     const productsByProviderId = new Map<string, (typeof existingProducts)[number]>();
     for (const product of existingProducts) {
       if (!product.shopifyProductId) continue;
@@ -260,28 +297,13 @@ export const commitEconomicsSnapshot = mutation({
       ordersByProviderId.set(order.shopifyOrderId, order);
     }
 
-    // If an independently observed provider row appeared after this attempt began but is absent
-    // from its reads, the reads raced provider state. Preserve that row and write no snapshot.
-    const racedProduct = existingProducts.some((product) => product.shopifyProductId
-      && !productIds.has(product.shopifyProductId)
-      && ((product.shopifyObservedAt ?? product._creationTime) > attemptedAt!));
-    const racedOrder = existingOrders.some((order) => order.createdAt >= cutoff
-      && !orderIds.has(order.shopifyOrderId)
-      && ((order.shopifyObservedAt ?? order._creationTime) > attemptedAt!));
-    if (racedProduct || racedOrder) {
-      await ctx.db.patch(siteId, { shopifyEconomicsSyncStatus: "incomplete" });
-      await appendAudit(ctx, { siteId, event: "shopify_economics_sync_incomplete", detail: { attemptId, reason: "provider_observation_race", racedProduct, racedOrder } });
-      return { status: "incomplete" as const, productCount: products.length, orderCount: orders.length, finishedAt };
-    }
-
     for (const product of products) {
       const existing = productsByProviderId.get(product.shopifyProductId);
       if (existing) {
-        const observedAfterRead = (existing.shopifyObservedAt ?? 0) > snapshotReadAt;
         const status = product.status === "active" && existing.status !== "active" ? "draft" : product.status;
         await ctx.db.patch(existing._id, {
-          ...(!observedAfterRead ? { title: product.title, priceUsd: product.priceUsd, status } : {}),
-          shopifyObservedAt: observedAfterRead ? existing.shopifyObservedAt : snapshotReadAt,
+          title: product.title, priceUsd: product.priceUsd, status,
+          shopifyObservedAt: finishedAt,
           shopifyEconomicsSnapshotAttemptId: attemptId,
           shopifyEconomicsExcludedAt: undefined,
           sample: false,
@@ -291,7 +313,7 @@ export const commitEconomicsSnapshot = mutation({
           siteId, title: product.title, shopifyProductId: product.shopifyProductId,
           cjFromUsWarehouse: false, cogsUsd: 0, shippingUsd: 0, priceUsd: product.priceUsd,
           status: product.status === "active" ? "draft" : product.status,
-          shopifyObservedAt: snapshotReadAt, shopifyEconomicsSnapshotAttemptId: attemptId,
+          shopifyObservedAt: finishedAt, shopifyEconomicsSnapshotAttemptId: attemptId,
           createdAt: finishedAt, sample: false,
         });
       }
@@ -308,21 +330,18 @@ export const commitEconomicsSnapshot = mutation({
     for (const order of orders) {
       const existing = ordersByProviderId.get(order.shopifyOrderId);
       if (existing) {
-        const fieldObservedAt = existing.shopifyEconomicFieldObservedAt;
-        const newer = (field: keyof NonNullable<typeof fieldObservedAt>) => (fieldObservedAt?.[field] ?? 0) > snapshotReadAt;
-        const currencyCode = newer("currencyCode") ? existing.currencyCode : order.currencyCode;
-        const currentTotal = newer("currentTotal") ? existing.currentTotal : order.currentTotal;
-        const financialStatus = newer("financialStatus") ? existing.financialStatus : order.financialStatus;
-        const test = newer("test") ? existing.test : order.test;
-        const cancelled = newer("cancelled") ? existing.cancelled : order.cancelled;
-        const creditAdjustmentState = newer("creditAdjustmentState") ? existing.creditAdjustmentState : order.creditAdjustmentState;
         const nextStatus = ADVANCED_ORDER[order.fulfillmentStatus] > ADVANCED_ORDER[existing.fulfillmentStatus]
           ? order.fulfillmentStatus : existing.fulfillmentStatus;
         await ctx.db.patch(existing._id, {
-          currencyCode, currentTotal, financialStatus, test, cancelled, creditAdjustmentState,
-          totalUsd: currencyCode === "USD" ? currentTotal : undefined,
+          currencyCode: order.currencyCode, currentTotal: order.currentTotal,
+          financialStatus: order.financialStatus, test: order.test, cancelled: order.cancelled,
+          creditAdjustmentState: order.creditAdjustmentState, totalUsd: order.currentTotal,
           fulfillmentStatus: nextStatus,
-          shopifyObservedAt: (existing.shopifyObservedAt ?? 0) > snapshotReadAt ? existing.shopifyObservedAt : snapshotReadAt,
+          shopifyObservedAt: finishedAt,
+          shopifyEconomicFieldObservedAt: {
+            currencyCode: finishedAt, currentTotal: finishedAt, financialStatus: finishedAt,
+            test: finishedAt, cancelled: finishedAt, creditAdjustmentState: finishedAt,
+          },
           shopifyEconomicsSnapshotAttemptId: attemptId,
           shopifyEconomicsExcludedAt: undefined,
           sample: false,
@@ -333,13 +352,17 @@ export const commitEconomicsSnapshot = mutation({
           currencyCode: order.currencyCode, currentTotal: order.currentTotal,
           financialStatus: order.financialStatus, test: order.test, cancelled: order.cancelled,
           creditAdjustmentState: order.creditAdjustmentState, totalUsd: order.currentTotal,
-          shopifyObservedAt: snapshotReadAt, shopifyEconomicsSnapshotAttemptId: attemptId,
+          shopifyObservedAt: finishedAt, shopifyEconomicsSnapshotAttemptId: attemptId,
+          shopifyEconomicFieldObservedAt: {
+            currencyCode: finishedAt, currentTotal: finishedAt, financialStatus: finishedAt,
+            test: finishedAt, cancelled: finishedAt, creditAdjustmentState: finishedAt,
+          },
           createdAt: order.createdAt, sample: false,
         });
       }
     }
     for (const existing of existingOrders) {
-      if (existing.createdAt < cutoff || orderIds.has(existing.shopifyOrderId)) continue;
+      if (orderIds.has(existing.shopifyOrderId)) continue;
       await ctx.db.patch(existing._id, {
         shopifyEconomicsSnapshotAttemptId: undefined,
         shopifyEconomicsExcludedAt: finishedAt,
@@ -353,6 +376,8 @@ export const commitEconomicsSnapshot = mutation({
       shopifyEconomicsSyncSucceededAt: finishedAt,
       shopifyEconomicsSyncProductCount: productCount,
       shopifyEconomicsSyncOrderCount: orderCount,
+      shopifyEconomicsSyncInvalidatedAt: undefined,
+      shopifyEconomicsSyncInvalidationReason: undefined,
     });
     await appendAudit(ctx, {
       siteId,
@@ -373,12 +398,21 @@ export const markEconomicsSyncNotCurrent = mutation({
   handler: async (ctx, { siteId, attemptId, status, reason }) => {
     await requireServiceIdentity(ctx);
     const site = await ctx.db.get(siteId);
-    if (!site || site.shopifyEconomicsSyncAttemptId !== attemptId || site.shopifyEconomicsSyncStatus !== "pending") {
-      return { ignored: true as const, status };
+    const finishedAt = Date.now();
+    if (!site || site.shopifyEconomicsSyncAttemptId !== attemptId) {
+      return { ignored: true as const, attemptMatched: false as const, status, finishedAt };
+    }
+    if (site.shopifyEconomicsSyncStatus !== "pending") {
+      return {
+        ignored: true as const,
+        attemptMatched: true as const,
+        status: site.shopifyEconomicsSyncStatus,
+        finishedAt,
+      };
     }
     await ctx.db.patch(siteId, { shopifyEconomicsSyncStatus: status });
     await appendAudit(ctx, { siteId, event: `shopify_economics_sync_${status}`, detail: { attemptId, ...(reason ? { reason } : {}) } });
-    return { ignored: false as const, status };
+    return { ignored: false as const, attemptMatched: true as const, status, finishedAt };
   },
 });
 

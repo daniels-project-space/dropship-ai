@@ -13,6 +13,7 @@ const modules = {
   "../convex/webhooks.ts": () => import("../convex/webhooks.ts"),
   "../convex/dashboard.ts": () => import("../convex/dashboard.ts"),
   "../convex/sites.ts": () => import("../convex/sites.ts"),
+  "../convex/shopifyEconomics.ts": () => import("../convex/shopifyEconomics.ts"),
   "../convex/audit.ts": () => import("../convex/audit.ts"),
   "../convex/_generated/api.js": () => import("../convex/_generated/api.js"),
 };
@@ -203,7 +204,7 @@ test("a verified site cannot rebind domains and preserves all prior tenant state
   const siteId = await site(t, "Bound", { status: "provisioning", storeCurrency: undefined });
   await service(t).mutation(api.sites.connectStore, { siteId, shopifyDomain: "bound.myshopify.com", storeCurrency: "USD" });
   await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "bound-current", sinceDays: 60 });
-  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "bound-current", snapshotReadAt: Date.now(), products: [], orders: [] });
+  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "bound-current", products: [], orders: [] });
   await t.run(async (ctx) => {
     await ctx.db.insert("products", { siteId, title: "Kept", cjFromUsWarehouse: true, cogsUsd: 1, shippingUsd: 1, priceUsd: 10, status: "draft", createdAt: 1 });
     await ctx.db.insert("orders", { siteId, shopifyOrderId: "kept-order", fulfillmentStatus: "received", createdAt: 1 });
@@ -261,7 +262,7 @@ test("economics sync records complete zero-commerce success and fails closed aft
   const siteId = await site(t, "Zero", { status: "provisioning", storeCurrency: undefined });
   await service(t).mutation(api.sites.connectStore, { siteId, shopifyDomain: "zero.myshopify.com", storeCurrency: "USD" });
   await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "zero-success", sinceDays: 60 });
-  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "zero-success", snapshotReadAt: Date.now(), products: [], orders: [] });
+  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "zero-success", products: [], orders: [] });
   const successful = await t.run((ctx) => ctx.db.get(siteId));
   assert.equal(successful.shopifyEconomicsSyncProductCount, 0);
   assert.equal(successful.shopifyEconomicsSyncOrderCount, 0);
@@ -319,7 +320,7 @@ test("bounded connected-site verification backfills legacy currency before curre
   await t.run((ctx) => ctx.db.insert("siteSecrets", { siteId, key: "SHOPIFY_ADMIN_TOKEN", vaultRef: "shopify/LEGACY" }));
   await service(t).mutation(api.sites.verifyConnectedStore, { siteId, shopifyDomain: "legacy.myshopify.com", storeCurrency: "USD" });
   await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "legacy-proof", sinceDays: 60 });
-  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "legacy-proof", snapshotReadAt: Date.now(), products: [], orders: [{ shopifyOrderId: "gid://shopify/Order/legacy", currencyCode: "USD", currentTotal: 64.5, financialStatus: "PAID", test: false, cancelled: false, creditAdjustmentState: "none", fulfillmentStatus: "received", createdAt: Date.now() }] });
+  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "legacy-proof", products: [], orders: [{ shopifyOrderId: "gid://shopify/Order/legacy", currencyCode: "USD", currentTotal: 64.5, financialStatus: "PAID", test: false, cancelled: false, creditAdjustmentState: "none", fulfillmentStatus: "received", createdAt: Date.now() }] });
   const stored = await t.run((ctx) => ctx.db.get(siteId));
   const order = await service(t).query(api.orders.getByShopifyOrder, { siteId, shopifyOrderId: "gid://shopify/Order/legacy" });
   assert.equal(stored.storeCurrency, "USD");
@@ -347,8 +348,11 @@ test("Shopify domain or currency mismatch changes no legacy connection state", a
 test("Shopify sync reads current money, currency, payment, test, cancellation and credit facts", async () => {
   const originalFetch = globalThis.fetch;
   let query = "";
+  let variables;
   globalThis.fetch = async (_url, init) => {
-    query = JSON.parse(init.body).query;
+    const request = JSON.parse(init.body);
+    query = request.query;
+    variables = request.variables;
     return new Response(JSON.stringify({ data: { orders: {
       pageInfo: { hasNextPage: false, endCursor: null },
       nodes: [{
@@ -361,8 +365,10 @@ test("Shopify sync reads current money, currency, payment, test, cancellation an
     } } }), { status: 200, headers: { "content-type": "application/json" } });
   };
   try {
-    const [order] = await listOrders({ shop: "example.myshopify.com", accessToken: "scoped-test" }, { limit: 1 });
+    const cutoff = Date.parse("2026-05-23T12:34:56.789Z");
+    const [order] = await listOrders({ shop: "example.myshopify.com", accessToken: "scoped-test" }, { createdAtMin: cutoff, limit: 1 });
     assert.match(query, /currentTotalPriceSet/);
+    assert.equal(variables.query, "created_at:>=2026-05-23T12:34:56.789Z");
     for (const field of ["displayFinancialStatus", "test", "cancelledAt", "refunds"]) assert.match(query, new RegExp(field));
     assert.equal(order.currentTotal, 42.5);
     assert.equal(order.currencyCode, "USD");

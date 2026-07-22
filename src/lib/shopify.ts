@@ -181,17 +181,20 @@ export interface ShopifyOrder {
 }
 
 /**
- * List orders created in the trailing `sinceDays` window (default 60). NOTE: the `read_orders`
+ * List orders from an exact cutoff, or a trailing `sinceDays` window for standalone callers.
+ * Snapshot orchestration always supplies the durable Convex-owned cutoff. NOTE: the `read_orders`
  * scope only exposes the **last 60 days** of orders by default — older history needs Shopify's
  * `read_all_orders` protected scope (app approval). 60 days is the safe default. Cursor-paginated,
  * 50 per page, capped at 250 orders.
  */
 export async function listOrdersWithCoverage(
   cfg: ShopifyClientConfig,
-  { sinceDays = 60, limit = 250 }: { sinceDays?: number; limit?: number } = {},
+  { createdAtMin, sinceDays = 60, limit = 250 }: { createdAtMin?: number; sinceDays?: number; limit?: number } = {},
 ): Promise<ShopifyBoundedRead<ShopifyOrder>> {
   const cap = Math.min(limit, 250);
-  const sinceIso = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+  const cutoff = createdAtMin ?? Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+  if (!Number.isFinite(cutoff)) throw new Error("Shopify order cutoff is invalid");
+  const sinceIso = new Date(cutoff).toISOString();
   const queryFilter = `created_at:>=${sinceIso}`;
   const out: ShopifyOrder[] = [];
   let after: string | null = null;
@@ -244,7 +247,7 @@ export async function listOrdersWithCoverage(
 
 export async function listOrders(
   cfg: ShopifyClientConfig,
-  options: { sinceDays?: number; limit?: number } = {},
+  options: { createdAtMin?: number; sinceDays?: number; limit?: number } = {},
 ): Promise<ShopifyOrder[]> {
   return (await listOrdersWithCoverage(cfg, options)).items;
 }

@@ -6,6 +6,7 @@ import { appendAudit } from "./audit";
 import { webhookDeliveryDecision, cjTrackingMappingDecision, shopifyReceiptDecision, shopifyStagingIntakeDecision } from "../src/lib/webhookReceiptState";
 import { cjStagingInputDigest } from "../src/lib/cjOrder";
 import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
+import { invalidateShopifyEconomicsForObservation } from "./shopifyEconomics";
 
 const fulfillmentStatus = v.union(
   v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
@@ -110,12 +111,8 @@ export const recordShopifyOrder = mutation({
     let intentId: any = null;
     let intentNeedsAttention = false;
     const storedOrder = await ctx.db.get(orderId) as any;
+    await invalidateShopifyEconomicsForObservation(ctx, args.siteId, "shopify_webhook_order_observation");
     const site = await ctx.db.get(args.siteId);
-    if (site?.shopifyEconomicsSyncStatus === "current") {
-      // A post-snapshot provider fact is retained, but launch economics wait for a new complete
-      // snapshot generation before including it.
-      await ctx.db.patch(args.siteId, { shopifyEconomicsSyncStatus: "incomplete" });
-    }
     const economicallyEligible = !!storedOrder && !!site && eligibleUsdOrder(storedOrder, site.storeCurrency);
     if (args.stagingInput && economicallyEligible) {
       // Deterministic on the mirrored order, not merely delivery ID: Shopify can redeliver a
