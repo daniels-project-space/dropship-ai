@@ -18,6 +18,7 @@ export default defineConfig({
           "VAULT_ACCESS_TOKEN", "NEXT_PUBLIC_CONVEX_URL", "CONVEX_URL",
           "DROPSHIP_AI_AUTH_ISSUER", "DROPSHIP_AI_AUTH_AUDIENCE", "DROPSHIP_AI_AUTH_KID", "DROPSHIP_AI_AUTH_PRIVATE_KEY",
           "TRIGGER_CJ_DISPATCH_LEASE_SECRET",
+          "CREATIVE_GENERATION_CONCURRENCY",
           // Non-secret dual-control flag required before a Trigger worker can issue any live write.
           "DROPSHIP_AI_LIVE_EFFECTS", "DROPSHIP_AI_LIVE_EFFECTS_CONFIRM",
         ] as const;

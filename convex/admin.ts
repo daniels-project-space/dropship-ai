@@ -10,7 +10,8 @@ import { v } from "convex/values";
 
 /**
  * Cascade-delete a single site and everything scoped to it: creatives, posts, actions, auditLog,
- * products, signals, metrics, siteSecrets, experiments, orders. Index-driven (no full scans).
+ * generation intents/variants, products, signals, metrics, siteSecrets, experiments, orders.
+ * Index-driven (no full scans).
  */
 export const deleteSiteCascade = mutation({
   args: { siteId: v.id("sites") },
@@ -27,6 +28,8 @@ export const deleteSiteCascade = mutation({
     };
 
     await delAll(await ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
+    await delAll(await ctx.db.query("creativeGenerationVariants").withIndex("by_site_updated", (q) => q.eq("siteId", siteId)).collect());
+    await delAll(await ctx.db.query("creativeGenerationIntents").withIndex("by_site_updated", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("posts").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("actions").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("auditLog").withIndex("by_site_at", (q) => q.eq("siteId", siteId)).collect());

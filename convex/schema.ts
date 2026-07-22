@@ -195,6 +195,8 @@ export default defineSchema({
   creatives: defineTable({
     siteId: v.id("sites"),
     productId: v.optional(v.id("products")),
+    // A durable generation variant may bind at most one review row. Optional for legacy rows.
+    generationVariantId: v.optional(v.id("creativeGenerationVariants")),
     kind: v.union(v.literal("product_demo"), v.literal("ai_spokesperson"), v.literal("ai_broll"), v.literal("customer_ugc")),
     r2Key: v.string(),                            // asset in R2
     aiGenerated: v.boolean(),
@@ -207,7 +209,96 @@ export default defineSchema({
     revision: v.optional(v.number()),              // immutable publication authorization fence
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
-  }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]).index("by_r2_key", ["r2Key"]),
+  }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]).index("by_r2_key", ["r2Key"])
+    .index("by_generation_variant", ["generationVariantId"]),
+
+  // One atomically-created parent plus K immutable children exists before any Trigger handoff.
+  // The parent status/counts are a transactionally maintained projection of its children.
+  creativeGenerationIntents: defineTable({
+    siteId: v.id("sites"),
+    productId: v.optional(v.id("products")),
+    callerRequestId: v.string(),
+    normalizedInputDigest: v.string(),
+    generationSpecDigest: v.string(),
+    requestedVariants: v.number(),
+    status: v.union(v.literal("queued"), v.literal("active"), v.literal("ready"), v.literal("failed"), v.literal("needs_attention"), v.literal("mixed")),
+    activeVariants: v.number(),
+    readyVariants: v.number(),
+    failedVariants: v.number(),
+    attentionVariants: v.number(),
+    handoffStatus: v.union(v.literal("pending"), v.literal("dispatching"), v.literal("dispatched")),
+    handoffGeneration: v.number(),
+    handoffLeaseExpiresAt: v.optional(v.number()),
+    handoffDueAt: v.optional(v.number()),
+    triggerRunId: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    completedAt: v.optional(v.number()),
+  }).index("by_request_id", ["callerRequestId"])
+    .index("by_handoff_due", ["handoffStatus", "handoffDueAt"])
+    .index("by_site_updated", ["siteId", "updatedAt"]),
+
+  creativeGenerationVariants: defineTable({
+    intentId: v.id("creativeGenerationIntents"),
+    siteId: v.id("sites"),
+    productId: v.optional(v.id("products")),
+    variantIndex: v.number(),
+    // Immutable generation facts. They never appear in Trigger payloads or operator projections.
+    hook: v.string(),
+    imagePrompt: v.string(),
+    clipPrompt: v.string(),
+    imageModel: v.string(),
+    clipModel: v.string(),
+    ttsModel: v.string(),
+    voiceId: v.string(),
+    ttsTextDigest: v.string(),
+    imageR2Key: v.string(),
+    clipR2Key: v.string(),
+    audioR2Key: v.string(),
+    finalR2Key: v.string(),
+    stage: v.union(
+      v.literal("image_submission"), v.literal("image_polling"), v.literal("image_result_copy"),
+      v.literal("clip_submission"), v.literal("clip_polling"), v.literal("clip_result_copy"),
+      v.literal("tts_reservation"), v.literal("tts_receipt"), v.literal("tts_audio_copy"),
+      v.literal("assembly"), v.literal("review_ready"), v.literal("failed"), v.literal("needs_attention"),
+    ),
+    terminal: v.boolean(),
+    runnableAt: v.optional(v.number()),
+    leaseOwner: v.optional(v.string()),
+    leaseGeneration: v.number(),
+    leaseExpiresAt: v.optional(v.number()),
+    failureCount: v.number(),
+    lastErrorCode: v.optional(v.string()),
+    failedAtStage: v.optional(v.string()),
+    retryEligible: v.optional(v.boolean()),
+    // Written immediately before an external submission. If it survives without a receipt,
+    // automatic replay is forbidden because the billed request may have reached the provider.
+    submissionStartedStage: v.optional(v.string()),
+    submissionStartedAt: v.optional(v.number()),
+    imageFalRequestId: v.optional(v.string()),
+    imageFalStatus: v.optional(v.string()),
+    imageFalStatusUrl: v.optional(v.string()),
+    imageFalResultUrl: v.optional(v.string()),
+    clipFalRequestId: v.optional(v.string()),
+    clipFalStatus: v.optional(v.string()),
+    clipFalStatusUrl: v.optional(v.string()),
+    clipFalResultUrl: v.optional(v.string()),
+    ttsRequestId: v.optional(v.string()),
+    ttsHistoryItemId: v.optional(v.string()),
+    ttsCharacterCost: v.optional(v.number()),
+    ttsCharacterCount: v.optional(v.number()),
+    imageObject: v.optional(v.object({ contentType: v.string(), bytes: v.number(), sha256: v.string() })),
+    clipObject: v.optional(v.object({ contentType: v.string(), bytes: v.number(), sha256: v.string() })),
+    audioObject: v.optional(v.object({ contentType: v.string(), bytes: v.number(), sha256: v.string() })),
+    finalObject: v.optional(v.object({ contentType: v.string(), bytes: v.number(), sha256: v.string() })),
+    labelBurned: v.optional(v.boolean()),
+    creativeId: v.optional(v.id("creatives")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+    completedAt: v.optional(v.number()),
+  }).index("by_intent_index", ["intentId", "variantIndex"])
+    .index("by_due", ["terminal", "runnableAt"])
+    .index("by_site_updated", ["siteId", "updatedAt"]),
 
   posts: defineTable({
     siteId: v.id("sites"),

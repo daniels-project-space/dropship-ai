@@ -96,11 +96,23 @@ export async function GET(request: Request) {
 
   for (const [id, label, service, keys] of [
     ["fal", "fal creative generation", "fal", ["FAL_KEY", "FAL_API_KEY"]],
-    ["elevenlabs", "ElevenLabs voiceover", "elevenlabs", ["ELEVENLABS_API_KEY"]],
   ] as const) {
     const configured = (await Promise.all(keys.map((key) => vaultGetValue(service, key)))).some(Boolean);
     checks.push({ id, group: "Generation", label, state: configured ? "configured" : "blocked", detail: configured ? "Caller credential is configured; quota/model execution is not probed" : "Caller credential is missing", next: configured ? "Run the bounded non-billable validation available to the operator, or retain this as unverified." : `Configure ${service} for the active caller.` });
   }
+
+  const elevenConfigured = Boolean(await vaultGetValue("elevenlabs", "ELEVENLABS_API_KEY"));
+  const elevenHistoryCompatible = process.env.ELEVENLABS_ENABLE_LOGGING !== "false";
+  checks.push({
+    id: "elevenlabs", group: "Generation", label: "ElevenLabs voiceover",
+    state: elevenConfigured && elevenHistoryCompatible ? "configured" : "blocked",
+    detail: !elevenConfigured ? "Caller credential is missing"
+      : elevenHistoryCompatible ? "Caller credential is configured; retained history is required for request-receipt recovery and provider execution is not probed"
+        : "Zero-retention mode disables the history/download reconciliation required to prevent duplicate billed samples",
+    next: !elevenConfigured ? "Configure elevenlabs for the active caller."
+      : elevenHistoryCompatible ? "Verify retained history and request-id headers in the separately authorized provider phase."
+        : "Enable ElevenLabs request logging/history before creative generation; zero-retention mode is incompatible with automatic reconciliation.",
+  });
 
   const cjKeys = await vaultKeyNames("cj");
   const cjBundle = ["CJ_OPEN_ID", "CJ_ACCESS_TOKEN", "CJ_REFRESH_TOKEN"].every((key) => cjKeys.includes(key));

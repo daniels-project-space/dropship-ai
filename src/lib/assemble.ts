@@ -12,7 +12,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getSignedUrl, putObject } from "./storage";
+import { getObjectBuffer, putDeterministicObject, type StoredObjectReceipt } from "./storage";
 
 const W = 1080;
 const H = 1920;
@@ -20,7 +20,9 @@ const LABEL_TEXT = "AI-generated"; // burned-in disclosure (locked wording)
 
 export type AssembleInput = {
   productClipR2Key: string;            // hero product clip OR still (mp4/jpg) — REQUIRED
+  productClipReceipt: Pick<StoredObjectReceipt, "contentType" | "bytes" | "sha256">;
   voiceoverR2Key?: string;             // optional ElevenLabs MP3
+  voiceoverReceipt?: Pick<StoredObjectReceipt, "contentType" | "bytes" | "sha256">;
   captions?: string;                   // optional on-screen caption line (hook)
   aiLabelRequired: boolean;            // MUST be true for any AI asset — enforced below
   outR2Key: string;                    // destination R2 key for the finished mp4
@@ -32,6 +34,8 @@ export type AssembleResult = {
   bytes: number;
   labelBurned: boolean;
   backend: "ffmpeg" | "stub";
+  contentType: "video/mp4";
+  sha256: string;
 };
 
 function ffmpegBinary(): string {
@@ -86,22 +90,16 @@ export async function assemble(input: AssembleInput): Promise<AssembleResult> {
   const dir = await mkdtemp(join(tmpdir(), "assemble-"));
   try {
     // 1) pull source clip/still from R2
-    const srcUrl = await getSignedUrl(input.productClipR2Key, 600);
-    const srcResp = await fetch(srcUrl);
-    if (!srcResp.ok) throw new Error(`assemble: source fetch HTTP ${srcResp.status}`);
     const isImage = /\.(jpe?g|png|webp)$/i.test(input.productClipR2Key);
     const srcPath = join(dir, isImage ? "src.jpg" : "src.mp4");
-    await writeFile(srcPath, Buffer.from(await srcResp.arrayBuffer()));
+    await writeFile(srcPath, await getObjectBuffer(input.productClipR2Key, input.productClipReceipt));
 
     // 2) optional voiceover
     let voicePath: string | null = null;
     if (input.voiceoverR2Key) {
-      const vUrl = await getSignedUrl(input.voiceoverR2Key, 600);
-      const vResp = await fetch(vUrl);
-      if (vResp.ok) {
-        voicePath = join(dir, "voice.mp3");
-        await writeFile(voicePath, Buffer.from(await vResp.arrayBuffer()));
-      }
+      if (!input.voiceoverReceipt) throw new Error("assemble: voiceover receipt is required");
+      voicePath = join(dir, "voice.mp3");
+      await writeFile(voicePath, await getObjectBuffer(input.voiceoverR2Key, input.voiceoverReceipt));
     }
 
     const outPath = join(dir, "out.mp4");
@@ -144,9 +142,9 @@ export async function assemble(input: AssembleInput): Promise<AssembleResult> {
 
     // 5) upload result to R2
     const out = await readFile(outPath);
-    await putObject(input.outR2Key, out, "video/mp4");
+    const receipt = await putDeterministicObject(input.outR2Key, out, "video/mp4", 300 * 1024 * 1024);
 
-    return { r2Key: input.outR2Key, bytes: out.byteLength, labelBurned: true, backend: "ffmpeg" };
+    return { r2Key: input.outR2Key, bytes: receipt.bytes, contentType: "video/mp4", sha256: receipt.sha256, labelBurned: true, backend: "ffmpeg" };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }

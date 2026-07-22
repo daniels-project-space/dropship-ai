@@ -1,48 +1,83 @@
-// Server-only route: enqueue the content-factory Trigger task from the Creative Studio UI.
-// Uses the Trigger SDK's tasks.trigger (no client bundle leakage; runs in the Node runtime).
-//
-// Auth: this is an internal operator console. The route requires TRIGGER_SECRET_KEY (or
-// TRIGGER_ACCESS_TOKEN) to be present in the server env to actually enqueue; if absent it
-// returns a 503 with a clear note rather than failing opaquely.
+// Operator intake commits one Convex intent plus K immutable variants before Trigger handoff.
 import { NextResponse } from "next/server";
 import { tasks } from "@trigger.dev/sdk/v3";
 import type { contentFactory } from "@/src/trigger/content-factory";
 import { requireOperator } from "@/src/lib/auth/server";
+import { convexClient, api } from "@/src/lib/convexClient";
+import type { Id } from "@/convex/_generated/dataModel";
+import {
+  creativeGenerationInputDigest, generationHandoffKey, normalizeCreativeGenerationInput,
+  validateCallerGenerationIdentity,
+} from "@/src/lib/creativeGeneration";
+import { FAL_CLIP_MODEL, FAL_IMAGE_MODEL } from "@/src/lib/gen/fal";
+import { ELEVEN_MODEL, ELEVEN_VOICE_ID } from "@/src/lib/gen/tts";
 
 export const runtime = "nodejs";
+const MAX_BODY_BYTES = 16 * 1024;
 
 export async function POST(req: Request) {
   const guard = await requireOperator(req);
   if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
-  let body: { siteId?: string; productId?: string; variants?: number; scenePrompt?: string; hooks?: string[] };
+  const declaredLength = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return NextResponse.json({ error: "request body is too large" }, { status: 413 });
+
+  let raw: unknown;
   try {
-    body = await req.json();
+    const text = await req.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) return NextResponse.json({ error: "request body is too large" }, { status: 413 });
+    raw = JSON.parse(text);
   } catch {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
-  if (!body.siteId) {
-    return NextResponse.json({ error: "siteId is required" }, { status: 400 });
-  }
-  if (!process.env.TRIGGER_SECRET_KEY && !process.env.TRIGGER_ACCESS_TOKEN) {
-    return NextResponse.json(
-      { error: "trigger not configured (TRIGGER_SECRET_KEY missing on server)" },
-      { status: 503 },
-    );
+
+  let input: ReturnType<typeof normalizeCreativeGenerationInput>;
+  let identity: ReturnType<typeof validateCallerGenerationIdentity>;
+  try {
+    input = normalizeCreativeGenerationInput(raw);
+    const body = raw as Record<string, unknown>;
+    identity = validateCallerGenerationIdentity(body.requestId, body.inputDigest);
+    if (creativeGenerationInputDigest(input) !== identity.inputDigest) throw new Error("inputDigest does not match the exact normalized input");
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "invalid generation request" }, { status: 400 });
   }
 
+  const convex = convexClient();
   try {
-    const handle = await tasks.trigger<typeof contentFactory>("content-factory", {
-      siteId: body.siteId,
-      productId: body.productId,
-      variants: body.variants ?? 3,
-      scenePrompt: body.scenePrompt,
-      hooks: body.hooks,
+    const intent: any = await convex.mutation(api.creativeGenerations.createOrReuseIntent, {
+      siteId: input.siteId as Id<"sites">,
+      productId: input.productId ? input.productId as Id<"products"> : undefined,
+      callerRequestId: identity.requestId,
+      normalizedInputDigest: identity.inputDigest,
+      requestedVariants: input.variants,
+      scenePrompt: input.scenePrompt,
+      hooks: input.hooks,
+      imageModel: FAL_IMAGE_MODEL,
+      clipModel: FAL_CLIP_MODEL,
+      ttsModel: ELEVEN_MODEL,
+      voiceId: ELEVEN_VOICE_ID,
     });
-    return NextResponse.json({ ok: true, runId: handle.id });
-  } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "trigger failed" },
-      { status: 500 },
-    );
+    const intentId = intent.intentId as Id<"creativeGenerationIntents">;
+    if (!process.env.TRIGGER_SECRET_KEY && !process.env.TRIGGER_ACCESS_TOKEN) {
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "deferred", queued: false, durable: true, reused: intent.reused }, { status: 202 });
+    }
+    const claim: any = await convex.mutation(api.creativeGenerations.claimIntentHandoff, { intentId });
+    if (claim.state === "dispatched" || claim.state === "busy") {
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "queued", queued: true, durable: true, reused: true, runId: claim.triggerRunId }, { status: 202 });
+    }
+    try {
+      const handle = await tasks.trigger<typeof contentFactory>("content-factory", { intentId }, {
+        idempotencyKey: generationHandoffKey(intentId, claim.generation), idempotencyKeyTTL: "24w",
+      });
+      await convex.mutation(api.creativeGenerations.recordIntentHandoff, { intentId, generation: claim.generation, triggerRunId: handle.id });
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "queued", queued: true, durable: true, reused: intent.reused, runId: handle.id }, { status: 202 });
+    } catch {
+      // Trigger may have accepted the deterministic handoff. The Convex lease remains due and
+      // the recovery sweep reuses the exact idempotency key.
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "deferred", queued: false, durable: true, reused: intent.reused }, { status: 202 });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "generation intake failed";
+    const conflict = /already used|digest mismatch|different immutable input/i.test(message);
+    return NextResponse.json({ error: message }, { status: conflict ? 409 : 422 });
   }
 }

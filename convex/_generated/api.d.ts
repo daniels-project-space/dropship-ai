@@ -12,6 +12,7 @@ import type * as actions from "../actions.js";
 import type * as admin from "../admin.js";
 import type * as audit from "../audit.js";
 import type * as creatives from "../creatives.js";
+import type * as creativeGenerations from "../creativeGenerations.js";
 import type * as dashboard from "../dashboard.js";
 import type * as experiments from "../experiments.js";
 import type * as insights from "../insights.js";
@@ -38,6 +39,7 @@ declare const fullApi: ApiFromModules<{
   admin: typeof admin;
   audit: typeof audit;
   creatives: typeof creatives;
+  creativeGenerations: typeof creativeGenerations;
   dashboard: typeof dashboard;
   experiments: typeof experiments;
   insights: typeof insights;
