@@ -55,13 +55,13 @@ export const get = query({
   },
 });
 
-// Resolve a site by its connected myshopify domain (used by the inbound Shopify webhook, which
-// carries the shop domain but not our siteId). Tenant set is small + bounded — take(500) is safe.
+// Resolve the signed webhook's shop identity only when it maps to one active, non-sample tenant.
 export const getByDomain = query({
   args: { shopifyDomain: v.string() },
   handler: async (ctx, { shopifyDomain }) => {
-    const sites = await ctx.db.query("sites").take(500);
-    return sites.find((s) => s.shopifyDomain === shopifyDomain) ?? null;
+    const sites = await ctx.db.query("sites").withIndex("by_shopify_domain", (q) => q.eq("shopifyDomain", shopifyDomain)).take(3);
+    const eligible = sites.filter((site) => site.sample !== true && site.status === "active");
+    return eligible.length === 1 ? eligible[0] : null;
   },
 });
 
@@ -69,16 +69,21 @@ export const getByDomain = query({
 // active, and clear the `sample` flag so the dashboard + SampleDataPill stop treating it as demo
 // data. Read-only connection (Phase 2a) — no fulfillment wiring. Idempotent.
 export const connectStore = mutation({
-  args: { siteId: v.id("sites"), shopifyDomain: v.string() },
-  handler: async (ctx, { siteId, shopifyDomain }) => {
+  args: { siteId: v.id("sites"), shopifyDomain: v.string(), storeCurrency: v.string() },
+  handler: async (ctx, { siteId, shopifyDomain, storeCurrency }) => {
     const existing = await ctx.db.get(siteId);
     if (!existing) throw new Error(`site ${siteId} not found`);
+    if (existing.sample === true) throw new Error("sample site cannot become live; clear sample data and create a real site first");
+    if (storeCurrency !== "USD") throw new Error(`unsupported Shopify store currency ${storeCurrency}; launch analytics require a USD store until conversion is implemented`);
+    const domainOwners = await ctx.db.query("sites").withIndex("by_shopify_domain", (q) => q.eq("shopifyDomain", shopifyDomain)).take(2);
+    if (domainOwners.some((site) => site._id !== siteId && site.sample !== true)) throw new Error("Shopify domain is already connected to another site");
     await ctx.db.patch(siteId, {
       shopifyDomain,
+      storeCurrency,
       status: "active",
       sample: false,
     });
-    await appendAudit(ctx, { siteId, event: "shopify_store_connected", detail: { shopifyDomain } });
+    await appendAudit(ctx, { siteId, event: "shopify_store_connected", detail: { shopifyDomain, storeCurrency } });
     return siteId;
   },
 });

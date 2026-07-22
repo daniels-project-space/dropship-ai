@@ -252,6 +252,9 @@ export function SettingsTab({ site }: { site: Site }) {
                 </button>
               ))}
             </div>
+            <p className="mt-2 font-mono text-[10px] leading-relaxed text-ink-faint">
+              Automated never means approval-free: every creative still needs a separate exact publication authorization, verified target accounts, and the deployment live-effects acknowledgement.
+            </p>
           </div>
           <div>
             <label className={LABEL}>Min kit price (USD)</label>
@@ -295,7 +298,7 @@ export function SettingsTab({ site }: { site: Site }) {
         </div>
         <p className="mt-4 flex items-start gap-2 text-[12px] leading-relaxed text-ink-faint">
           <Icon.settings size={14} className="mt-0.5 shrink-0" />
-          CJ fulfillment + automated publishing wire up in a later pass. Until then, distribution stays semi-manual.
+          Account rows are configuration hints, not verification. Use launch readiness for fresh proof; publication always retains its separate exact operator authorization.
         </p>
       </aside>
     </div>

@@ -65,7 +65,12 @@ export async function syncShopify(
       siteId: sid,
       orders: orders.map((o) => ({
         shopifyOrderId: o.id,
-        totalUsd: o.totalUsd,
+        currencyCode: o.currencyCode,
+        currentTotal: o.currentTotal,
+        financialStatus: o.financialStatus,
+        test: o.test,
+        cancelled: o.cancelled,
+        creditAdjustmentState: o.creditAdjustmentState,
         fulfillmentStatus: mapFulfillment(o.displayFulfillmentStatus),
         createdAt: o.createdAt,
       })),

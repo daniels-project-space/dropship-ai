@@ -5,10 +5,12 @@ import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { webhookDeliveryDecision, cjTrackingMappingDecision, shopifyReceiptDecision, shopifyStagingIntakeDecision } from "../src/lib/webhookReceiptState";
 import { cjStagingInputDigest } from "../src/lib/cjOrder";
+import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
 
 const fulfillmentStatus = v.union(
   v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
 );
+const creditAdjustmentState = v.union(v.literal("none"), v.literal("partial"), v.literal("full"));
 
 const RANK = { received: 0, sent_to_cj: 1, shipped: 2, delivered: 3, error: 0 } as const;
 type FulfillmentStatus = keyof typeof RANK;
@@ -20,7 +22,9 @@ async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Prom
 export const recordShopifyOrder = mutation({
   args: {
     siteId: v.id("sites"), deliveryId: v.string(), topic: v.string(), payloadHash: v.string(),
-    shopifyOrderId: v.string(), totalUsd: v.number(), fulfillmentStatus, createdAt: v.number(),
+    shopifyOrderId: v.string(), fulfillmentStatus, createdAt: v.number(),
+    currencyCode: v.optional(v.string()), currentTotal: v.optional(v.number()), financialStatus: v.optional(v.string()),
+    test: v.optional(v.boolean()), cancelled: v.optional(v.boolean()), creditAdjustmentState: v.optional(creditAdjustmentState),
     stagingInput: v.optional(v.object({
       shipping: v.object({ shippingZip: v.string(), shippingCountryCode: v.string(), shippingCountry: v.string(), shippingProvince: v.string(), shippingCity: v.string(), shippingAddress: v.string(), shippingCustomerName: v.string(), shippingPhone: v.string() }),
       shopifyLines: v.array(v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() })),
@@ -43,8 +47,8 @@ export const recordShopifyOrder = mutation({
       // through this request's exact site/order, verify the durable input binding, then repair
       // the receipt in the same transaction so all later replays have the direct lineage.
       if (!intent && args.stagingInput) {
-        const order = await ctx.db.query("orders").withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
-        if (order?.siteId === args.siteId) {
+        const order = await ctx.db.query("orders").withIndex("by_site_shopify_order", (q) => q.eq("siteId", args.siteId).eq("shopifyOrderId", args.shopifyOrderId)).first();
+        if (order) {
           const candidate = await ctx.db.query("cjStagingIntents").withIndex("by_order", (q) => q.eq("orderId", order._id)).first();
           const incomingDigest = cjStagingInputDigest(args.stagingInput);
           const candidateDigest = candidate?.stagingInputDigest ?? (candidate ? cjStagingInputDigest({ shipping: candidate.shipping, shopifyLines: candidate.shopifyLines }) : undefined);
@@ -61,24 +65,35 @@ export const recordShopifyOrder = mutation({
     }
 
     const existing = await ctx.db.query("orders")
-      .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId)).first();
+      .withIndex("by_site_shopify_order", (q) => q.eq("siteId", args.siteId).eq("shopifyOrderId", args.shopifyOrderId)).first();
     let orderId: any;
     if (existing) {
-      if (existing.siteId !== args.siteId) throw new Error("Shopify order belongs to another site");
       const next = RANK[args.fulfillmentStatus] > RANK[existing.fulfillmentStatus as FulfillmentStatus]
         ? args.fulfillmentStatus : existing.fulfillmentStatus;
-      await ctx.db.patch(existing._id, { totalUsd: args.totalUsd, fulfillmentStatus: next, sample: false });
+      const patch: Record<string, unknown> = { fulfillmentStatus: next, sample: false };
+      for (const key of ["currencyCode", "currentTotal", "financialStatus", "test", "cancelled", "creditAdjustmentState"] as const) {
+        if (args[key] !== undefined) patch[key] = args[key];
+      }
+      if (args.currentTotal !== undefined && (args.currencyCode ?? existing.currencyCode) === "USD") patch.totalUsd = args.currentTotal;
+      await ctx.db.patch(existing._id, patch);
       orderId = existing._id;
     } else {
       orderId = await ctx.db.insert("orders", {
-        siteId: args.siteId, shopifyOrderId: args.shopifyOrderId, totalUsd: args.totalUsd,
+        siteId: args.siteId, shopifyOrderId: args.shopifyOrderId,
+        currencyCode: args.currencyCode, currentTotal: args.currentTotal,
+        financialStatus: args.financialStatus, test: args.test, cancelled: args.cancelled,
+        creditAdjustmentState: args.creditAdjustmentState,
+        totalUsd: args.currencyCode === "USD" ? args.currentTotal : undefined,
         fulfillmentStatus: args.fulfillmentStatus, createdAt: args.createdAt, sample: false,
       });
       await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { source: "shopify_webhook" } });
     }
     let intentId: any = null;
     let intentNeedsAttention = false;
-    if (args.stagingInput) {
+    const storedOrder = await ctx.db.get(orderId) as any;
+    const site = await ctx.db.get(args.siteId);
+    const economicallyEligible = !!storedOrder && !!site && eligibleUsdOrder(storedOrder, site.storeCurrency);
+    if (args.stagingInput && economicallyEligible) {
       // Deterministic on the mirrored order, not merely delivery ID: Shopify can redeliver a
       // semantically identical create as a distinct delivery and it still gets one CJ intent.
       const existingIntent = await ctx.db.query("cjStagingIntents").withIndex("by_order", (q) => q.eq("orderId", orderId)).first();
@@ -98,6 +113,14 @@ export const recordShopifyOrder = mutation({
           status: "pending", attempt: 0, runnableAt: now, stagingInputDigest, shipping: args.stagingInput.shipping,
           shopifyLines: args.stagingInput.shopifyLines, createdAt: now, updatedAt: now,
         });
+      }
+    }
+    if (!economicallyEligible) {
+      const existingIntent = await ctx.db.query("cjStagingIntents").withIndex("by_order", (q) => q.eq("orderId", orderId)).first();
+      if (existingIntent && existingIntent.status !== "approval_resolved" && existingIntent.status !== "needs_attention") {
+        await ctx.db.patch(existingIntent._id, { status: "needs_attention", runnableAt: undefined, leaseExpiresAt: undefined, lastError: { code: "shopify_order_not_economically_eligible" }, updatedAt: Date.now() });
+        intentId = existingIntent._id;
+        intentNeedsAttention = true;
       }
     }
     await ctx.db.insert("webhookReceipts", {
@@ -121,7 +144,7 @@ export const recordCjTracking = mutation({
     if (webhookDeliveryDecision(prior) === "duplicate") return { duplicate: true, outcome: prior!.outcome };
 
     const order = await ctx.db.query("orders")
-      .withIndex("by_cj_order_number", (q) => q.eq("cjOrderNumber", args.cjOrderNumber)).first();
+      .withIndex("by_site_cj_order_number", (q) => q.eq("siteId", args.siteId).eq("cjOrderNumber", args.cjOrderNumber)).first();
     if (cjTrackingMappingDecision({ order, siteId: args.siteId, incomingCjOrderId: args.cjOrderId }) === "ignore") {
       await ctx.db.insert("webhookReceipts", {
         provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,

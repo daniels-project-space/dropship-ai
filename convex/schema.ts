@@ -42,6 +42,7 @@ export default defineSchema({
     niche: v.string(),
     status: v.union(v.literal("provisioning"), v.literal("active"), v.literal("paused"), v.literal("killed")),
     shopifyDomain: v.optional(v.string()),        // *.myshopify.com (store created manually)
+    storeCurrency: v.optional(v.string()),        // ISO 4217 shop currency verified at connection
     customDomain: v.optional(v.string()),
     // brand/margin guardrails (enforced by the brain)
     minKitPriceUsd: v.number(),                   // §8.2 never below this (e.g. 35–55)
@@ -50,7 +51,7 @@ export default defineSchema({
     killDate: v.optional(v.number()),             // pre-committed kill date (ms)
     createdAt: v.number(),
     sample: v.optional(v.boolean()),              // seeded demo brand (cleared by seed.clearSampleData)
-  }).index("by_status", ["status"]).index("by_sample", ["sample"]),
+  }).index("by_status", ["status"]).index("by_sample", ["sample"]).index("by_shopify_domain", ["shopifyDomain"]),
 
   // per-site credential REFERENCES (actual secrets live in env/vault; this maps which keys a site uses)
   siteSecrets: defineTable({
@@ -175,6 +176,7 @@ export default defineSchema({
     labelBurned: v.optional(v.boolean()),
     hook: v.optional(v.string()),
     status: v.union(v.literal("generating"), v.literal("review"), v.literal("approved"), v.literal("rejected")),
+    revision: v.optional(v.number()),              // immutable publication authorization fence
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]).index("by_r2_key", ["r2Key"]),
@@ -183,6 +185,9 @@ export default defineSchema({
     siteId: v.id("sites"),
     creativeId: v.id("creatives"),
     platform,
+    targetAccount: v.optional(v.string()),
+    caption: v.optional(v.string()),
+    distributionDispatchId: v.optional(v.id("distributionDispatches")),
     status: postStatus,
     scheduledFor: v.optional(v.number()),
     publishedAt: v.optional(v.number()),
@@ -195,11 +200,16 @@ export default defineSchema({
   }).index("by_site_status", ["siteId", "status"]).index("by_site_platform", ["siteId", "platform"])
     .index("by_creative_platform", ["creativeId", "platform"]),
 
-  // Approval creates this durable intent atomically with the creative transition. Browser/route
-  // failures can delay Trigger dispatch but cannot silently lose the distribution work.
+  // Created only by the separate publication-authorization action. Content approval alone has
+  // no scheduling or external-distribution consequence.
   distributionDispatches: defineTable({
     siteId: v.id("sites"),
     creativeId: v.id("creatives"),
+    // Optional only for rollout compatibility. Runtime claims reject every legacy row lacking
+    // the exact authorization snapshot.
+    creativeRevision: v.optional(v.number()),
+    caption: v.optional(v.string()),
+    destinations: v.optional(v.array(v.object({ platform, targetAccount: v.string() }))),
     dispatchKey: v.string(),
     status: v.union(v.literal("pending"), v.literal("dispatching"), v.literal("dispatched"), v.literal("delivered"), v.literal("reconcile_required")),
     triggerRunId: v.optional(v.string()),
@@ -217,12 +227,20 @@ export default defineSchema({
     // CJ's immutable custom order identity. This is distinct from Shopify's order id and is
     // the only key accepted for CJ tracking/reconciliation.
     cjOrderNumber: v.optional(v.string()),
+    currencyCode: v.optional(v.string()),
+    currentTotal: v.optional(v.number()),
+    financialStatus: v.optional(v.string()),
+    test: v.optional(v.boolean()),
+    cancelled: v.optional(v.boolean()),
+    creditAdjustmentState: v.optional(v.union(v.literal("none"), v.literal("partial"), v.literal("full"))),
     fulfillmentStatus: v.union(
       v.literal("received"), v.literal("sent_to_cj"), v.literal("shipped"), v.literal("delivered"), v.literal("error"),
     ),
     trackingNumber: v.optional(v.string()),       // via CJ ORDER webhook, not create-response
     trackingUrl: v.optional(v.string()),
-    totalUsd: v.number(),
+    // Legacy display field. New ingestion writes currentTotal + currencyCode and analytics never
+    // interprets this value without explicit USD eligibility.
+    totalUsd: v.optional(v.number()),
     // Immutable input supplied to CJ only after a separate human approval. This contains order
     // PII, so it is never copied to outbox payloads, traces, logs, or Trigger payloads.
     cjOrderInput: v.optional(v.object({
@@ -261,7 +279,11 @@ export default defineSchema({
     cjDispatchStatus: v.optional(v.union(v.literal("staged"), v.literal("reserved"), v.literal("ambiguous"), v.literal("sent"), v.literal("failed"))),
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
-  }).index("by_site", ["siteId"]).index("by_shopify_order", ["shopifyOrderId"]).index("by_cj_order_number", ["cjOrderNumber"]).index("by_site_status", ["siteId", "fulfillmentStatus"]),
+  }).index("by_site", ["siteId"])
+    .index("by_site_shopify_order", ["siteId", "shopifyOrderId"])
+    .index("by_site_cj_order_number", ["siteId", "cjOrderNumber"])
+    .index("by_site_cj_order_id", ["siteId", "cjOrderId"])
+    .index("by_site_status", ["siteId", "fulfillmentStatus"]),
 
   // A Shopify delivery has a durable, separate CJ preflight intent. The raw shipping fields are
   // intentionally confined to Convex; Trigger receives only this row's stable ID.

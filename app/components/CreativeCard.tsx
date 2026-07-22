@@ -17,6 +17,8 @@ export type ReviewCreative = {
   labelBurned?: boolean;
   hook?: string;
   status: "generating" | "review" | "approved" | "rejected";
+  revision?: number;
+  publicationAuthorized?: boolean;
   createdAt: number;
 };
 
@@ -48,8 +50,10 @@ export function CreativeCard({
 }) {
   const approve = useMutation(api.creatives.approve);
   const reject = useMutation(api.creatives.reject);
-  const [busy, setBusy] = useState<null | "approve" | "reject">(null);
+  const [busy, setBusy] = useState<null | "approve" | "reject" | "authorize">(null);
   const [error, setError] = useState<string | null>(null);
+  const [caption, setCaption] = useState(creative.hook ?? "");
+  const [targets, setTargets] = useState<Record<string, string>>({});
   const disclosureVerified = !creative.aiLabelRequired || creative.labelBurned === true;
 
   async function run(kind: "approve" | "reject") {
@@ -58,22 +62,31 @@ export function CreativeCard({
     try {
       if (kind === "approve") {
         await approve({ creativeId: creative._id, approver: "Daniel" });
-        // Approval has already created a durable Convex dispatch record. Await the handoff so the
-        // operator can see a deferred Trigger configuration instead of silently losing work.
-        const response = await fetch("/api/schedule", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ creativeId: creative._id }),
-        });
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok && !result.deferred) throw new Error(result.error ?? "distribution scheduling failed");
-        if (result.reconciliationRequired) throw new Error(result.reason ?? "provider receipt reconciliation is required");
-        onScheduled?.(creative._id);
       } else {
         await reject({ creativeId: creative._id, approver: "Daniel" });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed");
+      setBusy(null);
+    }
+  }
+
+  async function authorize() {
+    setError(null);
+    setBusy("authorize");
+    try {
+      const destinations = Object.entries(targets)
+        .filter(([, targetAccount]) => targetAccount.trim())
+        .map(([platform, targetAccount]) => ({ platform, targetAccount: targetAccount.trim() }));
+      const response = await fetch("/api/schedule", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ creativeId: creative._id, expectedRevision: creative.revision ?? 1, caption, destinations }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok && !result.deferred) throw new Error(result.error ?? "publication authorization failed");
+      onScheduled?.(creative._id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Authorization failed");
       setBusy(null);
     }
   }
@@ -116,7 +129,26 @@ export function CreativeCard({
           <p className="mt-1.5 font-mono text-[10px] text-ink-faint">{timeAgo(creative.createdAt)}</p>
         </div>
 
-        <div className="mt-auto flex items-center gap-2.5">
+        {creative.status === "approved" && creative.publicationAuthorized && (
+          <p className="mt-auto rounded-lg border border-live/30 bg-live/10 px-3 py-2 text-[12px] text-live">Publication authorized and durably queued.</p>
+        )}
+
+        {creative.status === "approved" && !creative.publicationAuthorized && (
+          <div className="mt-auto space-y-2.5">
+            <p className="text-[11px] leading-relaxed text-ink-dim">Content approved. Publication still requires this separate exact authorization.</p>
+            <textarea value={caption} onChange={(event) => setCaption(event.target.value)} placeholder="Exact publication caption" className="w-full rounded-lg border border-line bg-panel-2 px-3 py-2 text-[12px] text-ink" />
+            {(["tiktok", "instagram", "youtube", "facebook"] as const).map((platform) => (
+              <input key={platform} value={targets[platform] ?? ""} onChange={(event) => setTargets((current) => ({ ...current, [platform]: event.target.value }))}
+                placeholder={`${platform} exact account id / username`} className="w-full rounded-lg border border-line bg-panel-2 px-3 py-2 text-[11px] text-ink" />
+            ))}
+            <button onClick={authorize} disabled={busy !== null || !caption.trim() || !Object.values(targets).some((value) => value.trim())}
+              className="w-full rounded-lg bg-pending/15 px-4 py-2.5 text-[13px] font-semibold text-pending ring-1 ring-pending/30 disabled:opacity-50">
+              {busy === "authorize" ? "Authorizing…" : "Authorize exact publication"}
+            </button>
+          </div>
+        )}
+
+        {creative.status === "review" && <div className="mt-auto flex items-center gap-2.5">
           <button
             onClick={() => run("approve")}
             disabled={busy !== null || !disclosureVerified}
@@ -131,7 +163,7 @@ export function CreativeCard({
           >
             {busy === "reject" ? "Rejecting…" : "Reject"}
           </button>
-        </div>
+        </div>}
 
         {!disclosureVerified && (
           <p className="rounded-lg border border-pending/30 bg-pending/10 px-3 py-2 text-[12px] leading-relaxed text-pending">

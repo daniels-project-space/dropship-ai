@@ -6,6 +6,7 @@
 import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
+import { stableSha256 } from "../src/lib/cjOrder";
 
 const creativeKind = v.union(
   v.literal("product_demo"),
@@ -53,6 +54,7 @@ export const requestGen = mutation({
       labelBurned,
       hook: args.hook,
       status,
+      revision: 1,
       createdAt: Date.now(),
     });
     await appendAudit(ctx, {
@@ -73,7 +75,9 @@ export const setAsset = mutation({
     if (c.aiLabelRequired && !labelBurned) {
       throw new Error(`creative ${creativeId} requires verified burned-in AI disclosure`);
     }
-    await ctx.db.patch(creativeId, { r2Key, labelBurned, status: "review" });
+    if (c.status === "approved" || c.status === "rejected") throw new Error(`creative ${creativeId} is immutable after review resolution`);
+    const revision = (c.revision ?? 1) + 1;
+    await ctx.db.patch(creativeId, { r2Key, labelBurned, status: "review", revision });
     await appendAudit(ctx, { siteId: c.siteId, event: "creative_asset_ready", detail: { creativeId, r2Key, labelBurned } });
     return creativeId;
   },
@@ -92,25 +96,64 @@ export const approve = mutation({
     if (c.aiLabelRequired && c.labelBurned !== true) {
       throw new Error(`creative ${creativeId} requires verified burned-in AI disclosure before approval`);
     }
-    const dispatchKey = `distribution:${creativeId}`;
-    const existingDispatch = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", creativeId)).first();
-    if (existingDispatch) throw new Error(`creative ${creativeId} already has a distribution dispatch`);
-    const now = Date.now();
     await ctx.db.patch(creativeId, { status: "approved" });
-    await ctx.db.insert("distributionDispatches", {
-      siteId: c.siteId,
-      creativeId,
-      dispatchKey,
-      status: "pending",
-      createdAt: now,
-      updatedAt: now,
-    });
     await appendAudit(ctx, {
       siteId: c.siteId,
       event: "creative_approved",
       detail: { creativeId, approver: approver ?? "human" },
     });
-    return { creativeId, dispatchKey };
+    return { creativeId, revision: c.revision ?? 1, publicationAuthorized: false as const };
+  },
+});
+
+const publicationDestination = v.object({ platform: v.union(
+  v.literal("tiktok"), v.literal("instagram"), v.literal("youtube"), v.literal("facebook"),
+), targetAccount: v.string() });
+
+/** A distinct operator act binds publication to one exact content/account snapshot. */
+export const authorizePublication = mutation({
+  args: {
+    creativeId: v.id("creatives"),
+    expectedRevision: v.number(),
+    caption: v.string(),
+    destinations: v.array(publicationDestination),
+    operator: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const creative = await ctx.db.get(args.creativeId);
+    if (!creative) throw new Error(`creative ${args.creativeId} not found`);
+    if (creative.status !== "approved") throw new Error("content must be approved before publication can be authorized");
+    const revision = creative.revision ?? 1;
+    if (!Number.isInteger(args.expectedRevision) || args.expectedRevision !== revision) {
+      throw new Error("publication authorization is stale: creative revision changed");
+    }
+    const caption = args.caption.trim();
+    if (!caption) throw new Error("publication caption is required");
+    if (!args.destinations.length || args.destinations.length > 4) throw new Error("select one to four publication destinations");
+    const destinations = args.destinations.map(({ platform, targetAccount }) => ({ platform, targetAccount: targetAccount.trim() }));
+    if (destinations.some(({ targetAccount }) => !targetAccount)) throw new Error("every selected platform requires an exact target account");
+    if (new Set(destinations.map(({ platform }) => platform)).size !== destinations.length) throw new Error("a platform may be selected only once");
+    const binding = stableSha256(JSON.stringify({ creativeId: args.creativeId, revision, caption, destinations }));
+    const dispatchKey = `distribution:${args.creativeId}:r${revision}:${binding.slice(0, 24)}`;
+    const existing = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", args.creativeId)).first();
+    if (existing) {
+      if (existing.dispatchKey !== dispatchKey || existing.creativeRevision !== revision
+        || existing.caption !== caption || JSON.stringify(existing.destinations) !== JSON.stringify(destinations)) {
+        throw new Error("publication was already authorized for different immutable input");
+      }
+      return { creativeId: args.creativeId, dispatchKey, reused: true as const };
+    }
+    const now = Date.now();
+    await ctx.db.insert("distributionDispatches", {
+      siteId: creative.siteId, creativeId: args.creativeId, creativeRevision: revision,
+      caption, destinations, dispatchKey, status: "pending", createdAt: now, updatedAt: now,
+    });
+    await appendAudit(ctx, {
+      siteId: creative.siteId,
+      event: "creative_publication_authorized",
+      detail: { creativeId: args.creativeId, revision, platforms: destinations.map((d) => d.platform), operator: args.operator ?? "human" },
+    });
+    return { creativeId: args.creativeId, dispatchKey, reused: false as const };
   },
 });
 
@@ -137,7 +180,12 @@ export const listByStatus = query({
     const q = status
       ? ctx.db.query("creatives").withIndex("by_site_status", (qq) => qq.eq("siteId", siteId).eq("status", status))
       : ctx.db.query("creatives").withIndex("by_site_status", (qq) => qq.eq("siteId", siteId));
-    return q.order("desc").take(limit ?? 100);
+    const rows = await q.order("desc").take(limit ?? 100);
+    return Promise.all(rows.map(async (row) => ({
+      ...row,
+      revision: row.revision ?? 1,
+      publicationAuthorized: !!(await ctx.db.query("distributionDispatches").withIndex("by_creative", (qq) => qq.eq("creativeId", row._id)).first()),
+    })));
   },
 });
 
@@ -155,6 +203,25 @@ export const listForReview = query({
         .order("desc")
         .take(limit ?? 50);
       for (const r of rows) out.push({ ...r, siteName: s.name });
+    }
+    out.sort((a, b) => b.createdAt - a.createdAt);
+    return out.slice(0, limit ?? 100);
+  },
+});
+
+export const listForPublicationAuthorization = query({
+  args: { limit: v.optional(v.number()) },
+  handler: async (ctx, { limit }) => {
+    const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
+    const out = [];
+    for (const site of sites) {
+      const rows = await ctx.db.query("creatives")
+        .withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "approved"))
+        .order("desc").take(limit ?? 50);
+      for (const row of rows) {
+        const dispatch = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", row._id)).first();
+        if (!dispatch) out.push({ ...row, revision: row.revision ?? 1, siteName: site.name });
+      }
     }
     out.sort((a, b) => b.createdAt - a.createdAt);
     return out.slice(0, limit ?? 100);

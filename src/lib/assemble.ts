@@ -5,10 +5,10 @@
 // `aiLabelRequired` is true, assembly REFUSES to emit an asset that lacks the burned-in label.
 // This is the code-level enforcement of the locked AI-disclosure rule.
 //
-// Backend selection (auto): ffmpeg if `which ffmpeg` succeeds (it does on this host:
-// /usr/bin/ffmpeg) → real burn. Otherwise a documented STUB that still RECORDS the label
+// Backend selection (auto): the Trigger extension's FFMPEG_PATH, then PATH. Otherwise a
+// documented STUB that still RECORDS the label
 // requirement and throws, so no unlabeled asset can ever slip through.
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,9 +34,13 @@ export type AssembleResult = {
   backend: "ffmpeg" | "stub";
 };
 
+function ffmpegBinary(): string {
+  return process.env.FFMPEG_PATH ?? "ffmpeg";
+}
+
 function ffmpegAvailable(): boolean {
   try {
-    execSync("which ffmpeg", { stdio: "ignore" });
+    execFileSync(ffmpegBinary(), ["-version"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -136,7 +140,7 @@ export async function assemble(input: AssembleInput): Promise<AssembleResult> {
     }
     args.push(outPath);
 
-    await run("ffmpeg", args);
+    await run(ffmpegBinary(), args);
 
     // 5) upload result to R2
     const out = await readFile(outPath);

@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { getKey } from "@/src/lib/vault";
 import { convexClient, api } from "@/src/lib/convexClient";
 import type { Id } from "@/convex/_generated/dataModel";
+import { creditAdjustmentState, normalizeCurrencyCode } from "@/src/lib/shopifyOrder";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,7 +28,8 @@ type FulfillmentStatus = "received" | "sent_to_cj" | "shipped" | "delivered" | "
 type ShopifyCjLine = { product_id?: unknown; variant_id?: unknown; productId?: unknown; variantId?: unknown; quantity?: unknown };
 type ShopifyOrderPayload = {
   id?: number | string; order_id?: number | string; admin_graphql_api_id?: string;
-  total_price?: string; fulfillment_status?: string | null; status?: string | null; created_at?: string;
+  current_total_price?: string; currency?: string; financial_status?: string; test?: boolean; cancelled_at?: string | null;
+  refunds?: unknown[]; fulfillment_status?: string | null; status?: string | null; created_at?: string;
   shipping_address?: { zip?: unknown; country_code?: unknown; country?: unknown; province?: unknown; city?: unknown; address1?: unknown; address2?: unknown; name?: unknown; phone?: unknown } | null;
   line_items?: ShopifyCjLine[];
 };
@@ -98,6 +100,14 @@ export async function POST(req: Request) {
   const payloadHash = crypto.createHash("sha256").update(raw).digest("hex");
   // Shopify provides the webhook id. The digest fallback is only for a manually generated test.
   const deliveryId = req.headers.get("x-shopify-webhook-id") ?? `digest:${topic}:${payloadHash}`;
+  const has = (key: keyof ShopifyOrderPayload) => Object.prototype.hasOwnProperty.call(payload, key);
+  const parsedTotal = has("current_total_price") && payload.current_total_price !== null
+    ? Number(payload.current_total_price) : undefined;
+  const financialStatus = has("financial_status") && typeof payload.financial_status === "string"
+    ? payload.financial_status.toUpperCase() : undefined;
+  const adjustmentState = has("financial_status") || has("refunds")
+    ? creditAdjustmentState(financialStatus, Array.isArray(payload.refunds) && payload.refunds.length > 0)
+    : undefined;
   try {
     const result = await convex.mutation(api.webhooks.recordShopifyOrder, {
       siteId: site._id as Id<"sites">,
@@ -105,12 +115,17 @@ export async function POST(req: Request) {
       topic,
       payloadHash,
       shopifyOrderId,
-      totalUsd: Number(payload.total_price ?? 0) || 0,
+      currencyCode: has("currency") ? normalizeCurrencyCode(payload.currency) : undefined,
+      currentTotal: parsedTotal !== undefined && Number.isFinite(parsedTotal) && parsedTotal >= 0 ? parsedTotal : undefined,
+      financialStatus,
+      test: has("test") && typeof payload.test === "boolean" ? payload.test : undefined,
+      cancelled: has("cancelled_at") ? payload.cancelled_at != null : undefined,
+      creditAdjustmentState: adjustmentState,
       fulfillmentStatus: mapTopicToStatus(topic, payload),
       createdAt: Number.isFinite(parsedCreatedAt) ? parsedCreatedAt : Date.now(),
       // PII remains in Convex's intent row. It never becomes part of the webhook response or a
       // Trigger/task payload; the scheduled worker receives the intent ID from its own query.
-      stagingInput: topic === "orders/create" ? cjStagingInputFromShopify(payload) ?? undefined : undefined,
+      stagingInput: topic !== "fulfillments/update" ? cjStagingInputFromShopify(payload) ?? undefined : undefined,
     });
     // Shopify gets a 2xx as soon as its signed delivery is durable. Do not make CJ, Trigger, or
     // approval-waitpoint calls here: Shopify retries transport failures and expects this path to

@@ -2,6 +2,9 @@
   "name": "dropship-ai",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -16,7 +19,8 @@
     "convex": "^1.42.3",
     "next": "16.2.9",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "sharp": "0.35.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -30,6 +34,7 @@
     "typescript": "^5"
   },
   "overrides": {
+    "sharp": "$sharp",
     "socket.io": "4.8.1",
     "socket.io-client": "4.8.1",
     "socket.io-adapter": "2.5.8",

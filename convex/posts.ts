@@ -34,6 +34,9 @@ export const schedule = mutation({
     siteId: v.id("sites"),
     creativeId: v.id("creatives"),
     platform,
+    targetAccount: v.string(),
+    caption: v.string(),
+    dispatchKey: v.string(),
     status: v.optional(v.union(v.literal("scheduled"), v.literal("awaiting_manual_publish"))),
     scheduledFor: v.optional(v.number()),
   },
@@ -45,6 +48,12 @@ export const schedule = mutation({
     if (creative.status !== "approved") {
       throw new Error(`creative ${args.creativeId} is ${creative.status}, only approved creatives can post`);
     }
+    const dispatch = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", args.creativeId)).first();
+    const destinations = dispatch?.destinations;
+    if (!dispatch || !destinations || dispatch.dispatchKey !== args.dispatchKey || dispatch.creativeRevision !== (creative.revision ?? 1)
+      || dispatch.caption !== args.caption || !destinations.some((d) => d.platform === args.platform && d.targetAccount === args.targetAccount)) {
+      throw new Error("post input is not covered by the exact publication authorization");
+    }
     // Data-layer label gate: AI creative must have an asset (label is burned into that asset).
     if (creative.aiLabelRequired && (creative.labelBurned !== true || !creative.r2Key)) {
       throw new Error(`creative ${args.creativeId} requires verified AI-labeled asset before scheduling`);
@@ -54,11 +63,19 @@ export const schedule = mutation({
       .query("posts")
       .withIndex("by_creative_platform", (q) => q.eq("creativeId", args.creativeId).eq("platform", args.platform))
       .first();
-    if (duplicate) return { postId: duplicate._id, status: duplicate.status, duplicate: true };
+    if (duplicate) {
+      if (duplicate.distributionDispatchId !== dispatch._id || duplicate.targetAccount !== args.targetAccount || duplicate.caption !== args.caption) {
+        throw new Error("existing post is bound to different publication authorization input");
+      }
+      return { postId: duplicate._id, status: duplicate.status, duplicate: true };
+    }
     const postId = await ctx.db.insert("posts", {
       siteId: args.siteId,
       creativeId: args.creativeId,
       platform: args.platform,
+      targetAccount: args.targetAccount,
+      caption: args.caption,
+      distributionDispatchId: dispatch._id,
       status,
       scheduledFor: args.scheduledFor,
       views: 0,
@@ -126,8 +143,12 @@ export const beginDistributionDispatch = mutation({
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
     const row = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", args.creativeId)).first();
-    if (!row) throw new Error("approved creative has no durable distribution dispatch");
+    if (!row || row.creativeRevision === undefined || row.caption === undefined || !row.destinations?.length) throw new Error("approved creative has no exact publication authorization");
     if (row.dispatchKey !== args.dispatchKey) throw new Error("distribution dispatch key does not match creative");
+    const creative = await ctx.db.get(args.creativeId);
+    if (!creative || creative.status !== "approved" || (creative.revision ?? 1) !== row.creativeRevision) {
+      throw new Error("publication authorization is stale for the current creative revision");
+    }
     const now = Date.now();
     if (row.status === "dispatching") {
       if ((row.triggerLeaseExpiresAt ?? 0) > now) return { status: "busy" as const, triggerRunId: row.triggerRunId };
@@ -139,6 +160,18 @@ export const beginDistributionDispatch = mutation({
     if (decision === "already_dispatched") return { status: row.status, triggerRunId: row.triggerRunId, reused: true as const };
     await ctx.db.patch(row._id, { status: "dispatching", triggerLeaseExpiresAt: now + 5 * 60_000, updatedAt: now });
     return { status: "dispatching" as const };
+  },
+});
+
+export const getDistributionAuthorization = query({
+  args: { creativeId: v.id("creatives"), dispatchKey: v.string() },
+  handler: async (ctx, args) => {
+    await requireServiceIdentity(ctx);
+    const row = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", args.creativeId)).first();
+    if (!row || row.dispatchKey !== args.dispatchKey || row.creativeRevision === undefined || row.caption === undefined || !row.destinations?.length) return null;
+    const creative = await ctx.db.get(args.creativeId);
+    if (!creative || creative.status !== "approved" || (creative.revision ?? 1) !== row.creativeRevision) return null;
+    return { ...row, creativeRevision: row.creativeRevision, caption: row.caption, destinations: row.destinations };
   },
 });
 
@@ -170,10 +203,12 @@ export const completeDistributionDispatch = mutation({
 export const listDispatchesNeedingTrigger = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
-    const pending = await ctx.db.query("distributionDispatches").withIndex("by_status", (q) => q.eq("status", "pending")).take(limit ?? 100);
+    const pending = (await ctx.db.query("distributionDispatches").withIndex("by_status", (q) => q.eq("status", "pending")).take(limit ?? 100))
+      .filter((row) => row.creativeRevision !== undefined && row.caption !== undefined && !!row.destinations?.length);
     const remaining = Math.max(0, (limit ?? 100) - pending.length);
     const dispatching = remaining
-      ? await ctx.db.query("distributionDispatches").withIndex("by_status", (q) => q.eq("status", "dispatching")).take(remaining)
+      ? (await ctx.db.query("distributionDispatches").withIndex("by_status", (q) => q.eq("status", "dispatching")).take(remaining))
+        .filter((row) => row.creativeRevision !== undefined && row.caption !== undefined && !!row.destinations?.length)
       : [];
     return [...pending, ...dispatching];
   },

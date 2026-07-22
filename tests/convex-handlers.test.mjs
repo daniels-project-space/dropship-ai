@@ -86,7 +86,7 @@ test("Convex handlers reject anonymous service calls and due index returns only 
   assert.deepEqual(due.map((row) => row._id), [a.intentId]);
 });
 
-test("creative approval persists one distribution intent and concurrent Trigger claims fence to one handoff", async () => {
+test("content approval has zero dispatch consequence; exact publication authorization fences one handoff", async () => {
   const t = convexTest({ schema, modules });
   const { siteId, creativeId } = await t.run(async (ctx) => {
     const siteId = await ctx.db.insert("sites", { name: "Content", niche: "test", status: "active", minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual", createdAt: 1 });
@@ -94,22 +94,37 @@ test("creative approval persists one distribution intent and concurrent Trigger 
     return { siteId, creativeId };
   });
   const approved = await service(t).mutation(api.creatives.approve, { creativeId, approver: "test" });
-  assert.equal(approved.dispatchKey, `distribution:${creativeId}`);
-  const dispatches = await t.run((ctx) => ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", creativeId)).collect());
+  assert.equal(approved.publicationAuthorized, false);
+  let dispatches = await t.run((ctx) => ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", creativeId)).collect());
+  assert.equal(dispatches.length, 0, "content approval must not enqueue or create distribution work");
+  const authorization = await service(t).mutation(api.creatives.authorizePublication, {
+    creativeId, expectedRevision: 1, caption: "Exact approved caption",
+    destinations: [{ platform: "tiktok", targetAccount: "account-123" }], operator: "test",
+  });
+  dispatches = await t.run((ctx) => ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", creativeId)).collect());
   assert.equal(dispatches.length, 1, "approval cannot lose or duplicate its durable distribution intent");
   assert.equal(dispatches[0].siteId, siteId);
+  assert.equal(dispatches[0].caption, "Exact approved caption");
+  await assert.rejects(() => service(t).mutation(api.creatives.authorizePublication, {
+    creativeId, expectedRevision: 2, caption: "Exact approved caption",
+    destinations: [{ platform: "tiktok", targetAccount: "account-123" }],
+  }), /stale/);
+  await assert.rejects(() => service(t).mutation(api.creatives.authorizePublication, {
+    creativeId, expectedRevision: 1, caption: "Mismatched caption",
+    destinations: [{ platform: "tiktok", targetAccount: "account-123" }],
+  }), /different immutable input/);
 
   const [first, second] = await Promise.all([
-    service(t).mutation(api.posts.beginDistributionDispatch, { creativeId, dispatchKey: approved.dispatchKey }),
-    service(t).mutation(api.posts.beginDistributionDispatch, { creativeId, dispatchKey: approved.dispatchKey }),
+    service(t).mutation(api.posts.beginDistributionDispatch, { creativeId, dispatchKey: authorization.dispatchKey }),
+    service(t).mutation(api.posts.beginDistributionDispatch, { creativeId, dispatchKey: authorization.dispatchKey }),
   ]);
   assert.deepEqual([first.status, second.status].sort(), ["busy", "dispatching"], "only one concurrent caller may submit Trigger work");
 });
 
 test("Convex receipt handler links order and intent atomically, including repaired legacy duplicate receipts", async () => {
   const t = convexTest({ schema, modules });
-  const args = { deliveryId: "delivery-a", topic: "orders/create", payloadHash: "hash-a", shopifyOrderId: "gid://shopify/Order/1", totalUsd: 50, fulfillmentStatus: "received", createdAt: 1, stagingInput: { shipping, shopifyLines: lines } };
-  const siteId = await t.run((ctx) => ctx.db.insert("sites", { name: "Test", niche: "test", status: "active", minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual", createdAt: 1 }));
+  const args = { deliveryId: "delivery-a", topic: "orders/create", payloadHash: "hash-a", shopifyOrderId: "gid://shopify/Order/1", currencyCode: "USD", currentTotal: 50, financialStatus: "PAID", test: false, cancelled: false, creditAdjustmentState: "none", fulfillmentStatus: "received", createdAt: 1, stagingInput: { shipping, shopifyLines: lines } };
+  const siteId = await t.run((ctx) => ctx.db.insert("sites", { name: "Test", niche: "test", status: "active", storeCurrency: "USD", minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual", createdAt: 1 }));
   const first = await service(t).mutation(api.webhooks.recordShopifyOrder, { siteId, ...args });
   assert.equal(first.duplicate, false);
   const receipt = await t.run((ctx) => ctx.db.query("webhookReceipts").withIndex("by_provider_site_delivery", (q) => q.eq("provider", "shopify").eq("siteId", siteId).eq("deliveryId", args.deliveryId)).first());
@@ -464,7 +479,7 @@ test("provider intake and tracking handlers require the service identity", async
   const t = convexTest({ schema, modules });
   const { orderId } = await seedApprovedDispatch(t);
   const order = await t.run((ctx) => ctx.db.get(orderId));
-  await assert.rejects(() => t.mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" }), /UNAUTHENTICATED/);
+  await assert.rejects(() => t.mutation(api.orders.applyTracking, { siteId: order.siteId, cjOrderNumber: order.cjOrderNumber, status: "shipped" }), /UNAUTHENTICATED/);
   await assert.rejects(() => t.mutation(api.webhooks.recordCjTracking, { siteId: order.siteId, deliveryId: "d", topic: "ORDER", payloadHash: "h", cjOrderNumber: order.cjOrderNumber }), /UNAUTHENTICATED/);
 });
 
@@ -478,7 +493,7 @@ test("provider intake and runtime primitives reject anonymous and operator ident
     () => operator.mutation(api.orders.upsertFromShopify, { siteId, orders: [] }),
     () => operator.mutation(api.products.upsertFromShopify, { siteId, products: [] }),
     () => operator.mutation(api.orders.record, { siteId, shopifyOrderId: "gid://shopify/Order/x", totalUsd: 1 }),
-    () => operator.mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" }),
+    () => operator.mutation(api.orders.applyTracking, { siteId, cjOrderNumber: order.cjOrderNumber, status: "shipped" }),
     () => operator.mutation(api.orders.claimSandboxCjDispatch, { actionId, triggerRunId: "run", leaseToken: "t".repeat(64) }),
     () => operator.mutation(api.orders.beginSandboxCjDispatchReconciliation, { actionId, orderId, receipt: claim.receipt }),
     () => operator.mutation(api.orders.rejectSandboxCjDispatchAfterDefinitiveProviderRejection, { actionId, orderId, receipt: claim.receipt, rejection: "invalid_order" }),
@@ -518,14 +533,14 @@ test("tracking and audit boundaries never copy sentinel customer or tracking val
   await t.run((ctx) => ctx.db.patch(orderId, {
     cjOrderInput: { ...order.cjOrderInput, shippingAddress: sentinel, shippingCustomerName: sentinel, shippingPhone: sentinel, shippingZip: sentinel },
   }));
-  await service(t).mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, trackingNumber: sentinel, trackingUrl: `https://example.test/${sentinel}`, status: "shipped" });
+  await service(t).mutation(api.orders.applyTracking, { siteId, cjOrderNumber: order.cjOrderNumber, trackingNumber: sentinel, trackingUrl: `https://example.test/${sentinel}`, status: "shipped" });
   const privateOrder = await t.run((ctx) => ctx.db.get(orderId));
   assert.match(JSON.stringify(privateOrder.cjOrderInput), new RegExp(sentinel));
   const audit = await t.run((ctx) => ctx.db.query("auditLog").collect());
   const outbox = await t.run((ctx) => ctx.db.query("outbox").collect());
   const traces = await t.run((ctx) => ctx.db.query("traces").collect());
   assert.equal(JSON.stringify({ audit, outbox, traces }).includes(sentinel), false);
-  assert.equal(JSON.stringify(await service(t).mutation(api.orders.applyTracking, { cjOrderNumber: order.cjOrderNumber, status: "shipped" })).includes(sentinel), false);
+  assert.equal(JSON.stringify(await service(t).mutation(api.orders.applyTracking, { siteId, cjOrderNumber: order.cjOrderNumber, status: "shipped" })).includes(sentinel), false);
   assert.equal(siteId !== undefined, true);
 });
 

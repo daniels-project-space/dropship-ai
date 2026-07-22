@@ -5,6 +5,7 @@ import type { QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { matchesDataMode, type DataMode } from "./sampleScope";
+import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
 
 export const portfolio = query({
   args: { dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
@@ -41,7 +42,7 @@ export const portfolio = query({
           killDate: site.killDate ?? null,
           pendingActionCount: pendingActions.length,
           activeProductCount: activeProducts.length,
-          ordersAwaitingFulfillment: openOrders.length,
+          ordersAwaitingFulfillment: openOrders.filter((order) => eligibleUsdOrder(order, site.storeCurrency)).length,
         };
       }),
     );
@@ -200,9 +201,10 @@ export const timeseries = query({
           .take(2000);
         for (const o of orders) {
           if (o.createdAt < since) continue;
+          if (!eligibleUsdOrder(o, s.storeCurrency)) continue;
           const k = dayKey(o.createdAt);
           if (!buckets.has(k)) continue;
-          buckets.set(k, buckets.get(k)! + (metric === "revenue" ? o.totalUsd : 1));
+          buckets.set(k, buckets.get(k)! + (metric === "revenue" ? o.currentTotal! : 1));
         }
       } else {
         // views / engagement from published posts (publishedAt bucketed)
@@ -230,7 +232,7 @@ export const timeseries = query({
     const prior = points.slice(0, half).reduce((s, p) => s + p.value, 0);
     const deltaPct = prior > 0 ? ((recent - prior) / prior) * 100 : recent > 0 ? 100 : 0;
 
-    return { metric, days: window, points, total, deltaPct };
+    return { metric, days: window, points, total, deltaPct, currencyCode: metric === "revenue" ? "USD" : null, eligibleRealOrdersOnly: metric === "revenue" || metric === "orders" };
   },
 });
 
@@ -305,8 +307,9 @@ export const funnel = query({
         pageviews += m.pageviews;
         atc += m.addToCartCount ?? 0;
         checkout += m.checkoutCount ?? 0;
-        purchases += m.purchaseCount ?? 0;
       }
+      const orders = await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", s._id)).take(2000);
+      purchases += orders.filter((order) => order.createdAt >= since && eligibleUsdOrder(order, s.storeCurrency)).length;
     }
     const stages = [
       { label: "Provider-observed reach", value: views },
@@ -315,7 +318,7 @@ export const funnel = query({
       { label: "Shopify checkout", value: checkout },
       { label: "Shopify purchase", value: purchases },
     ];
-    return { stages, days: window, providerObservedOnly: true };
+    return { stages, days: window, providerObservedOnly: true, purchaseBasis: "eligible_real_paid_usd_orders" };
   },
 });
 
@@ -435,7 +438,8 @@ export const brandDetail = query({
       ]);
 
     const totalViews = publishedPosts.reduce((s, p) => s + (hasProviderObservedPostMetrics(p) ? p.views ?? 0 : 0), 0);
-    const revenueUsd = allOrders.reduce((s, o) => s + (o.totalUsd ?? 0), 0);
+    const eligibleOrders = allOrders.filter((order) => eligibleUsdOrder(order, site.storeCurrency));
+    const revenueUsd = eligibleOrders.reduce((sum, order) => sum + order.currentTotal!, 0);
 
     return {
       site,
@@ -445,10 +449,11 @@ export const brandDetail = query({
       postCount: allPosts.length,
       publishedPostCount: publishedPosts.length,
       openOrderCount: openOrders.length,
-      orderCount: allOrders.length,
+      orderCount: eligibleOrders.length,
       reviewCreativeCount: reviewCreatives.length,
       totalViews,
       revenueUsd,
+      revenueCurrency: "USD" as const,
     };
   },
 });

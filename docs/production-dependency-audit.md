@@ -1,20 +1,19 @@
-# Production dependency audit — 2026-07-21
+# Production dependency audit — 2026-07-22
 
-`npm audit --omit=dev` reports **0 high, 0 critical, 13 moderate** findings after the
-compatible Socket.IO/Engine.IO/ws/PostCSS overrides in `package.json`.
+The lockfile pins `next@16.2.9` and a compatible root `sharp@0.35.3`. The direct root pin is
+intentional: Next's nested `sharp@0.34.5` was affected by GHSA-f88m-g3jw-g9cj, while 0.35.3
+supports the project's declared Node `>=20.9.0` target. CI exercises the production build; local
+verification additionally decodes, resizes and re-encodes an image through the pinned Sharp.
 
-The remaining findings are one path, repeated through OpenTelemetry packages:
+## Expiring Trigger/OpenTelemetry exception
 
-`@trigger.dev/sdk@4.5.5 -> @trigger.dev/core@4.5.5 -> @opentelemetry/*@2.7.1/0.218.0 -> @opentelemetry/core@2.7.1`
+Owner: Dropship AI maintainers. Expires: **2026-08-22** (must be renewed with a new audit or
+removed). `@trigger.dev/sdk` and `@trigger.dev/build` remain on the compatible v4 architecture.
+As checked on 2026-07-22, current stable Trigger `4.5.6` still pins OpenTelemetry core 2.7.1 and
+related 0.218.0 packages affected by GHSA-8988-4f7v-96qf. `npm audit fix` proposes an incompatible
+Trigger v3 downgrade, so it is not an honest automatic fix.
 
-The advisory is [GHSA-8988-4f7v-96qf](https://github.com/advisories/GHSA-8988-4f7v-96qf):
-unbounded allocation while parsing W3C Baggage. The deployed exposure is confined to the
-server-side Trigger worker telemetry dependency; it is not bundled into the browser and neither
-the CJ executor nor its Convex receipt accepts a caller-supplied Baggage value. The application
-boundary accepts only authenticated API/Trigger traffic, and CJ customer input remains in Convex
-instead of task payloads/logs/traces.
-
-No compatible fixed Trigger v4 release is available: `npm audit fix` proposes downgrading the
-selected v4 SDK to `@trigger.dev/sdk@3.3.17`, a breaking change that would invalidate the pinned
-v4 task architecture. Keep the v4 line, retain the ingress/PII boundary above, and reassess when
-Trigger publishes a v4 release with OpenTelemetry core 2.8.0 or newer.
+The exposure is confined to server-side Trigger telemetry. Provider/customer bodies are not
+placed into task payloads, logs or traces, and service ingress is authenticated. This mitigation
+does not change the audit count: the exact full and production counts from the verified commit
+must be reported at delivery and rechecked before this exception expires.

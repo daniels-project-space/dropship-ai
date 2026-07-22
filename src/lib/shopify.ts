@@ -137,7 +137,11 @@ const ORDERS_QUERY = /* GraphQL */ `
         name
         createdAt
         displayFulfillmentStatus
-        totalPriceSet { shopMoney { amount } }
+        displayFinancialStatus
+        test
+        cancelledAt
+        currentTotalPriceSet { shopMoney { amount currencyCode } }
+        refunds { id }
         lineItems(first: 50) {
           nodes { quantity product { id } }
         }
@@ -156,7 +160,12 @@ export interface ShopifyOrder {
   name: string; // "#1001"
   createdAt: number; // ms epoch
   displayFulfillmentStatus: string; // FULFILLED | UNFULFILLED | PARTIALLY_FULFILLED | ...
-  totalUsd: number;
+  currencyCode: string;
+  currentTotal: number;
+  financialStatus: string;
+  test: boolean;
+  cancelled: boolean;
+  creditAdjustmentState: "none" | "partial" | "full";
   lineItems: ShopifyOrderLine[];
 }
 
@@ -185,7 +194,11 @@ export async function listOrders(
           name: string;
           createdAt: string;
           displayFulfillmentStatus: string;
-          totalPriceSet: { shopMoney: { amount: string } };
+          displayFinancialStatus: string | null;
+          test: boolean;
+          cancelledAt: string | null;
+          currentTotalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+          refunds: Array<{ id: string }>;
           lineItems: { nodes: Array<{ quantity: number; product: { id: string } | null }> };
         }>;
       };
@@ -196,7 +209,13 @@ export async function listOrders(
         name: n.name,
         createdAt: Date.parse(n.createdAt),
         displayFulfillmentStatus: n.displayFulfillmentStatus,
-        totalUsd: Number(n.totalPriceSet?.shopMoney?.amount ?? 0) || 0,
+        currencyCode: n.currentTotalPriceSet.shopMoney.currencyCode,
+        currentTotal: Number(n.currentTotalPriceSet.shopMoney.amount),
+        financialStatus: n.displayFinancialStatus ?? "UNKNOWN",
+        test: n.test,
+        cancelled: n.cancelledAt !== null,
+        creditAdjustmentState: n.displayFinancialStatus === "REFUNDED" ? "full"
+          : n.displayFinancialStatus === "PARTIALLY_REFUNDED" || n.refunds.length ? "partial" : "none",
         lineItems: n.lineItems.nodes.map((li) => ({
           productId: li.product?.id ?? null,
           quantity: li.quantity,

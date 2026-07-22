@@ -37,7 +37,7 @@ test("semi-manual brands do not call a public distribution provider", async () =
         mediaUrl: "https://example.invalid/creative.mp4",
         caption: "A reviewed creative",
       },
-      { distributionMode: "semi_manual" },
+      { distributionMode: "semi_manual", destinations: [{ platform: "tiktok", targetAccount: "acct-1" }] },
     );
     assert.deepEqual(result, {
       mode: "semi_manual",
@@ -67,7 +67,7 @@ test("automated distribution fails closed without the deployment live-effects ac
           mediaUrl: "https://example.invalid/creative.mp4",
           caption: "A reviewed creative",
         },
-        { distributionMode: "automated" },
+        { distributionMode: "automated", destinations: [{ platform: "tiktok", targetAccount: "acct-1" }] },
       ),
       /live effects are disabled/,
     );

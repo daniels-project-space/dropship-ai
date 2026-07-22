@@ -8,6 +8,7 @@ import { query } from "./authz";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { matchesDataMode } from "./sampleScope";
+import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -70,8 +71,8 @@ export const list = query({
       }
 
       for (const o of orders) {
-        if (o.createdAt >= since) revenue += o.totalUsd;
-        if (o.fulfillmentStatus === "received") openOrders++;
+        if (o.createdAt >= since && eligibleUsdOrder(o, s.storeCurrency)) revenue += o.currentTotal!;
+        if (o.fulfillmentStatus === "received" && eligibleUsdOrder(o, s.storeCurrency)) openOrders++;
       }
 
       for (const p of products) {

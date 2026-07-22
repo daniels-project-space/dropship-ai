@@ -22,6 +22,7 @@ const cjOrderInput = v.object({
   products: v.array(v.object({ vid: v.string(), quantity: v.number() })),
 });
 const shopifyLine = v.object({ productId: v.string(), variantId: v.string(), quantity: v.number() });
+const creditAdjustmentState = v.union(v.literal("none"), v.literal("partial"), v.literal("full"));
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: sandbox dispatch requires the service runtime");
 }
@@ -102,7 +103,12 @@ export const upsertFromShopify = mutation({
     orders: v.array(
       v.object({
         shopifyOrderId: v.string(),
-        totalUsd: v.number(),
+        currencyCode: v.string(),
+        currentTotal: v.number(),
+        financialStatus: v.string(),
+        test: v.boolean(),
+        cancelled: v.boolean(),
+        creditAdjustmentState,
         fulfillmentStatus: fulfillmentStatus,
         createdAt: v.number(),
       }),
@@ -115,7 +121,7 @@ export const upsertFromShopify = mutation({
     for (const o of orders) {
       const existing = await ctx.db
         .query("orders")
-        .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", o.shopifyOrderId))
+        .withIndex("by_site_shopify_order", (q) => q.eq("siteId", siteId).eq("shopifyOrderId", o.shopifyOrderId))
         .first();
       if (existing) {
         // never downgrade an order the fulfillment loop has already advanced
@@ -124,7 +130,13 @@ export const upsertFromShopify = mutation({
             ? o.fulfillmentStatus
             : existing.fulfillmentStatus;
         await ctx.db.patch(existing._id, {
-          totalUsd: o.totalUsd,
+          currencyCode: o.currencyCode,
+          currentTotal: o.currentTotal,
+          financialStatus: o.financialStatus,
+          test: o.test,
+          cancelled: o.cancelled,
+          creditAdjustmentState: o.creditAdjustmentState,
+          totalUsd: o.currencyCode === "USD" ? o.currentTotal : undefined,
           fulfillmentStatus: nextStatus,
           sample: false,
         });
@@ -134,7 +146,13 @@ export const upsertFromShopify = mutation({
           siteId,
           shopifyOrderId: o.shopifyOrderId,
           fulfillmentStatus: o.fulfillmentStatus,
-          totalUsd: o.totalUsd,
+          currencyCode: o.currencyCode,
+          currentTotal: o.currentTotal,
+          financialStatus: o.financialStatus,
+          test: o.test,
+          cancelled: o.cancelled,
+          creditAdjustmentState: o.creditAdjustmentState,
+          totalUsd: o.currencyCode === "USD" ? o.currentTotal : undefined,
           createdAt: o.createdAt,
           sample: false,
         });
@@ -150,7 +168,13 @@ export const record = mutation({
   args: {
     siteId: v.id("sites"),
     shopifyOrderId: v.string(),
-    totalUsd: v.number(),
+    totalUsd: v.optional(v.number()),
+    currencyCode: v.optional(v.string()),
+    currentTotal: v.optional(v.number()),
+    financialStatus: v.optional(v.string()),
+    test: v.optional(v.boolean()),
+    cancelled: v.optional(v.boolean()),
+    creditAdjustmentState: v.optional(creditAdjustmentState),
     cjOrderId: v.optional(v.string()),
     fulfillmentStatus: v.optional(fulfillmentStatus),
   },
@@ -158,12 +182,16 @@ export const record = mutation({
     await requireServiceIdentity(ctx);
     const existing = await ctx.db
       .query("orders")
-      .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", args.shopifyOrderId))
+      .withIndex("by_site_shopify_order", (q) => q.eq("siteId", args.siteId).eq("shopifyOrderId", args.shopifyOrderId))
       .first();
     if (existing) {
       const patch: Record<string, unknown> = {};
       if (args.cjOrderId) patch.cjOrderId = args.cjOrderId;
       if (args.fulfillmentStatus) patch.fulfillmentStatus = args.fulfillmentStatus;
+      for (const key of ["currencyCode", "currentTotal", "financialStatus", "test", "cancelled", "creditAdjustmentState"] as const) {
+        if (args[key] !== undefined) patch[key] = args[key];
+      }
+      if (args.currentTotal !== undefined && args.currencyCode === "USD") patch.totalUsd = args.currentTotal;
       if (Object.keys(patch).length) await ctx.db.patch(existing._id, patch);
       return existing._id;
     }
@@ -172,7 +200,13 @@ export const record = mutation({
       shopifyOrderId: args.shopifyOrderId,
       cjOrderId: args.cjOrderId,
       fulfillmentStatus: args.fulfillmentStatus ?? "received",
-      totalUsd: args.totalUsd,
+      totalUsd: args.totalUsd ?? (args.currencyCode === "USD" ? args.currentTotal : undefined),
+      currencyCode: args.currencyCode,
+      currentTotal: args.currentTotal,
+      financialStatus: args.financialStatus,
+      test: args.test,
+      cancelled: args.cancelled,
+      creditAdjustmentState: args.creditAdjustmentState,
       createdAt: Date.now(),
     });
     await appendAudit(ctx, { siteId: args.siteId, event: "order_received", detail: { orderId } });
@@ -798,6 +832,7 @@ export const claimSandboxCjDispatchReconciliationSchedule = mutation({
 // never a Shopify id; this prevents an arbitrary provider value mapping another order.
 export const applyTracking = mutation({
   args: {
+    siteId: v.id("sites"),
     cjOrderNumber: v.string(),
     trackingNumber: v.optional(v.string()),
     trackingUrl: v.optional(v.string()),
@@ -808,7 +843,7 @@ export const applyTracking = mutation({
     await requireServiceIdentity(ctx);
     const order = await ctx.db
       .query("orders")
-      .withIndex("by_cj_order_number", (q) => q.eq("cjOrderNumber", args.cjOrderNumber))
+      .withIndex("by_site_cj_order_number", (q) => q.eq("siteId", args.siteId).eq("cjOrderNumber", args.cjOrderNumber))
       .first();
     if (!order) throw new Error(`order for cjOrderNumber ${args.cjOrderNumber} not found`);
     if (args.cjOrderId && order.cjOrderId && args.cjOrderId !== order.cjOrderId) throw new Error("CJ webhook order id does not match persisted order identity");
@@ -828,19 +863,19 @@ export const applyTracking = mutation({
 });
 
 export const getByShopifyOrder = query({
-  args: { shopifyOrderId: v.string() },
-  handler: async (ctx, { shopifyOrderId }) => {
+  args: { siteId: v.id("sites"), shopifyOrderId: v.string() },
+  handler: async (ctx, { siteId, shopifyOrderId }) => {
     return ctx.db
       .query("orders")
-      .withIndex("by_shopify_order", (q) => q.eq("shopifyOrderId", shopifyOrderId))
+      .withIndex("by_site_shopify_order", (q) => q.eq("siteId", siteId).eq("shopifyOrderId", shopifyOrderId))
       .first();
   },
 });
 
 export const getByCjOrderNumber = query({
-  args: { cjOrderNumber: v.string() },
-  handler: async (ctx, { cjOrderNumber }) => ctx.db.query("orders")
-    .withIndex("by_cj_order_number", (q) => q.eq("cjOrderNumber", cjOrderNumber)).first(),
+  args: { siteId: v.id("sites"), cjOrderNumber: v.string() },
+  handler: async (ctx, { siteId, cjOrderNumber }) => ctx.db.query("orders")
+    .withIndex("by_site_cj_order_number", (q) => q.eq("siteId", siteId).eq("cjOrderNumber", cjOrderNumber)).first(),
 });
 
 export const listBySite = query({

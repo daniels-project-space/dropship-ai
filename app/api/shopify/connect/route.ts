@@ -60,13 +60,19 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
+  if (shop.myshopifyDomain.toLowerCase() !== shopifyDomain) {
+    return NextResponse.json({ error: "validated Shopify store identity does not match the requested domain" }, { status: 400 });
+  }
+  if (shop.currencyCode !== "USD") {
+    return NextResponse.json({ error: `Shopify store currency ${shop.currencyCode} is unsupported; this launch requires USD until currency conversion is implemented` }, { status: 409 });
+  }
 
   const convex = convexClient();
   const sid = siteId as Id<"sites">;
 
   // 2. Persist connection state + the vaultRef pointer (NOT the token value).
   try {
-    await convex.mutation(api.sites.connectStore, { siteId: sid, shopifyDomain });
+    await convex.mutation(api.sites.connectStore, { siteId: sid, shopifyDomain, storeCurrency: shop.currencyCode });
     await convex.mutation(api.siteSecrets.upsertRef, {
       siteId: sid,
       key: SHOPIFY_TOKEN_KEY,

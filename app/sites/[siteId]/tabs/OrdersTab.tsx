@@ -8,7 +8,7 @@ import { DataTable, type Column } from "../../../components/ui/DataTable";
 import { Badge } from "../../../components/ui/Badge";
 import { Drawer } from "../../../components/ui/Drawer";
 import { Icon } from "../../../components/Icons";
-import { FULFILLMENT_STATUS, type FulfillmentStatus, fmtUsd, timeAgo } from "../../../components/tokens";
+import { FULFILLMENT_STATUS, type FulfillmentStatus, timeAgo } from "../../../components/tokens";
 
 type OrderRow = {
   _id: Id<"orders">;
@@ -17,7 +17,13 @@ type OrderRow = {
   fulfillmentStatus: FulfillmentStatus;
   trackingNumber?: string;
   trackingUrl?: string;
-  totalUsd: number;
+  totalUsd?: number;
+  currentTotal?: number;
+  currencyCode?: string;
+  financialStatus?: string;
+  test?: boolean;
+  cancelled?: boolean;
+  creditAdjustmentState?: "none" | "partial" | "full";
   createdAt: number;
 };
 
@@ -58,7 +64,8 @@ function OrderDrawer({ row, onClose }: { row: OrderRow | null; onClose: () => vo
         </div>
         <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line-soft bg-line-soft">
           {[
-            ["Order total", fmtUsd(row.totalUsd)],
+            ["Current total", row.currentTotal !== undefined && row.currencyCode ? `${row.currencyCode} ${row.currentTotal.toFixed(2)}` : "not observed"],
+            ["Financial status", row.financialStatus ?? "not observed"],
             ["Received", timeAgo(row.createdAt)],
             ["Shopify ID", `#${row.shopifyOrderId}`],
             ["CJ order", row.cjOrderId ? `CJ ${row.cjOrderId}` : "not dispatched"],
@@ -111,8 +118,8 @@ export function OrdersTab({ siteId }: { siteId: Id<"sites"> }) {
       header: "Total",
       align: "right",
       sortable: true,
-      sortValue: (r) => r.totalUsd,
-      render: (r) => <span className="font-mono tabular-nums text-ink">{fmtUsd(r.totalUsd)}</span>,
+      sortValue: (r) => r.currentTotal ?? -1,
+      render: (r) => <span className="font-mono tabular-nums text-ink">{r.currentTotal !== undefined && r.currencyCode ? `${r.currencyCode} ${r.currentTotal.toFixed(2)}` : "—"}</span>,
     },
     {
       key: "tracking",

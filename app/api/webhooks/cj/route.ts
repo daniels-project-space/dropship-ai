@@ -47,8 +47,18 @@ export async function POST(req: Request) {
 
   const tracking = parseOrderWebhook(payload);
   if (!tracking.orderNumber) return NextResponse.json({ ok: true, ignored: "no order number" });
+  // Configure each site's CJ webhook URL with ?siteId=<Convex site id>. The signature protects
+  // the request; the explicit tenant scope prevents a provider identifier collision from ever
+  // selecting another site's order.
+  const siteId = new URL(req.url).searchParams.get("siteId");
+  if (!siteId) return NextResponse.json({ error: "siteId webhook scope is required" }, { status: 400 });
   const convex = convexClient();
-  const order = await convex.query(api.orders.getByCjOrderNumber, { cjOrderNumber: tracking.orderNumber });
+  let order;
+  try {
+    order = await convex.query(api.orders.getByCjOrderNumber, { siteId: siteId as Id<"sites">, cjOrderNumber: tracking.orderNumber });
+  } catch {
+    return NextResponse.json({ error: "invalid siteId webhook scope" }, { status: 400 });
+  }
   if (!order) return NextResponse.json({ ok: true, ignored: "unknown order" });
 
   const topic = req.headers.get("x-cj-topic") ?? "ORDER";
@@ -56,7 +66,7 @@ export async function POST(req: Request) {
   const deliveryId = req.headers.get("x-cj-webhook-id") ?? req.headers.get("x-cj-event-id") ?? `digest:${topic}:${payloadHash}`;
   try {
     const result = await convex.mutation(api.webhooks.recordCjTracking, {
-      siteId: order.siteId as Id<"sites">,
+      siteId: siteId as Id<"sites">,
       deliveryId,
       topic,
       payloadHash,

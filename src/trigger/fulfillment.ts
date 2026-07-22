@@ -89,6 +89,7 @@ export const cjDispatchReconciliationSweep = schedules.task({
 });
 
 export interface CjWebhookHandlerArgs {
+  siteId: string;
   payload: unknown;
   shopify?: { cfg: ShopifyClientConfig; fulfillmentId: string };
   mode?: EffectMode;
@@ -100,7 +101,7 @@ export async function handleCjTrackingWebhook(args: CjWebhookHandlerArgs) {
   const tracking = parseOrderWebhook(args.payload);
   if (!tracking.orderNumber) throw new Error("cj webhook: missing orderNumber — cannot map to a Shopify order");
   await convex.mutation(api.orders.applyTracking, {
-    cjOrderNumber: tracking.orderNumber, trackingNumber: tracking.trackNumber, trackingUrl: tracking.trackingUrl,
+    siteId: args.siteId as Id<"sites">, cjOrderNumber: tracking.orderNumber, trackingNumber: tracking.trackNumber, trackingUrl: tracking.trackingUrl,
     cjOrderId: tracking.cjOrderId, status: "shipped",
   });
   if (args.shopify && tracking.trackNumber) {

@@ -94,10 +94,11 @@ function GenerateBar({
 
 export default function CreativeStudioPage() {
   const reviews = useQuery(api.creatives.listForReview, {});
+  const publicationAuthorizations = useQuery(api.creatives.listForPublicationAuthorization, {});
   const portfolio = useQuery(api.dashboard.portfolio, {});
 
-  const loading = reviews === undefined;
-  const creatives = (reviews ?? []) as ReviewCreative[];
+  const loading = reviews === undefined || publicationAuthorizations === undefined;
+  const creatives = ([...(reviews ?? []), ...(publicationAuthorizations ?? [])]) as ReviewCreative[];
   const isEmpty = !loading && creatives.length === 0;
   const sites = (portfolio?.sites ?? []).map((s) => ({ siteId: s.siteId, name: s.name }));
   const aiCount = creatives.filter((c) => c.aiLabelRequired).length;
@@ -116,14 +117,15 @@ export default function CreativeStudioPage() {
           </h1>
           <p className="mt-5 max-w-xl text-[15px] leading-relaxed text-ink-dim">
             The factory builds hero assets around the product itself — never uncanny AI dogs. Every
-            AI-touched frame carries a mandatory disclosure label, enforced in code. Approve to push
-            it down the distribution pipeline; reject to discard.
+            AI-touched frame carries a mandatory disclosure label, enforced in code. Approve
+            the content first; publication remains blocked until a separate exact caption, platform,
+            and target-account authorization.
           </p>
 
           {!isEmpty && !loading && (
             <div className="mt-7 flex flex-wrap items-center gap-x-8 gap-y-3 font-mono text-[13px] text-ink-dim">
               <span>
-                <span className="font-display text-2xl text-ink">{creatives.length}</span> in review
+                <span className="font-display text-2xl text-ink">{creatives.length}</span> awaiting a decision
               </span>
               <span className="flex items-center gap-2">
                 <StatusDot className="bg-cyan" hex="#5cc6e8" size={7} />
