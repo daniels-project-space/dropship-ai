@@ -39,15 +39,41 @@ function ttsReceipt(row: VariantRow): TtsProviderReceipt {
   return { requestId: row.ttsRequestId, voiceId: row.voiceId, model: row.ttsModel, textDigest: row.ttsTextDigest, characterCount: row.ttsCharacterCount, characterCost: row.ttsCharacterCost };
 }
 
-type ExecutorOverrides = {
-  convex?: ReturnType<typeof convexClient>;
-  getElevenLabsApiKey?: typeof getElevenLabsApiKey;
-  openElevenLabsTts?: typeof openElevenLabsTts;
-  cancelResponseBody?: typeof cancelResponseBody;
+export type CreativeGenerationExecutorEffects = {
+  convex: ReturnType<typeof convexClient>;
+  getFalApiKey: typeof getFalApiKey;
+  getElevenLabsApiKey: typeof getElevenLabsApiKey;
+  getSignedUrl: typeof getSignedUrl;
+  submitFalQueue: typeof submitFalQueue;
+  readFalQueueStatus: typeof readFalQueueStatus;
+  copyFalQueueResult: typeof copyFalQueueResult;
+  openElevenLabsTts: typeof openElevenLabsTts;
+  cancelResponseBody: typeof cancelResponseBody;
+  findUniqueTtsHistoryItem: typeof findUniqueTtsHistoryItem;
+  copyTtsHistoryAudio: typeof copyTtsHistoryAudio;
+  assemble: typeof assemble;
 };
 
-export async function processCreativeGenerationVariant(payload: VariantPayload, owner: string, overrides: ExecutorOverrides = {}) {
-  const convex = overrides.convex ?? convexClient();
+export async function processCreativeGenerationVariant(
+  payload: VariantPayload,
+  owner: string,
+  overrides: Partial<CreativeGenerationExecutorEffects> = {},
+) {
+  const effects: CreativeGenerationExecutorEffects = {
+    convex: overrides.convex ?? convexClient(),
+    getFalApiKey: overrides.getFalApiKey ?? getFalApiKey,
+    getElevenLabsApiKey: overrides.getElevenLabsApiKey ?? getElevenLabsApiKey,
+    getSignedUrl: overrides.getSignedUrl ?? getSignedUrl,
+    submitFalQueue: overrides.submitFalQueue ?? submitFalQueue,
+    readFalQueueStatus: overrides.readFalQueueStatus ?? readFalQueueStatus,
+    copyFalQueueResult: overrides.copyFalQueueResult ?? copyFalQueueResult,
+    openElevenLabsTts: overrides.openElevenLabsTts ?? openElevenLabsTts,
+    cancelResponseBody: overrides.cancelResponseBody ?? cancelResponseBody,
+    findUniqueTtsHistoryItem: overrides.findUniqueTtsHistoryItem ?? findUniqueTtsHistoryItem,
+    copyTtsHistoryAudio: overrides.copyTtsHistoryAudio ?? copyTtsHistoryAudio,
+    assemble: overrides.assemble ?? assemble,
+  };
+  const convex = effects.convex;
   validateControlPlaneIdentity(owner, "worker owner ID");
   const variantId = payload.variantId as Id<"creativeGenerationVariants">;
   const claimed: any = await convex.mutation(api.creativeGenerations.claimVariantStage, {
@@ -62,16 +88,16 @@ export async function processCreativeGenerationVariant(payload: VariantPayload, 
   try {
     if (payload.stage === "image_submission" || payload.stage === "clip_submission") {
       const kind = payload.stage === "image_submission" ? "image" : "clip";
-      const apiKey = await getFalApiKey(); // known pre-submission configuration failure is safely retryable
+      const apiKey = await effects.getFalApiKey(); // known pre-submission configuration failure is safely retryable
       let input: Record<string, unknown>;
       if (kind === "image") input = imageQueueInput(row.imagePrompt);
       else {
         const lifetime = FAL_CLIP_START_TIMEOUT_SECONDS + FAL_INPUT_URL_MARGIN_SECONDS;
-        input = clipQueueInput(await getSignedUrl(row.imageR2Key, lifetime), row.clipPrompt);
+        input = clipQueueInput(await effects.getSignedUrl(row.imageR2Key, lifetime), row.clipPrompt);
       }
       await convex.mutation(api.creativeGenerations.beginProviderSubmission, { variantId, expectedStage: payload.stage, leaseGeneration });
       try {
-        const receipt = await submitFalQueue({
+        const receipt = await effects.submitFalQueue({
           model: kind === "image" ? row.imageModel : row.clipModel, input, apiKey,
           ...(kind === "clip" ? { startTimeoutSeconds: FAL_CLIP_START_TIMEOUT_SECONDS } : {}),
         });
@@ -85,7 +111,7 @@ export async function processCreativeGenerationVariant(payload: VariantPayload, 
     if (payload.stage === "image_polling" || payload.stage === "clip_polling") {
       const kind = payload.stage === "image_polling" ? "image" : "clip";
       const receipt = falReceipt(row, kind);
-      const status = await readFalQueueStatus({ receipt, apiKey: await getFalApiKey() });
+      const status = await effects.readFalQueueStatus({ receipt, apiKey: await effects.getFalApiKey() });
       if (status.failed) return fail("definitive", "fal_request_failed");
       return convex.mutation(api.creativeGenerations.recordFalPoll, { variantId, kind, leaseGeneration, requestId: receipt.requestId, status: status.status });
     }
@@ -93,19 +119,19 @@ export async function processCreativeGenerationVariant(payload: VariantPayload, 
     if (payload.stage === "image_result_copy" || payload.stage === "clip_result_copy") {
       const kind = payload.stage === "image_result_copy" ? "image" : "clip";
       const receipt = falReceipt(row, kind);
-      const object = await copyFalQueueResult({ kind, receipt, apiKey: await getFalApiKey(), r2Key: kind === "image" ? row.imageR2Key : row.clipR2Key });
+      const object = await effects.copyFalQueueResult({ kind, receipt, apiKey: await effects.getFalApiKey(), r2Key: kind === "image" ? row.imageR2Key : row.clipR2Key });
       return convex.mutation(api.creativeGenerations.recordFalObjectCopy, { variantId, kind, leaseGeneration, requestId: receipt.requestId, object });
     }
 
     if (payload.stage === "tts_reservation") {
-      const apiKey = await (overrides.getElevenLabsApiKey ?? getElevenLabsApiKey)();
+      const apiKey = await effects.getElevenLabsApiKey();
       await convex.mutation(api.creativeGenerations.beginProviderSubmission, { variantId, expectedStage: "tts_reservation", leaseGeneration });
       try {
-        const opened = await (overrides.openElevenLabsTts ?? openElevenLabsTts)({ text: row.hook, voiceId: row.voiceId, model: row.ttsModel, apiKey });
+        const opened = await effects.openElevenLabsTts({ text: row.hook, voiceId: row.voiceId, model: row.ttsModel, apiKey });
         const recorded = await convex.mutation(api.creativeGenerations.recordTtsReceipt, { variantId, leaseGeneration, ...opened.receipt });
         // The header receipt is durable. Stop the unneeded audio stream without materializing it;
         // the next stage recovers this exact billed generation from history.
-        await (overrides.cancelResponseBody ?? cancelResponseBody)(opened.response);
+        await effects.cancelResponseBody(opened.response);
         return recorded;
       } catch (error) {
         if (error instanceof TtsDefinitiveSubmissionError) return fail("definitive", "tts_submission_rejected");
@@ -116,7 +142,7 @@ export async function processCreativeGenerationVariant(payload: VariantPayload, 
     if (payload.stage === "tts_receipt") {
       try {
         const receipt = ttsReceipt(row);
-        const historyItemId = await findUniqueTtsHistoryItem({ receipt, text: row.hook, createdAt: row.submissionStartedAt, apiKey: await getElevenLabsApiKey() });
+        const historyItemId = await effects.findUniqueTtsHistoryItem({ receipt, text: row.hook, createdAt: row.submissionStartedAt, apiKey: await effects.getElevenLabsApiKey() });
         return convex.mutation(api.creativeGenerations.recordTtsHistoryItem, { variantId, leaseGeneration, requestId: receipt.requestId, historyItemId });
       } catch {
         return fail(row.failureCount >= 2 ? "ambiguous" : "retryable_safe", "tts_history_not_uniquely_recoverable");
@@ -126,7 +152,7 @@ export async function processCreativeGenerationVariant(payload: VariantPayload, 
     if (payload.stage === "tts_audio_copy") {
       try {
         const receipt = ttsReceipt(row);
-        const object = await copyTtsHistoryAudio({ historyItemId: row.ttsHistoryItemId, apiKey: await getElevenLabsApiKey(), r2Key: row.audioR2Key });
+        const object = await effects.copyTtsHistoryAudio({ historyItemId: row.ttsHistoryItemId, apiKey: await effects.getElevenLabsApiKey(), r2Key: row.audioR2Key });
         return convex.mutation(api.creativeGenerations.recordTtsObjectCopy, { variantId, leaseGeneration, requestId: receipt.requestId, historyItemId: row.ttsHistoryItemId, object });
       } catch {
         return fail(row.failureCount >= 2 ? "ambiguous" : "retryable_safe", "tts_audio_copy_failed");
@@ -134,7 +160,7 @@ export async function processCreativeGenerationVariant(payload: VariantPayload, 
     }
 
     if (payload.stage === "assembly") {
-      const result = await assemble({
+      const result = await effects.assemble({
         productClipR2Key: row.clipR2Key, productClipReceipt: row.clipObject,
         voiceoverR2Key: row.audioR2Key, voiceoverReceipt: row.audioObject,
         captions: row.hook, aiLabelRequired: true, outR2Key: row.finalR2Key,

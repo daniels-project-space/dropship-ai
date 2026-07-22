@@ -11,6 +11,7 @@ import {
 } from "@/src/lib/creativeGeneration";
 import { FAL_CLIP_MODEL, FAL_IMAGE_MODEL } from "@/src/lib/gen/fal";
 import { ELEVEN_MODEL, ELEVEN_VOICE_ID } from "@/src/lib/gen/tts";
+import { BodyLimitExceededError, readRequestBodyBounded } from "@/src/lib/boundedBody";
 
 export const runtime = "nodejs";
 const MAX_BODY_BYTES = 16 * 1024;
@@ -36,15 +37,14 @@ export function createGeneratePost(overrides: Partial<GenerateRouteDependencies>
 async function handleGeneratePost(req: Request, dependencies: GenerateRouteDependencies) {
   const guard = await dependencies.authorize(req);
   if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
-  const declaredLength = Number(req.headers.get("content-length") ?? "0");
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return NextResponse.json({ error: "request body is too large" }, { status: 413 });
-
   let raw: unknown;
   try {
-    const text = await req.text();
-    if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) return NextResponse.json({ error: "request body is too large" }, { status: 413 });
-    raw = JSON.parse(text);
-  } catch {
+    const body = await readRequestBodyBounded(req, MAX_BODY_BYTES, "generation request");
+    raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+  } catch (error) {
+    if (error instanceof BodyLimitExceededError) {
+      return NextResponse.json({ error: "request body is too large" }, { status: 413 });
+    }
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
 

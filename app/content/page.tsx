@@ -6,6 +6,7 @@ import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { normalizeCreativeGenerationInput } from "@/src/lib/creativeGeneration";
 import { confirmPendingCreativeRequest, getOrCreatePendingCreativeRequest } from "@/src/lib/creativeRequestIdentity";
+import { presentCreativeGenerationSuccess } from "@/src/lib/creativeGenerationPresentation";
 import { CreativeCard, type ReviewCreative } from "../components/CreativeCard";
 import { EmptyState } from "../components/EmptyState";
 import { StatusDot } from "../components/StatusDot";
@@ -43,7 +44,7 @@ function GenerateBar({
           confirmPendingCreativeRequest(sessionStorage, pending);
         }
         setState("done");
-        setMsg(`Batch ${String(d.intentId).slice(0, 12)} ${d.state === "deferred" ? "saved · handoff deferred" : "queued"}`);
+        setMsg(presentCreativeGenerationSuccess(d.intentId, d.state));
       } else {
         setState("error");
         setMsg(d.error ?? "Generation could not be queued");

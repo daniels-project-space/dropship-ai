@@ -3,13 +3,17 @@
 import { getKey } from "../vault";
 import { putDeterministicObject, type StoredObjectReceipt } from "../storage";
 import type { FalQueueState } from "../creativeGeneration";
-import { readResponseBodyBounded } from "../boundedBody";
+import { readJsonResponseBounded, readResponseBodyBounded } from "../boundedBody";
 
 const QUEUE_BASE = "https://queue.fal.run";
 export const FAL_IMAGE_MODEL = process.env.FAL_MODEL_IMAGE ?? "fal-ai/flux/schnell";
 export const FAL_CLIP_MODEL = process.env.FAL_MODEL_CLIP ?? "fal-ai/kling-video/v1/standard/image-to-video";
 export const FAL_CLIP_START_TIMEOUT_SECONDS = 120;
 export const FAL_INPUT_URL_MARGIN_SECONDS = 60;
+// Queue receipts/status are tiny even with normal metadata; results contain URLs, not media.
+export const FAL_SUBMIT_METADATA_MAX_BYTES = 32 * 1024;
+export const FAL_STATUS_METADATA_MAX_BYTES = 64 * 1024;
+export const FAL_RESULT_METADATA_MAX_BYTES = 256 * 1024;
 
 export type FalQueueReceipt = {
   requestId: string;
@@ -67,7 +71,13 @@ export async function submitFalQueue(args: {
     throw new FalDefinitiveSubmissionError(response.status);
   }
   let body: { request_id?: unknown; status_url?: unknown; response_url?: unknown };
-  try { body = await response.json(); } catch { throw new FalSubmissionAmbiguousError(); }
+  try {
+    body = await readJsonResponseBounded(response, FAL_SUBMIT_METADATA_MAX_BYTES, "fal submission metadata");
+  } catch {
+    // The successful HTTP response proves the POST may have been accepted even when its receipt
+    // metadata is malformed, truncated, or oversized.
+    throw new FalSubmissionAmbiguousError();
+  }
   if (typeof body.request_id !== "string" || !/^[A-Za-z0-9-]{8,128}$/.test(body.request_id)) throw new FalSubmissionAmbiguousError();
   const exact = exactQueueUrls(args.model, body.request_id);
   if (body.status_url !== exact.statusUrl || body.response_url !== exact.resultUrl) throw new FalSubmissionAmbiguousError();
@@ -87,7 +97,11 @@ async function safeQueueRead(url: string, apiKey: string, fetchImpl?: typeof fet
 export async function readFalQueueStatus(args: { receipt: FalQueueReceipt; apiKey: string; fetchImpl?: typeof fetch }): Promise<{ status: FalQueueState; failed: boolean }> {
   const exact = exactQueueUrls(args.receipt.model, args.receipt.requestId);
   if (args.receipt.statusUrl !== exact.statusUrl || args.receipt.resultUrl !== exact.resultUrl) throw new Error("fal_receipt_endpoint_invalid");
-  const body = await (await safeQueueRead(args.receipt.statusUrl, args.apiKey, args.fetchImpl)).json() as { status?: unknown; request_id?: unknown; error?: unknown };
+  const body = await readJsonResponseBounded<{ status?: unknown; request_id?: unknown; error?: unknown }>(
+    await safeQueueRead(args.receipt.statusUrl, args.apiKey, args.fetchImpl),
+    FAL_STATUS_METADATA_MAX_BYTES,
+    "fal status metadata",
+  );
   if (body.request_id !== args.receipt.requestId || (body.status !== "IN_QUEUE" && body.status !== "IN_PROGRESS" && body.status !== "COMPLETED")) {
     throw new Error("fal_queue_status_invalid");
   }
@@ -114,7 +128,11 @@ export async function copyFalQueueResult(args: {
 }): Promise<StoredObjectReceipt> {
   const exact = exactQueueUrls(args.receipt.model, args.receipt.requestId);
   if (args.receipt.resultUrl !== exact.resultUrl) throw new Error("fal_receipt_endpoint_invalid");
-  const result = await (await safeQueueRead(args.receipt.resultUrl, args.apiKey, args.fetchImpl)).json();
+  const result = await readJsonResponseBounded(
+    await safeQueueRead(args.receipt.resultUrl, args.apiKey, args.fetchImpl),
+    FAL_RESULT_METADATA_MAX_BYTES,
+    "fal result metadata",
+  );
   const mediaUrl = mediaUrlFromResult(result, args.kind);
   const media = await (args.fetchImpl ?? fetch)(mediaUrl);
   if (!media.ok) throw new Error(`fal_media_download_http_${media.status}`);

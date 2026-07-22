@@ -3,11 +3,16 @@
 import { getKey } from "../vault";
 import { putDeterministicObject, type StoredObjectReceipt } from "../storage";
 import { stableSha256 } from "../cjOrder";
-import { readResponseBodyBounded } from "../boundedBody";
+import { readJsonResponseBounded, readResponseBodyBounded } from "../boundedBody";
 
 const ELEVEN_BASE = "https://api.elevenlabs.io/v1";
 export const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM";
 export const ELEVEN_MODEL = process.env.ELEVENLABS_MODEL ?? "eleven_turbo_v2_5";
+export const ELEVEN_HISTORY_PAGE_SIZE = 100;
+export const ELEVEN_HISTORY_MAX_PAGES = 4;
+export const ELEVEN_HISTORY_MAX_ITEMS = ELEVEN_HISTORY_PAGE_SIZE * ELEVEN_HISTORY_MAX_PAGES;
+// A history page contains at most 100 metadata records; audio is fetched separately.
+export const ELEVEN_HISTORY_PAGE_MAX_BYTES = 1024 * 1024;
 
 export type TtsProviderReceipt = {
   requestId: string;
@@ -77,19 +82,68 @@ export async function findUniqueTtsHistoryItem(args: {
   fetchImpl?: typeof fetch;
 }): Promise<string> {
   if (stableSha256(args.text) !== args.receipt.textDigest) throw new Error("tts_history_input_mismatch");
-  const query = new URLSearchParams({
-    page_size: "100", voice_id: args.receipt.voiceId, model_id: args.receipt.model, source: "TTS",
-    date_after_unix: String(Math.max(0, Math.floor(args.createdAt / 1_000) - 60)), sort_direction: "desc",
-  });
-  const response = await (args.fetchImpl ?? fetch)(`${ELEVEN_BASE}/history?${query}`, { headers: { "xi-api-key": args.apiKey } });
-  if (!response.ok) throw new Error(`elevenlabs_history_http_${response.status}`);
-  const body = await response.json() as { history?: Array<{ history_item_id?: unknown; request_id?: unknown; voice_id?: unknown; model_id?: unknown; text?: unknown; source?: unknown }> };
-  const matches = (body.history ?? []).filter((item) => item.request_id === args.receipt.requestId
-    && item.voice_id === args.receipt.voiceId && item.model_id === args.receipt.model && item.source === "TTS"
-    && typeof item.text === "string" && stableSha256(item.text) === args.receipt.textDigest
-    && typeof item.history_item_id === "string" && item.history_item_id.length > 0 && item.history_item_id.length <= 200);
-  if (matches.length !== 1) throw new Error("elevenlabs_history_not_uniquely_recoverable");
-  return matches[0].history_item_id as string;
+  if (!Number.isSafeInteger(args.createdAt) || args.createdAt < 0) throw new Error("tts_history_creation_time_invalid");
+  const windowStart = Math.max(0, Math.floor(args.createdAt / 1_000) - 60);
+  const fetcher = args.fetchImpl ?? fetch;
+  const seen = new Map<string, string>();
+  const matchingIds = new Set<string>();
+  let cursor: string | undefined;
+  let totalItems = 0;
+  let exhausted = false;
+
+  for (let page = 0; page < ELEVEN_HISTORY_MAX_PAGES; page++) {
+    const query = new URLSearchParams({
+      page_size: String(ELEVEN_HISTORY_PAGE_SIZE), voice_id: args.receipt.voiceId,
+      model_id: args.receipt.model, source: "TTS", date_after_unix: String(windowStart),
+      sort_direction: "desc", ...(cursor ? { start_after_history_item_id: cursor } : {}),
+    });
+    const response = await fetcher(`${ELEVEN_BASE}/history?${query}`, { headers: { "xi-api-key": args.apiKey } });
+    if (!response.ok) throw new Error(`elevenlabs_history_http_${response.status}`);
+    const body = await readJsonResponseBounded<{
+      history?: unknown; has_more?: unknown; last_history_item_id?: unknown; scanned_until?: unknown;
+    }>(response, ELEVEN_HISTORY_PAGE_MAX_BYTES, "ElevenLabs history metadata");
+    if (!Array.isArray(body.history) || body.history.length > ELEVEN_HISTORY_PAGE_SIZE
+      || typeof body.has_more !== "boolean"
+      || (body.last_history_item_id !== null && typeof body.last_history_item_id !== "string")
+      || (body.scanned_until !== null && body.scanned_until !== undefined && !Number.isSafeInteger(body.scanned_until))) {
+      throw new Error("elevenlabs_history_page_invalid");
+    }
+    totalItems += body.history.length;
+    if (totalItems > ELEVEN_HISTORY_MAX_ITEMS) throw new Error("elevenlabs_history_item_limit_exceeded");
+
+    for (const value of body.history) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("elevenlabs_history_item_invalid");
+      const item = value as Record<string, unknown>;
+      const id = item.history_item_id;
+      if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(id)) throw new Error("elevenlabs_history_item_invalid");
+      const fingerprint = stableSha256(JSON.stringify({
+        requestId: item.request_id, voiceId: item.voice_id, model: item.model_id,
+        text: item.text, source: item.source,
+      }));
+      const prior = seen.get(id);
+      if (prior && prior !== fingerprint) throw new Error("elevenlabs_history_duplicate_conflict");
+      if (prior) continue;
+      seen.set(id, fingerprint);
+      if (item.request_id === args.receipt.requestId && item.voice_id === args.receipt.voiceId
+        && item.model_id === args.receipt.model && item.source === "TTS"
+        && typeof item.text === "string" && stableSha256(item.text) === args.receipt.textDigest) {
+        matchingIds.add(id);
+      }
+    }
+
+    if (matchingIds.size > 1) throw new Error("elevenlabs_history_not_uniquely_recoverable");
+    if (!body.has_more || (typeof body.scanned_until === "number" && body.scanned_until < windowStart)) {
+      exhausted = true;
+      break;
+    }
+    const nextCursor = body.last_history_item_id;
+    if (typeof nextCursor !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(nextCursor)
+      || nextCursor === cursor) throw new Error("elevenlabs_history_cursor_invalid");
+    cursor = nextCursor;
+  }
+
+  if (!exhausted || matchingIds.size !== 1) throw new Error("elevenlabs_history_not_uniquely_recoverable");
+  return [...matchingIds][0];
 }
 
 export async function copyTtsHistoryAudio(args: {

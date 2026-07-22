@@ -140,7 +140,7 @@ test("TTS restart uses one exact history item and audio copy; missing headers be
 
   const text = "hello history";
   const receipt = { requestId: "tts-history-request", voiceId: "voice-1", model: "model-1", textDigest: createHash("sha256").update(text).digest("hex"), characterCount: text.length };
-  const historyItemId = await findUniqueTtsHistoryItem({ receipt, text, createdAt: Date.now(), apiKey: "fixture", fetchImpl: async () => Response.json({ history: [{ history_item_id: "history-exact", request_id: receipt.requestId, voice_id: receipt.voiceId, model_id: receipt.model, text, source: "TTS" }] }) });
+  const historyItemId = await findUniqueTtsHistoryItem({ receipt, text, createdAt: Date.now(), apiKey: "fixture", fetchImpl: async () => Response.json({ history: [{ history_item_id: "history-exact", request_id: receipt.requestId, voice_id: receipt.voiceId, model_id: receipt.model, text, source: "TTS" }], has_more: false, last_history_item_id: "history-exact", scanned_until: Math.floor(Date.now() / 1_000) }) });
   assert.equal(historyItemId, "history-exact");
   const mp3 = Buffer.from("ID3fixture");
   const copied = await copyTtsHistoryAudio({ historyItemId, apiKey: "fixture", r2Key: "creatives/generations/intent/v0/voice.mp3", fetchImpl: async () => new Response(mp3, { headers: { "content-type": "audio/mpeg" } }), putObject: async (key, body, contentType) => ({ key, contentType, bytes: body.byteLength, sha256: createHash("sha256").update(body).digest("hex"), reused: false }) });
