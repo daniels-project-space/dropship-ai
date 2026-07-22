@@ -3,6 +3,8 @@ import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { isMyshopifyDomain, SHOPIFY_TOKEN_KEY, vaultRefForDomain } from "../src/lib/shopifyIdentity";
+import type { MutationCtx } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 
 const siteStatus = v.union(
   v.literal("provisioning"),
@@ -15,6 +17,15 @@ async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Prom
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: Shopify connection verification requires the service runtime");
 }
 
+async function requireUnaliasedVaultRef(ctx: MutationCtx, siteId: Id<"sites">, vaultRef: string) {
+  const aliases = await ctx.db.query("siteSecrets")
+    .withIndex("by_key_vault_ref", (q) => q.eq("key", SHOPIFY_TOKEN_KEY).eq("vaultRef", vaultRef))
+    .take(3);
+  if (aliases.some((row) => row.siteId !== siteId)) {
+    throw new Error("Shopify vault reference is already bound to another site; aliased domains require distinct credentials");
+  }
+}
+
 export const create = mutation({
   args: {
     name: v.string(),
@@ -22,7 +33,6 @@ export const create = mutation({
     minKitPriceUsd: v.number(),
     minBlendedMarginPct: v.number(),
     distributionMode: v.union(v.literal("semi_manual"), v.literal("automated")),
-    shopifyDomain: v.optional(v.string()),
     customDomain: v.optional(v.string()),
     killDate: v.optional(v.number()),
     status: v.optional(siteStatus),
@@ -82,11 +92,17 @@ export const connectStore = mutation({
     if (existing.sample === true) throw new Error("sample site cannot become live; clear sample data and create a real site first");
     if (!isMyshopifyDomain(shopifyDomain)) throw new Error("Shopify domain must be a canonical myshopify.com domain");
     if (storeCurrency !== "USD") throw new Error(`unsupported Shopify store currency ${storeCurrency}; launch analytics require a USD store until conversion is implemented`);
+    if (existing.shopifyDomain && existing.shopifyDomain !== shopifyDomain) {
+      throw new Error("connected Shopify domain cannot be changed; an explicit migration is required");
+    }
     const domainOwners = await ctx.db.query("sites").withIndex("by_shopify_domain", (q) => q.eq("shopifyDomain", shopifyDomain)).take(2);
     if (domainOwners.some((site) => site._id !== siteId && site.sample !== true)) throw new Error("Shopify domain is already connected to another site");
     const vaultRef = vaultRefForDomain(shopifyDomain);
-    const secretRef = await ctx.db.query("siteSecrets")
-      .withIndex("by_site_key", (q) => q.eq("siteId", siteId).eq("key", SHOPIFY_TOKEN_KEY)).first();
+    await requireUnaliasedVaultRef(ctx, siteId, vaultRef);
+    const secretRefs = await ctx.db.query("siteSecrets")
+      .withIndex("by_site_key", (q) => q.eq("siteId", siteId).eq("key", SHOPIFY_TOKEN_KEY)).take(2);
+    if (secretRefs.length > 1) throw new Error("Shopify recurring vault reference is ambiguous");
+    const secretRef = secretRefs[0];
     if (secretRef) await ctx.db.patch(secretRef._id, { vaultRef });
     else await ctx.db.insert("siteSecrets", { siteId, key: SHOPIFY_TOKEN_KEY, vaultRef });
     const verifiedAt = Date.now();
@@ -94,6 +110,8 @@ export const connectStore = mutation({
       shopifyDomain,
       storeCurrency,
       shopifyAccessVerifiedAt: verifiedAt,
+      shopifyEconomicsSyncStatus: "pending",
+      shopifyEconomicsSyncAttemptedAt: verifiedAt,
       status: "active",
       sample: false,
     });
@@ -113,8 +131,11 @@ export const verifyConnectedStore = mutation({
     if (!site || site.shopifyDomain !== shopifyDomain) throw new Error("connected Shopify domain changed during verification");
     if (storeCurrency !== "USD") throw new Error(`unsupported Shopify store currency ${storeCurrency}; launch analytics require a USD store until conversion is implemented`);
     const expectedRef = vaultRefForDomain(shopifyDomain);
-    const secretRef = await ctx.db.query("siteSecrets")
-      .withIndex("by_site_key", (q) => q.eq("siteId", siteId).eq("key", SHOPIFY_TOKEN_KEY)).first();
+    await requireUnaliasedVaultRef(ctx, siteId, expectedRef);
+    const secretRefs = await ctx.db.query("siteSecrets")
+      .withIndex("by_site_key", (q) => q.eq("siteId", siteId).eq("key", SHOPIFY_TOKEN_KEY)).take(2);
+    if (secretRefs.length !== 1) throw new Error("Shopify recurring vault reference requires re-verification");
+    const secretRef = secretRefs[0];
     if (!secretRef || secretRef.vaultRef !== expectedRef) throw new Error("Shopify recurring vault reference requires re-verification");
     const verifiedAt = Date.now();
     await ctx.db.patch(secretRef._id, { vaultRef: expectedRef });
@@ -124,13 +145,70 @@ export const verifyConnectedStore = mutation({
   },
 });
 
+export const beginEconomicsSync = mutation({
+  args: { siteId: v.id("sites"), attemptId: v.string(), sinceDays: v.number() },
+  handler: async (ctx, { siteId, attemptId, sinceDays }) => {
+    await requireServiceIdentity(ctx);
+    const site = await ctx.db.get(siteId);
+    if (!site?.shopifyDomain || site.sample === true) throw new Error("a real connected Shopify site is required before economics sync");
+    if (!/^[A-Za-z0-9-]{1,100}$/.test(attemptId)) throw new Error("invalid Shopify sync attempt identity");
+    if (!Number.isInteger(sinceDays) || sinceDays < 1 || sinceDays > 60) throw new Error("invalid Shopify sync coverage window");
+    const attemptedAt = Date.now();
+    await ctx.db.patch(siteId, {
+      shopifyEconomicsSyncStatus: "pending",
+      shopifyEconomicsSyncAttemptId: attemptId,
+      shopifyEconomicsSyncAttemptedAt: attemptedAt,
+      shopifyEconomicsSyncSinceDays: sinceDays,
+    });
+    await appendAudit(ctx, { siteId, event: "shopify_economics_sync_started", detail: { attemptId, sinceDays } });
+    return { attemptedAt };
+  },
+});
+
+export const finishEconomicsSync = mutation({
+  args: {
+    siteId: v.id("sites"),
+    attemptId: v.string(),
+    status: v.union(v.literal("current"), v.literal("failed"), v.literal("incomplete")),
+    productCount: v.optional(v.number()),
+    orderCount: v.optional(v.number()),
+  },
+  handler: async (ctx, { siteId, attemptId, status, productCount, orderCount }) => {
+    await requireServiceIdentity(ctx);
+    const site = await ctx.db.get(siteId);
+    if (!site || site.shopifyEconomicsSyncAttemptId !== attemptId) {
+      throw new Error("Shopify economics sync attempt was superseded");
+    }
+    const finishedAt = Date.now();
+    if (status === "current") {
+      if (!Number.isInteger(productCount) || productCount! < 0 || !Number.isInteger(orderCount) || orderCount! < 0) {
+        throw new Error("complete Shopify economics sync requires durable row counts");
+      }
+      await ctx.db.patch(siteId, {
+        shopifyEconomicsSyncStatus: status,
+        shopifyEconomicsSyncSucceededAt: finishedAt,
+        shopifyEconomicsSyncProductCount: productCount,
+        shopifyEconomicsSyncOrderCount: orderCount,
+      });
+    } else {
+      // Preserve the last successful timestamp/counts as evidence while latest-attempt state fails closed.
+      await ctx.db.patch(siteId, { shopifyEconomicsSyncStatus: status });
+    }
+    await appendAudit(ctx, {
+      siteId,
+      event: `shopify_economics_sync_${status}`,
+      detail: { attemptId, ...(productCount !== undefined ? { productCount } : {}), ...(orderCount !== undefined ? { orderCount } : {}) },
+    });
+    return { finishedAt, status };
+  },
+});
+
 export const update = mutation({
   args: {
     siteId: v.id("sites"),
     name: v.optional(v.string()),
     niche: v.optional(v.string()),
     status: v.optional(siteStatus),
-    shopifyDomain: v.optional(v.string()),
     customDomain: v.optional(v.string()),
     minKitPriceUsd: v.optional(v.number()),
     minBlendedMarginPct: v.optional(v.number()),

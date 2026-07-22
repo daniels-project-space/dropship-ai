@@ -28,6 +28,7 @@ function PortfolioInner() {
   const isEmpty = !loading && allSites.length === 0;
   const scope = isAll ? "all" : brand;
   const scopedName = sites[0]?.name;
+  const economicsNotCurrent = sites.filter((site) => site.shopifyEconomicsSyncState !== "current");
 
   return (
     <PageContainer wide>
@@ -82,6 +83,11 @@ function PortfolioInner() {
         </EmptyState>
       ) : (
         <>
+          {economicsNotCurrent.length > 0 && (
+            <p className="mb-5 rounded-xl border border-pending/30 bg-pending/5 px-4 py-3 text-[12px] leading-relaxed text-pending">
+              {economicsNotCurrent.length} visible brand{economicsNotCurrent.length === 1 ? " has" : "s have"} no complete current economics sync. Zero revenue and order values are not launch-ready evidence.
+            </p>
+          )}
           {/* the structured analytics command center */}
           <CommandCenter scope={scope} />
 

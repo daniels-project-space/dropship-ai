@@ -44,6 +44,14 @@ export default defineSchema({
     shopifyDomain: v.optional(v.string()),        // *.myshopify.com (store created manually)
     storeCurrency: v.optional(v.string()),        // ISO 4217 shop currency verified at connection
     shopifyAccessVerifiedAt: v.optional(v.number()), // recurring vault token resolved + identity read
+    // Recurring identity above is deliberately separate from complete, current economic facts.
+    shopifyEconomicsSyncStatus: v.optional(v.union(v.literal("pending"), v.literal("current"), v.literal("failed"), v.literal("incomplete"))),
+    shopifyEconomicsSyncAttemptId: v.optional(v.string()),
+    shopifyEconomicsSyncAttemptedAt: v.optional(v.number()),
+    shopifyEconomicsSyncSucceededAt: v.optional(v.number()),
+    shopifyEconomicsSyncSinceDays: v.optional(v.number()),
+    shopifyEconomicsSyncProductCount: v.optional(v.number()),
+    shopifyEconomicsSyncOrderCount: v.optional(v.number()),
     customDomain: v.optional(v.string()),
     // brand/margin guardrails (enforced by the brain)
     minKitPriceUsd: v.number(),                   // §8.2 never below this (e.g. 35–55)
@@ -59,7 +67,9 @@ export default defineSchema({
     siteId: v.id("sites"),
     key: v.string(),        // e.g. "SHOPIFY_ADMIN_TOKEN", "CJ_ACCESS_TOKEN"
     vaultRef: v.string(),   // pointer into the vault, NOT the secret value
-  }).index("by_site", ["siteId"]).index("by_site_key", ["siteId", "key"]),
+  }).index("by_site", ["siteId"])
+    .index("by_site_key", ["siteId", "key"])
+    .index("by_key_vault_ref", ["key", "vaultRef"]),
 
   // ── catalog ───────────────────────────────────────────────────────────────
   products: defineTable({

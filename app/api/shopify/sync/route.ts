@@ -23,12 +23,14 @@ export async function POST(req: Request) {
   }
 
   try {
-    const cfg = await resolveShopifyConfig(body.siteId); // vault token
-    const result = await syncShopify(body.siteId, cfg, { sinceDays: body.sinceDays ?? 60 });
+    const result = await syncShopify(body.siteId, () => resolveShopifyConfig(body.siteId!), { sinceDays: body.sinceDays ?? 60 });
+    if (result.economicsSync === "incomplete") {
+      return NextResponse.json({ ok: false, state: "incomplete", error: "bounded Shopify coverage is incomplete", ...result }, { status: 409 });
+    }
     return NextResponse.json({ ok: true, ...result });
   } catch (err) {
     return NextResponse.json(
-      { ok: false, state: "needs_reverification", error: err instanceof Error ? err.message : "sync failed" },
+      { ok: false, state: "failed", error: err instanceof Error ? err.message : "sync failed" },
       { status: 409 },
     );
   }

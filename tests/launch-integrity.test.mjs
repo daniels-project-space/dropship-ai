@@ -4,7 +4,9 @@ import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";
 import { creditAdjustmentState, eligibleUsdOrder } from "../src/lib/shopifyOrder.ts";
-import { listOrders } from "../src/lib/shopify.ts";
+import { listOrders, listOrdersWithCoverage } from "../src/lib/shopify.ts";
+import { shopifyEconomicsReadiness, SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS } from "../src/lib/shopifySyncState.ts";
+import { vaultRefForDomain } from "../src/lib/shopifyIdentity.ts";
 
 const modules = {
   "../convex/orders.ts": () => import("../convex/orders.ts"),
@@ -147,6 +149,30 @@ test("a seeded sample site cannot be transitioned into a live store", async () =
   assert.equal(stored.shopifyDomain, undefined);
 });
 
+test("operator CRUD cannot establish or mutate Shopify identity or economics proof", async () => {
+  const t = convexTest({ schema, modules });
+  const operator = t.withIdentity({ subject: "dropship-ai:operator" });
+  const createArgs = {
+    name: "Operator", niche: "test", minKitPriceUsd: 40, minBlendedMarginPct: 70,
+    distributionMode: "semi_manual", shopifyDomain: "bypass.myshopify.com",
+  };
+  await assert.rejects(() => operator.mutation(api.sites.create, createArgs), /Unexpected field/);
+  const siteId = await site(t, "No bypass", { status: "provisioning", storeCurrency: undefined });
+  for (const patch of [
+    { shopifyDomain: "bypass.myshopify.com" },
+    { storeCurrency: "USD" },
+    { shopifyAccessVerifiedAt: Date.now() },
+    { shopifyEconomicsSyncStatus: "current", shopifyEconomicsSyncSucceededAt: Date.now() },
+  ]) {
+    await assert.rejects(() => operator.mutation(api.sites.update, { siteId, ...patch }), /Unexpected field/);
+  }
+  const stored = await t.run((ctx) => ctx.db.get(siteId));
+  assert.equal(stored.shopifyDomain, undefined);
+  assert.equal(stored.storeCurrency, undefined);
+  assert.equal(stored.shopifyAccessVerifiedAt, undefined);
+  assert.equal(stored.shopifyEconomicsSyncStatus, undefined);
+});
+
 test("non-USD stores fail the explicit connection precondition", async () => {
   const t = convexTest({ schema, modules });
   const siteId = await site(t, "CAD", { status: "provisioning", storeCurrency: undefined });
@@ -164,6 +190,117 @@ test("first Shopify connection atomically writes recurring reference, identity a
   assert.equal(stored.storeCurrency, "USD");
   assert.equal(typeof stored.shopifyAccessVerifiedAt, "number");
   assert.deepEqual(refs.map(({ key, vaultRef }) => ({ key, vaultRef })), [{ key: "SHOPIFY_ADMIN_TOKEN", vaultRef: "shopify/ATOMIC" }]);
+});
+
+test("a verified site cannot rebind domains and preserves all prior tenant state", async () => {
+  const t = convexTest({ schema, modules });
+  const siteId = await site(t, "Bound", { status: "provisioning", storeCurrency: undefined });
+  await service(t).mutation(api.sites.connectStore, { siteId, shopifyDomain: "bound.myshopify.com", storeCurrency: "USD" });
+  await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "bound-current", sinceDays: 60 });
+  await service(t).mutation(api.sites.finishEconomicsSync, { siteId, attemptId: "bound-current", status: "current", productCount: 1, orderCount: 1 });
+  await t.run(async (ctx) => {
+    await ctx.db.insert("products", { siteId, title: "Kept", cjFromUsWarehouse: true, cogsUsd: 1, shippingUsd: 1, priceUsd: 10, status: "draft", createdAt: 1 });
+    await ctx.db.insert("orders", { siteId, shopifyOrderId: "kept-order", fulfillmentStatus: "received", createdAt: 1 });
+  });
+  const before = await t.run(async (ctx) => ({
+    site: await ctx.db.get(siteId),
+    refs: await ctx.db.query("siteSecrets").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect(),
+    products: await ctx.db.query("products").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect(),
+    orders: await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect(),
+  }));
+  await assert.rejects(
+    () => service(t).mutation(api.sites.connectStore, { siteId, shopifyDomain: "other.myshopify.com", storeCurrency: "USD" }),
+    /cannot be changed/,
+  );
+  const after = await t.run(async (ctx) => ({
+    site: await ctx.db.get(siteId),
+    refs: await ctx.db.query("siteSecrets").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect(),
+    products: await ctx.db.query("products").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect(),
+    orders: await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect(),
+  }));
+  assert.deepEqual(after, before);
+});
+
+test("aliased deterministic Shopify vault references cannot cross site boundaries", async () => {
+  assert.equal(vaultRefForDomain("repeat--hyphen.myshopify.com"), vaultRefForDomain("repeat-hyphen.myshopify.com"));
+  const t = convexTest({ schema, modules });
+  const siteA = await site(t, "Alias A", { status: "provisioning", storeCurrency: undefined });
+  const siteB = await site(t, "Alias B", { status: "provisioning", storeCurrency: undefined });
+  await service(t).mutation(api.sites.connectStore, { siteId: siteA, shopifyDomain: "repeat--hyphen.myshopify.com", storeCurrency: "USD" });
+  await assert.rejects(
+    () => service(t).mutation(api.sites.connectStore, { siteId: siteB, shopifyDomain: "repeat-hyphen.myshopify.com", storeCurrency: "USD" }),
+    /vault reference is already bound/,
+  );
+  const [storedB, refsB] = await t.run(async (ctx) => [
+    await ctx.db.get(siteB),
+    await ctx.db.query("siteSecrets").withIndex("by_site", (q) => q.eq("siteId", siteB)).collect(),
+  ]);
+  assert.equal(storedB.shopifyDomain, undefined);
+  assert.deepEqual(refsB, []);
+});
+
+test("economics sync records complete zero-commerce success and fails closed after a later failure", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: { orders: {
+    pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+  } } }), { status: 200, headers: { "content-type": "application/json" } });
+  try {
+    const emptyRead = await listOrdersWithCoverage({ shop: "zero.myshopify.com", accessToken: "fixture-token" });
+    assert.deepEqual(emptyRead, { items: [], complete: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const t = convexTest({ schema, modules });
+  const siteId = await site(t, "Zero", { status: "provisioning", storeCurrency: undefined });
+  await service(t).mutation(api.sites.connectStore, { siteId, shopifyDomain: "zero.myshopify.com", storeCurrency: "USD" });
+  await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "zero-success", sinceDays: 60 });
+  await service(t).mutation(api.sites.finishEconomicsSync, { siteId, attemptId: "zero-success", status: "current", productCount: 0, orderCount: 0 });
+  const successful = await t.run((ctx) => ctx.db.get(siteId));
+  assert.equal(successful.shopifyEconomicsSyncProductCount, 0);
+  assert.equal(successful.shopifyEconomicsSyncOrderCount, 0);
+  assert.equal(shopifyEconomicsReadiness(successful, successful.shopifyEconomicsSyncSucceededAt), "current");
+
+  await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "read-orders-denied", sinceDays: 60 });
+  await service(t).mutation(api.sites.finishEconomicsSync, { siteId, attemptId: "read-orders-denied", status: "failed" });
+  const failed = await t.run((ctx) => ctx.db.get(siteId));
+  assert.equal(failed.shopifyEconomicsSyncSucceededAt, successful.shopifyEconomicsSyncSucceededAt);
+  assert.equal(failed.shopifyEconomicsSyncOrderCount, 0);
+  assert.equal(shopifyEconomicsReadiness(failed), "failed");
+});
+
+test("stale and incomplete economics evidence never becomes current readiness", async () => {
+  const now = 1_800_000_000_000;
+  const identity = { shopifyDomain: "state.myshopify.com", storeCurrency: "USD", shopifyAccessVerifiedAt: now - 1 };
+  assert.equal(shopifyEconomicsReadiness({ ...identity, shopifyEconomicsSyncStatus: "current", shopifyEconomicsSyncSucceededAt: now - SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS - 1 }, now), "stale");
+  assert.equal(shopifyEconomicsReadiness({ ...identity, shopifyEconomicsSyncStatus: "incomplete", shopifyEconomicsSyncSucceededAt: now - 1 }, now), "incomplete");
+});
+
+test("missing read_orders fails and a 250-row hard-cap reports incomplete coverage", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ errors: [{ message: "Access denied for orders field. Required access: read_orders." }] }), { status: 200, headers: { "content-type": "application/json" } });
+    await assert.rejects(() => listOrdersWithCoverage({ shop: "scope.myshopify.com", accessToken: "fixture-token" }), /read_orders/);
+
+    let page = 0;
+    globalThis.fetch = async () => {
+      const offset = page++ * 50;
+      return new Response(JSON.stringify({ data: { orders: {
+        pageInfo: { hasNextPage: true, endCursor: `cursor-${page}` },
+        nodes: Array.from({ length: 50 }, (_, index) => ({
+          id: `gid://shopify/Order/${offset + index}`, name: `#${offset + index}`, createdAt: "2026-07-22T00:00:00Z",
+          displayFulfillmentStatus: "UNFULFILLED", displayFinancialStatus: "PAID", test: false, cancelledAt: null,
+          currentTotalPriceSet: { shopMoney: { amount: "0.00", currencyCode: "USD" } }, refunds: [], lineItems: { nodes: [] },
+        })),
+      } } }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const read = await listOrdersWithCoverage({ shop: "cap.myshopify.com", accessToken: "fixture-token" });
+    assert.equal(read.items.length, 250);
+    assert.equal(read.complete, false);
+    assert.equal(page, 5);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("bounded connected-site verification backfills legacy currency before current order economics", async () => {

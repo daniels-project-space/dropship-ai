@@ -21,6 +21,7 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
   const detail = useQuery(api.dashboard.brandDetail, { siteId: site._id as Id<"sites"> });
   const recurringVerified = !!site.shopifyDomain && site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt;
   const needsReverification = !!site.shopifyDomain && !recurringVerified;
+  const economicsSync = detail?.economicsReadiness ?? "pending";
 
   const [domain, setDomain] = useState(site.shopifyDomain ?? "");
   const [token, setToken] = useState("");
@@ -108,6 +109,9 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
       {recurringVerified ? (
         <div className="flex flex-col gap-3">
           <p className="font-mono text-[11px] text-ink-dim">{site.shopifyDomain}</p>
+          <p className={`rounded-lg border px-3 py-2 text-[11px] ${economicsSync === "current" ? "border-live/25 bg-live/5 text-live" : "border-pending/25 bg-pending/5 text-pending"}`}>
+            Economics sync: {economicsSync.replaceAll("_", " ")}. {economicsSync === "current" ? "Complete bounded catalogue and commerce writes are current." : "Revenue and zero-order values are not launch-ready evidence."}
+          </p>
           <div className="grid grid-cols-2 gap-2">
             <div className="rounded-lg border border-line-soft bg-void/30 px-3 py-2.5">
               <span className="label-eyebrow text-[9px]">Products</span>

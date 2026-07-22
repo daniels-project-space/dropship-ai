@@ -8,7 +8,8 @@ import { syncShopify } from "@/src/lib/shopifySync";
 import { convexClient, api } from "@/src/lib/convexClient";
 import type { Id } from "@/convex/_generated/dataModel";
 import { requireOperator } from "@/src/lib/auth/server";
-import { assertShopifyIdentity, isMyshopifyDomain, normalizeShopifyDomain, vaultRefForDomain } from "@/src/lib/shopifyIdentity";
+import { assertShopifyIdentity, vaultRefForDomain } from "@/src/lib/shopifyIdentity";
+import { parseShopifyConnectRequest } from "@/src/lib/shopifyConnectRequest";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,26 +17,15 @@ export const dynamic = "force-dynamic";
 export async function POST(req: Request) {
   const guard = await requireOperator(req);
   if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
-  let body: { siteId?: string; shopifyDomain?: string; accessToken?: string };
+  let rawBody: unknown;
   try {
-    body = await req.json();
+    rawBody = await req.json();
   } catch {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
-  const { siteId, accessToken } = body;
-  if (!siteId || !body.shopifyDomain || !accessToken) {
-    return NextResponse.json(
-      { error: "siteId, shopifyDomain and accessToken are all required" },
-      { status: 400 },
-    );
-  }
-  const shopifyDomain = normalizeShopifyDomain(body.shopifyDomain);
-  if (!isMyshopifyDomain(shopifyDomain)) {
-    return NextResponse.json(
-      { error: "shopifyDomain must be a *.myshopify.com domain" },
-      { status: 400 },
-    );
-  }
+  const body = parseShopifyConnectRequest(rawBody);
+  if (!body) return NextResponse.json({ error: "invalid Shopify connect request" }, { status: 400 });
+  const { siteId, shopifyDomain, accessToken } = body;
 
   // 1. Validate the token against the live store.
   let shop;
@@ -71,9 +61,11 @@ export async function POST(req: Request) {
   try {
     await convex.mutation(api.sites.connectStore, { siteId: sid, shopifyDomain, storeCurrency: shop.currencyCode });
   } catch (err) {
+    const message = err instanceof Error ? err.message : "failed to persist connection";
+    const conflict = /cannot be changed|already connected|already bound|ambiguous/.test(message);
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "failed to persist connection" },
-      { status: 500 },
+      { error: message },
+      { status: conflict ? 409 : 500 },
     );
   }
 
@@ -81,6 +73,19 @@ export async function POST(req: Request) {
   try {
     const cfg = { shop: shopifyDomain, accessToken: durableToken };
     const result = await syncShopify(siteId, cfg, { sinceDays: 60 });
+    if (result.economicsSync === "incomplete") {
+      return NextResponse.json({
+        ok: true,
+        connected: true,
+        recurringAccess: "verified",
+        economicsSync: "incomplete",
+        shop: { name: shop.name, domain: shop.myshopifyDomain },
+        currency: shop.currencyCode,
+        productCount: result.productCount,
+        orderCount: result.orderCount,
+        syncError: "Shopify pagination exceeded the bounded sync cap; economics remain not launch-ready",
+      }, { status: 207 });
+    }
     return NextResponse.json({
       ok: true,
       shop: { name: shop.name, domain: shop.myshopifyDomain },
@@ -89,6 +94,7 @@ export async function POST(req: Request) {
       orderCount: result.orderCount,
       lastSyncedAt: result.lastSyncedAt,
       recurringAccess: "verified",
+      economicsSync: result.economicsSync,
     });
   } catch (err) {
     // Connection persisted but sync failed — surface it so the operator can retry "Sync now".
@@ -97,6 +103,7 @@ export async function POST(req: Request) {
         ok: true,
         connected: true,
         recurringAccess: "verified",
+        economicsSync: "failed",
         shop: { name: shop.name, domain: shop.myshopifyDomain },
         currency: shop.currencyCode,
         syncError: err instanceof Error ? err.message : "initial sync failed",

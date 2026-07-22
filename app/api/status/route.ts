@@ -7,6 +7,7 @@ import { convexClient, api } from "@/src/lib/convexClient";
 import { getShop } from "@/src/lib/shopify";
 import { assertShopifyIdentity, SHOPIFY_TOKEN_KEY, vaultRefForDomain } from "@/src/lib/shopifyIdentity";
 import type { Id } from "@/convex/_generated/dataModel";
+import { shopifyEconomicsReadiness } from "@/src/lib/shopifySyncState";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -104,6 +105,14 @@ export async function GET(request: Request) {
       checks.push(verified === results.length
         ? { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: "verified", detail: `${verified} site(s) resolved recurring vault access and returned the expected USD myshopify identity`, next: "Re-run readiness after any token, domain, or store-currency change." }
         : { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: missing ? "blocked" : "unverified", detail: `${verified} verified; ${legacy} need re-verification; ${missing} missing recurring vault access; ${failed} failed current identity reads`, next: "Re-verify each affected site. A one-time operator token check is never counted as recurring access." });
+
+      const economics = sites.map((site) => shopifyEconomicsReadiness(site));
+      const current = economics.filter((state) => state === "current").length;
+      const states = ["pending", "stale", "failed", "incomplete", "needs_reverification"] as const;
+      const detail = states.map((state) => `${economics.filter((value) => value === state).length} ${state}`).join("; ");
+      checks.push(current === economics.length
+        ? { id: "shopify-economics", group: "Commerce", label: "Shopify economics sync", state: "verified", detail: `${current} site(s) have complete bounded catalogue and order writes within the freshness window`, next: "Keep economics sync current; an identity read alone does not refresh commerce evidence." }
+        : { id: "shopify-economics", group: "Commerce", label: "Shopify economics sync", state: "unverified", detail: `${current} current; ${detail}`, next: "Complete a fresh bounded catalogue and read_orders sync without truncation. Failed, stale, pending, or truncated attempts fail launch readiness closed." });
     }
   } catch {
     checks.push({ id: "shopify", group: "Commerce", label: "Shopify recurring access", state: "unverified", detail: "Per-site recurring access could not be read and proven", next: "Restore the authenticated Convex/vault read path and re-run readiness." });

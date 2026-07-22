@@ -6,7 +6,7 @@ export function normalizeShopifyDomain(raw: string): string {
 }
 
 export function isMyshopifyDomain(value: string): boolean {
-  return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(value);
+  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$/.test(value);
 }
 
 /** Derive the vault key name for a store domain: calm-collar.myshopify.com -> CALM_COLLAR. */

@@ -85,17 +85,20 @@ export interface ShopifyProduct {
   priceUsd: number; // first variant price (0 when no variant/price)
 }
 
+export type ShopifyBoundedRead<T> = { items: T[]; complete: boolean };
+
 /**
  * List products with cursor pagination up to `limit` (hard-capped at 250 to stay polite).
  * Pulls 50 per page. priceUsd is the first variant's price parsed to a number.
  */
-export async function listProducts(
+export async function listProductsWithCoverage(
   cfg: ShopifyClientConfig,
   { limit = 250 }: { limit?: number } = {},
-): Promise<ShopifyProduct[]> {
+): Promise<ShopifyBoundedRead<ShopifyProduct>> {
   const cap = Math.min(limit, 250);
   const out: ShopifyProduct[] = [];
   let after: string | null = null;
+  let hasMore = false;
   while (out.length < cap) {
     const pageSize = Math.min(50, cap - out.length);
     const data: {
@@ -121,11 +124,19 @@ export async function listProducts(
         priceUsd: Number(n.variants.nodes[0]?.price ?? 0) || 0,
       });
     }
-    if (!data.products.pageInfo.hasNextPage) break;
+    hasMore = data.products.pageInfo.hasNextPage;
+    if (!hasMore) break;
     after = data.products.pageInfo.endCursor;
     if (!after) break;
   }
-  return out.slice(0, cap);
+  return { items: out.slice(0, cap), complete: !hasMore };
+}
+
+export async function listProducts(
+  cfg: ShopifyClientConfig,
+  options: { limit?: number } = {},
+): Promise<ShopifyProduct[]> {
+  return (await listProductsWithCoverage(cfg, options)).items;
 }
 
 const ORDERS_QUERY = /* GraphQL */ `
@@ -175,15 +186,16 @@ export interface ShopifyOrder {
  * `read_all_orders` protected scope (app approval). 60 days is the safe default. Cursor-paginated,
  * 50 per page, capped at 250 orders.
  */
-export async function listOrders(
+export async function listOrdersWithCoverage(
   cfg: ShopifyClientConfig,
   { sinceDays = 60, limit = 250 }: { sinceDays?: number; limit?: number } = {},
-): Promise<ShopifyOrder[]> {
+): Promise<ShopifyBoundedRead<ShopifyOrder>> {
   const cap = Math.min(limit, 250);
   const sinceIso = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
   const queryFilter = `created_at:>=${sinceIso}`;
   const out: ShopifyOrder[] = [];
   let after: string | null = null;
+  let hasMore = false;
   while (out.length < cap) {
     const pageSize = Math.min(50, cap - out.length);
     const data: {
@@ -222,11 +234,19 @@ export async function listOrders(
         })),
       });
     }
-    if (!data.orders.pageInfo.hasNextPage) break;
+    hasMore = data.orders.pageInfo.hasNextPage;
+    if (!hasMore) break;
     after = data.orders.pageInfo.endCursor;
     if (!after) break;
   }
-  return out.slice(0, cap);
+  return { items: out.slice(0, cap), complete: !hasMore };
+}
+
+export async function listOrders(
+  cfg: ShopifyClientConfig,
+  options: { sinceDays?: number; limit?: number } = {},
+): Promise<ShopifyOrder[]> {
+  return (await listOrdersWithCoverage(cfg, options)).items;
 }
 
 const PRODUCT_CREATE = /* GraphQL */ `

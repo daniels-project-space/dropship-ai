@@ -12,6 +12,8 @@ import {
   verifyCjWebhookSignature,
 } from "../src/lib/cjWebhook.ts";
 import { getIndependentAccountTokenBundle, parseIndependentAccountTokenResponse, refreshAccessToken } from "../src/lib/cj.ts";
+import { selectCjOpenId } from "../src/lib/cjOpenId.ts";
+import { POST as postCjWebhook } from "../app/api/webhooks/cj/route.ts";
 
 const fixture = (name) => fs.readFile(new URL(`./fixtures/cj/${name}`, import.meta.url), "utf8");
 
@@ -88,4 +90,48 @@ test("CJ route source has one callback contract and no invented x-cj/siteId inpu
   const source = await fs.readFile(new URL("../app/api/webhooks/cj/route.ts", import.meta.url), "utf8");
   assert.match(source, /headers\.get\("sign"\)/);
   for (const stale of ["x-cj-signature", "x-cj-hmac-sha256", "x-cj-topic", "x-cj-webhook-id", "searchParams.get(\"siteId\")"]) assert.equal(source.includes(stale), false);
+});
+
+test("CJ webhook prefers durable openId and fails closed on a stale environment alias", async () => {
+  assert.equal(selectCjOpenId("22222", undefined), "22222");
+  assert.equal(selectCjOpenId(null, "11111"), "11111");
+  assert.throws(() => selectCjOpenId("22222", "11111"), (error) => {
+    assert.match(error.message, /configuration conflict/);
+    assert.equal(error.message.includes("22222"), false);
+    assert.equal(error.message.includes("11111"), false);
+    return true;
+  });
+
+  const original = {
+    fetch: globalThis.fetch,
+    openId: process.env.CJ_OPEN_ID,
+    vaultToken: process.env.VAULT_ACCESS_TOKEN,
+    vaultUrl: process.env.VAULT_URL,
+  };
+  process.env.CJ_OPEN_ID = "11111";
+  process.env.VAULT_ACCESS_TOKEN = "fixture-vault-capability";
+  process.env.VAULT_URL = "https://vault.test/api/query";
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ value: { value: "22222" } }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const raw = Buffer.from(await fixture("order-update.json"));
+    const response = await postCjWebhook(new Request("https://control.example/api/webhooks/cj", {
+      method: "POST",
+      headers: { sign: createHmac("sha256", "11111").update(raw).digest("base64") },
+      body: raw,
+    }));
+    assert.equal(response.status, 503);
+    assert.equal(calls, 1, "only the durable vault read occurs; no Convex writer runs");
+    const text = await response.text();
+    assert.equal(text.includes("11111"), false);
+    assert.equal(text.includes("22222"), false);
+  } finally {
+    globalThis.fetch = original.fetch;
+    for (const [key, value] of [["CJ_OPEN_ID", original.openId], ["VAULT_ACCESS_TOKEN", original.vaultToken], ["VAULT_URL", original.vaultUrl]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });

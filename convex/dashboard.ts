@@ -6,6 +6,7 @@ import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { matchesDataMode, type DataMode } from "./sampleScope";
 import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
+import { shopifyEconomicsReadiness } from "../src/lib/shopifySyncState";
 
 export const portfolio = query({
   args: { dataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))) },
@@ -39,6 +40,7 @@ export const portfolio = query({
           distributionMode: site.distributionMode,
           shopifyDomain: site.shopifyDomain ?? null,
           shopifyNeedsReverification: !!site.shopifyDomain && (site.storeCurrency !== "USD" || !site.shopifyAccessVerifiedAt),
+          shopifyEconomicsSyncState: shopifyEconomicsReadiness(site),
           customDomain: site.customDomain ?? null,
           killDate: site.killDate ?? null,
           pendingActionCount: pendingActions.length,
@@ -144,9 +146,7 @@ export const siteSummary = query({
 
     return {
       site,
-      economicsReadiness: !site.shopifyDomain ? "not_connected" as const
-        : site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt ? "verified_usd" as const
-          : "needs_reverification" as const,
+      economicsReadiness: shopifyEconomicsReadiness(site),
       pendingActionCount: pending.length,
       activeProductCount: activeProducts.length,
     };
@@ -447,9 +447,7 @@ export const brandDetail = query({
 
     return {
       site,
-      economicsReadiness: !site.shopifyDomain ? "not_connected" as const
-        : site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt ? "verified_usd" as const
-          : "needs_reverification" as const,
+      economicsReadiness: shopifyEconomicsReadiness(site),
       productCount: allProducts.length,
       activeProductCount: activeProducts.length,
       pendingActionCount: pendingActions.length,

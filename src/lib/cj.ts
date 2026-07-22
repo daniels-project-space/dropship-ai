@@ -4,6 +4,7 @@
 import { assertCjTokenBundleWriterConfigured, getKey, replaceCjTokenBundleAtomically } from "./vault";
 import { CjStagingFailureError } from "./cjStagingState";
 import { CjTokenCoordinator, type CjTokenBundle, type RotatedCjTokenPair } from "./cjTokenRotation";
+import { selectCjOpenId } from "./cjOpenId";
 
 const CJ_BASE = "https://developers.cjdropshipping.com/api2.0/v1";
 
@@ -17,7 +18,7 @@ async function readTokenBundle(): Promise<CjTokenBundle> {
   ]);
   const accessToken = vaultAccess ?? process.env.CJ_ACCESS_TOKEN;
   const refreshToken = vaultRefresh ?? process.env.CJ_REFRESH_TOKEN;
-  const openId = vaultOpenId ?? process.env.CJ_OPEN_ID;
+  const openId = selectCjOpenId(vaultOpenId, process.env.CJ_OPEN_ID);
   if (!accessToken) throw new Error("cj: no access token — add CJ_ACCESS_TOKEN to the server vault/control plane");
   if (!openId) throw new Error("cj: no openId — reconnect the independent account so CJ_OPEN_ID is retained atomically");
   return {

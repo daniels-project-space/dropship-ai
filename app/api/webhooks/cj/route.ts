@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { NextResponse } from "next/server";
 import { convexClient, api } from "@/src/lib/convexClient";
 import { getKey } from "@/src/lib/vault";
+import { selectCjOpenId } from "@/src/lib/cjOpenId";
 import {
   CJ_WEBHOOK_MAX_BYTES,
   CJ_WEBHOOK_SUCCESS,
@@ -32,9 +33,8 @@ async function beforeDeadline<T>(promise: Promise<T>, deadline: number): Promise
 }
 
 async function cjOpenId(deadline: number): Promise<string | null> {
-  const configured = process.env.CJ_OPEN_ID;
-  if (configured) return configured;
-  return beforeDeadline(getKey("cj", "CJ_OPEN_ID").catch(() => null), deadline);
+  const durable = await beforeDeadline(getKey("cj", "CJ_OPEN_ID"), deadline);
+  return selectCjOpenId(durable, process.env.CJ_OPEN_ID);
 }
 
 export async function POST(request: Request) {

@@ -11,9 +11,9 @@ import type { BrandDetail } from "./types";
 export function OverviewTab({ siteId, detail }: { siteId: Id<"sites">; detail?: BrandDetail | undefined }) {
   return (
     <>
-      {detail?.economicsReadiness === "needs_reverification" && (
+      {detail && detail.economicsReadiness !== "current" && (
         <div className="mb-5 rounded-xl border border-pending/30 bg-pending/5 px-4 py-3 text-[12px] leading-relaxed text-pending">
-          Shopify recurring access, store currency, and current order economics need re-verification. Zero values below are not launch-ready revenue evidence.
+          Shopify economics sync is {detail.economicsReadiness.replaceAll("_", " ")}. Zero values below are not launch-ready revenue evidence until a complete current catalogue and order sync succeeds.
         </div>
       )}
       <CommandCenter scope={siteId} />
