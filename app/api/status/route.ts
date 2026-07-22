@@ -7,13 +7,50 @@ import { convexClient, api } from "@/src/lib/convexClient";
 import { getShop } from "@/src/lib/shopify";
 import { assertShopifyIdentity, SHOPIFY_TOKEN_KEY, vaultRefForDomain } from "@/src/lib/shopifyIdentity";
 import type { Id } from "@/convex/_generated/dataModel";
-import { shopifyEconomicsReadiness } from "@/src/lib/shopifySyncState";
+import {
+  shopifyEconomicsReadiness,
+  SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS,
+  SHOPIFY_ECONOMICS_DAY_MS,
+  SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+  SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS,
+  type ShopifyEconomicsReadiness,
+  type ShopifySiteSyncFacts,
+} from "@/src/lib/shopifySyncState";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type ReadinessState = "configured" | "unverified" | "verified" | "blocked";
 type CheckItem = { id: string; group: string; label: string; state: ReadinessState; detail: string; next: string };
+
+/** The launch endpoint keeps an independent exact-proof fence around the shared capability. */
+export function shopifyEconomicsStatusReadiness(site: ShopifySiteSyncFacts): ShopifyEconomicsReadiness {
+  const readiness = shopifyEconomicsReadiness(site);
+  if (readiness !== "current") return readiness;
+  const attemptId = site.shopifyEconomicsSyncAttemptId;
+  const attemptedAt = site.shopifyEconomicsSyncAttemptedAt;
+  const cutoffAt = site.shopifyEconomicsSyncOrderCutoffAt;
+  const succeededAt = site.shopifyEconomicsSyncSucceededAt;
+  const expiresAt = site.shopifyEconomicsSyncExpiresAt;
+  const exactAtomicProof = site.shopifyEconomicsSnapshotProtocolVersion === SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION
+    && typeof attemptId === "string"
+    && /^[A-Za-z0-9-]{1,100}$/.test(attemptId)
+    && site.shopifyEconomicsSyncSinceDays === SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS
+    && Number.isFinite(attemptedAt)
+    && Number.isFinite(cutoffAt)
+    && Number.isFinite(succeededAt)
+    && Number.isFinite(expiresAt)
+    && cutoffAt === attemptedAt! - SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS * SHOPIFY_ECONOMICS_DAY_MS
+    && succeededAt! >= attemptedAt!
+    && expiresAt === succeededAt! + SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS
+    && Number.isInteger(site.shopifyEconomicsSyncProductCount)
+    && site.shopifyEconomicsSyncProductCount! >= 0
+    && Number.isInteger(site.shopifyEconomicsSyncOrderCount)
+    && site.shopifyEconomicsSyncOrderCount! >= 0
+    && site.shopifyEconomicsSyncExpiredAt === undefined
+    && site.shopifyEconomicsSyncExpiredAttemptId === undefined;
+  return exactAtomicProof ? "current" : "incomplete";
+}
 
 async function vaultGetValue(service: string, keyName: string): Promise<string | null> {
   try { return await getKey(service, keyName); } catch { return null; }
@@ -106,11 +143,7 @@ export async function GET(request: Request) {
         ? { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: "verified", detail: `${verified} site(s) resolved recurring vault access and returned the expected USD myshopify identity`, next: "Re-run readiness after any token, domain, or store-currency change." }
         : { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: missing ? "blocked" : "unverified", detail: `${verified} verified; ${legacy} need re-verification; ${missing} missing recurring vault access; ${failed} failed current identity reads`, next: "Re-verify each affected site. A one-time operator token check is never counted as recurring access." });
 
-      // Keep the launch endpoint's own canonical-window fence even if the shared reducer is
-      // later reused for a diagnostic display state.
-      const economics = sites.map((site) => site.shopifyEconomicsSyncSinceDays === 60
-        ? shopifyEconomicsReadiness(site)
-        : "incomplete" as const);
+      const economics = sites.map(shopifyEconomicsStatusReadiness);
       const current = economics.filter((state) => state === "current").length;
       const states = ["pending", "stale", "failed", "incomplete", "needs_reverification"] as const;
       const detail = states.map((state) => `${economics.filter((value) => value === state).length} ${state}`).join("; ");

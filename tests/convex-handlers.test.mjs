@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import test from "node:test";
+import "./helpers/unref-long-convex-timers.mjs";
 import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";

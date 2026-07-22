@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
+import "./helpers/unref-long-convex-timers.mjs";
 import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";
-import { shopifyEconomicsReadiness } from "../src/lib/shopifySyncState.ts";
+import {
+  shopifyEconomicsReadiness,
+  SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+  SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS,
+} from "../src/lib/shopifySyncState.ts";
+import { shopifyEconomicsStatusReadiness } from "../app/api/status/route.ts";
 
 const modules = {
   "../convex/sites.ts": () => import("../convex/sites.ts"),
@@ -13,9 +19,10 @@ const modules = {
   "../convex/orders.ts": () => import("../convex/orders.ts"),
   "../convex/products.ts": () => import("../convex/products.ts"),
   "../convex/shopifyEconomics.ts": () => import("../convex/shopifyEconomics.ts"),
+  "../convex/shopifyEconomicsExpiry.ts": () => import("../convex/shopifyEconomicsExpiry.ts"),
   "../convex/_generated/api.js": () => import("../convex/_generated/api.js"),
 };
-const { api } = apiModule;
+const { api, internal } = apiModule;
 const schema = schemaModule.default ?? schemaModule;
 const service = (t) => t.withIdentity({ subject: "dropship-ai:service" });
 
@@ -57,15 +64,202 @@ test("atomic snapshot success derives zero-inclusive counts from its own writes"
   ]);
   assert.equal(site.shopifyEconomicsSyncProductCount, products.length);
   assert.equal(site.shopifyEconomicsSyncOrderCount, orders.length);
+  assert.equal(site.shopifyEconomicsSnapshotProtocolVersion, SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION);
+  assert.equal(site.shopifyEconomicsSyncOrderCutoffAt, site.shopifyEconomicsSyncAttemptedAt - 60 * 24 * 60 * 60 * 1000);
+  assert.equal(site.shopifyEconomicsSyncSucceededAt, result.finishedAt);
+  assert.equal(site.shopifyEconomicsSyncExpiresAt, result.finishedAt + SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS);
+  assert.equal(site.shopifyEconomicsSyncExpiredAt, undefined);
+  assert.equal(site.shopifyEconomicsSyncExpiredAttemptId, undefined);
   assert.equal(products[0].shopifyEconomicsSnapshotAttemptId, "atomic-counts");
   assert.equal(orders[0].shopifyEconomicsSnapshotAttemptId, "atomic-counts");
-  assert.equal(shopifyEconomicsReadiness(site, result.finishedAt), "current");
+  assert.equal(shopifyEconomicsReadiness(site), "current");
+  const scheduled = await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect());
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].name, "shopifyEconomicsExpiry:expireEconomicsSnapshot");
+  assert.equal(scheduled[0].scheduledTime, site.shopifyEconomicsSyncExpiresAt);
+  assert.deepEqual(scheduled[0].args, [{
+    siteId,
+    attemptId: "atomic-counts",
+    protocolVersion: SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+    succeededAt: site.shopifyEconomicsSyncSucceededAt,
+    expiresAt: site.shopifyEconomicsSyncExpiresAt,
+  }]);
   await assert.rejects(
     () => service(t).mutation(api.sites.commitEconomicsSnapshot, {
       siteId, attemptId: "atomic-counts", products: [], orders: [], productCount: 999,
     }),
     /Unexpected field/,
   );
+});
+
+test("legacy current rows without atomic generation proof are incomplete and never verified zero commerce", async () => {
+  const t = convexTest({ schema, modules });
+  const now = Date.now();
+  const siteId = await t.run(async (ctx) => {
+    const id = await ctx.db.insert("sites", {
+      name: "Legacy Current", niche: "test", status: "active", storeCurrency: "USD",
+      minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual",
+      createdAt: now, shopifyDomain: "legacy-current.myshopify.com", shopifyAccessVerifiedAt: now,
+      shopifyEconomicsSyncStatus: "current", shopifyEconomicsSyncAttemptId: "legacy-current",
+      shopifyEconomicsSyncSucceededAt: now, shopifyEconomicsSyncSinceDays: 60,
+      shopifyEconomicsSyncProductCount: 0, shopifyEconomicsSyncOrderCount: 1,
+    });
+    await ctx.db.insert("orders", {
+      siteId: id, shopifyOrderId: "gid://shopify/Order/legacy-current", fulfillmentStatus: "received",
+      currencyCode: "USD", currentTotal: 99, financialStatus: "PAID", test: false,
+      cancelled: false, creditAdjustmentState: "none", createdAt: now,
+      shopifyEconomicsSnapshotAttemptId: "former-separate-writer",
+    });
+    return id;
+  });
+
+  const site = await t.run((ctx) => ctx.db.get(siteId));
+  const [portfolio, timeseries, funnel, brand, summary] = await Promise.all([
+    service(t).query(api.dashboard.portfolio, {}),
+    service(t).query(api.dashboard.timeseries, { scope: siteId, metric: "revenue", days: 30 }),
+    service(t).query(api.dashboard.funnel, { scope: siteId, days: 30 }),
+    service(t).query(api.dashboard.brandDetail, { siteId }),
+    service(t).query(api.dashboard.siteSummary, { siteId }),
+  ]);
+  assert.equal(shopifyEconomicsReadiness(site), "incomplete");
+  assert.equal(shopifyEconomicsStatusReadiness(site), "incomplete");
+  assert.equal(portfolio.sites[0].shopifyEconomicsSyncState, "incomplete");
+  assert.equal(portfolio.sites[0].ordersAwaitingFulfillment, 0);
+  assert.deepEqual({ verified: timeseries.commerceVerified, total: timeseries.total }, { verified: false, total: 0 });
+  assert.equal(funnel.commerceVerified, false);
+  assert.equal(brand.economicsReadiness, "incomplete");
+  assert.deepEqual({ orderCount: brand.orderCount, revenueUsd: brand.revenueUsd }, { orderCount: 0, revenueUsd: 0 });
+  assert.equal(summary.economicsReadiness, "incomplete");
+});
+
+test("durable expiry alone invalidates every reactive commerce surface after a stopped sync", async () => {
+  const t = convexTest({ schema, modules });
+  const siteId = await connectedSite(t, "Stopped Sync");
+  await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "stopped-sync", sinceDays: 60 });
+  await service(t).mutation(api.sites.commitEconomicsSnapshot, {
+    siteId, attemptId: "stopped-sync", products: [snapshotProduct("expiry")],
+    orders: [snapshotOrder("expiry")],
+  });
+  const [beforeSite, beforeProduct, beforeOrder, scheduled] = await t.run(async (ctx) => [
+    await ctx.db.get(siteId),
+    await ctx.db.query("products").withIndex("by_site", (q) => q.eq("siteId", siteId)).first(),
+    await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", siteId)).first(),
+    await ctx.db.system.query("_scheduled_functions").collect(),
+  ]);
+  assert.equal(shopifyEconomicsReadiness(beforeSite), "current");
+  assert.equal(scheduled.length, 1);
+
+  mock.method(Date, "now", () => beforeSite.shopifyEconomicsSyncExpiresAt);
+  try {
+    const transition = await t.mutation(
+      internal.shopifyEconomicsExpiry.expireEconomicsSnapshot,
+      scheduled[0].args[0],
+    );
+    assert.deepEqual(transition, { expired: true, reason: "expired" });
+  } finally {
+    mock.restoreAll();
+  }
+
+  const [afterSite, afterProduct, afterOrder, portfolio, timeseries, funnel, brand, summary, expiryAudits] = await Promise.all([
+    t.run((ctx) => ctx.db.get(siteId)),
+    t.run((ctx) => ctx.db.get(beforeProduct._id)),
+    t.run((ctx) => ctx.db.get(beforeOrder._id)),
+    service(t).query(api.dashboard.portfolio, {}),
+    service(t).query(api.dashboard.timeseries, { scope: siteId, metric: "revenue", days: 30 }),
+    service(t).query(api.dashboard.funnel, { scope: siteId, days: 30 }),
+    service(t).query(api.dashboard.brandDetail, { siteId }),
+    service(t).query(api.dashboard.siteSummary, { siteId }),
+    t.run((ctx) => ctx.db.query("auditLog").withIndex("by_site_at", (q) => q.eq("siteId", siteId)).collect()),
+  ]);
+  assert.equal(afterSite.shopifyEconomicsSyncStatus, "current");
+  assert.equal(afterSite.shopifyEconomicsSyncExpiredAt, beforeSite.shopifyEconomicsSyncExpiresAt);
+  assert.equal(afterSite.shopifyEconomicsSyncExpiredAttemptId, "stopped-sync");
+  assert.equal(shopifyEconomicsReadiness(afterSite), "stale");
+  assert.equal(shopifyEconomicsStatusReadiness(afterSite), "stale");
+  assert.equal(portfolio.sites[0].shopifyEconomicsSyncState, "stale");
+  assert.equal(portfolio.sites[0].ordersAwaitingFulfillment, 0);
+  assert.deepEqual({ verified: timeseries.commerceVerified, total: timeseries.total }, { verified: false, total: 0 });
+  assert.equal(funnel.commerceVerified, false);
+  assert.equal(brand.economicsReadiness, "stale");
+  assert.deepEqual({ orderCount: brand.orderCount, revenueUsd: brand.revenueUsd }, { orderCount: 0, revenueUsd: 0 });
+  assert.equal(summary.economicsReadiness, "stale");
+  assert.deepEqual(afterProduct, beforeProduct);
+  assert.deepEqual(afterOrder, beforeOrder);
+  assert.equal(expiryAudits.filter((row) => row.event === "shopify_economics_sync_expired").length, 1);
+});
+
+test("old and repeated expiry transitions cannot demote a newer generation", async () => {
+  const t = convexTest({ schema, modules });
+  const siteId = await connectedSite(t, "Expiry Fence");
+  await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "expiry-old", sinceDays: 60 });
+  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "expiry-old", products: [], orders: [] });
+  const oldScheduled = (await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect()))[0];
+  await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "expiry-new", sinceDays: 60 });
+  await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: "expiry-new", products: [], orders: [] });
+  const scheduled = await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect());
+  const newScheduled = scheduled.find((row) => row.args[0].attemptId === "expiry-new");
+  assert.equal(scheduled.length, 2);
+
+  mock.method(Date, "now", () => Math.max(oldScheduled.args[0].expiresAt, newScheduled.args[0].expiresAt));
+  try {
+    assert.deepEqual(
+      await t.mutation(internal.shopifyEconomicsExpiry.expireEconomicsSnapshot, oldScheduled.args[0]),
+      { expired: false, reason: "superseded" },
+    );
+    const stillNew = await t.run((ctx) => ctx.db.get(siteId));
+    assert.equal(stillNew.shopifyEconomicsSyncAttemptId, "expiry-new");
+    assert.equal(shopifyEconomicsReadiness(stillNew), "current");
+    assert.deepEqual(
+      await t.mutation(internal.shopifyEconomicsExpiry.expireEconomicsSnapshot, newScheduled.args[0]),
+      { expired: true, reason: "expired" },
+    );
+    assert.deepEqual(
+      await t.mutation(internal.shopifyEconomicsExpiry.expireEconomicsSnapshot, newScheduled.args[0]),
+      { expired: false, reason: "already_expired" },
+    );
+  } finally {
+    mock.restoreAll();
+  }
+  const [site, audit] = await t.run(async (ctx) => [
+    await ctx.db.get(siteId),
+    await ctx.db.query("auditLog").withIndex("by_site_at", (q) => q.eq("siteId", siteId)).collect(),
+  ]);
+  assert.equal(shopifyEconomicsReadiness(site), "stale");
+  assert.equal(audit.filter((row) => row.event === "shopify_economics_sync_expired").length, 1);
+});
+
+test("expiry leaves observation-invalidated, pending, failed, and incomplete attempts unchanged", async () => {
+  for (const state of ["observation", "pending", "failed", "incomplete"]) {
+    const t = convexTest({ schema, modules });
+    const siteId = await connectedSite(t, `Expiry ${state}`);
+    await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: `${state}-old`, sinceDays: 60 });
+    await service(t).mutation(api.sites.commitEconomicsSnapshot, { siteId, attemptId: `${state}-old`, products: [], orders: [] });
+    const scheduled = (await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect()))[0];
+    if (state === "observation") {
+      await service(t).mutation(api.webhooks.recordShopifyOrder, {
+        siteId, deliveryId: "expiry-observation", topic: "orders/create", payloadHash: "expiry-observation-hash",
+        ...snapshotOrder("expiry-observation"),
+      });
+    } else {
+      await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: `${state}-new`, sinceDays: 60 });
+      if (state === "failed" || state === "incomplete") {
+        await service(t).mutation(api.sites.markEconomicsSyncNotCurrent, {
+          siteId, attemptId: `${state}-new`, status: state,
+        });
+      }
+    }
+    const before = await t.run((ctx) => ctx.db.get(siteId));
+    mock.method(Date, "now", () => scheduled.args[0].expiresAt);
+    try {
+      await t.mutation(internal.shopifyEconomicsExpiry.expireEconomicsSnapshot, scheduled.args[0]);
+    } finally {
+      mock.restoreAll();
+    }
+    const after = await t.run((ctx) => ctx.db.get(siteId));
+    assert.deepEqual(after, before);
+    assert.equal(after.shopifyEconomicsSyncExpiredAt, undefined);
+    assert.equal(after.shopifyEconomicsSyncStatus, state === "observation" ? "incomplete" : state);
+  }
 });
 
 test("one-day diagnostics and superseded attempts cannot write or finish a snapshot", async () => {
@@ -153,7 +347,7 @@ test("a later complete zero snapshot archives missing provider products and excl
   assert.equal(storedProviderOrder.trackingNumber, "tracking-kept");
   assert.equal(storedProviderOrder.shopifyEconomicsSnapshotAttemptId, undefined);
   assert.equal(localProduct.status, "active");
-  assert.equal(shopifyEconomicsReadiness(storedSite, zero.finishedAt), "current");
+  assert.equal(shopifyEconomicsReadiness(storedSite), "current");
   const revenue = await service(t).query(api.dashboard.timeseries, { scope: siteId, metric: "revenue", days: 30 });
   assert.equal(revenue.commerceVerified, true);
   assert.equal(revenue.total, 0);

@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import "./helpers/unref-long-convex-timers.mjs";
 import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";
 import { creditAdjustmentState, eligibleUsdOrder } from "../src/lib/shopifyOrder.ts";
 import { listOrders, listOrdersWithCoverage } from "../src/lib/shopify.ts";
-import { shopifyEconomicsReadiness, SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS } from "../src/lib/shopifySyncState.ts";
+import {
+  shopifyEconomicsReadiness,
+  SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+  SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS,
+} from "../src/lib/shopifySyncState.ts";
 import { vaultRefForDomain } from "../src/lib/shopifyIdentity.ts";
 
 const modules = {
@@ -14,6 +19,7 @@ const modules = {
   "../convex/dashboard.ts": () => import("../convex/dashboard.ts"),
   "../convex/sites.ts": () => import("../convex/sites.ts"),
   "../convex/shopifyEconomics.ts": () => import("../convex/shopifyEconomics.ts"),
+  "../convex/shopifyEconomicsExpiry.ts": () => import("../convex/shopifyEconomicsExpiry.ts"),
   "../convex/audit.ts": () => import("../convex/audit.ts"),
   "../convex/_generated/api.js": () => import("../convex/_generated/api.js"),
 };
@@ -34,6 +40,19 @@ function shopifyDelivery(siteId, deliveryId, overrides = {}) {
     shopifyOrderId: "gid://shopify/Order/shared", currencyCode: "USD", currentTotal: 50,
     financialStatus: "PAID", test: false, cancelled: false, creditAdjustmentState: "none",
     fulfillmentStatus: "received", createdAt: Date.now(), ...overrides,
+  };
+}
+
+function atomicEconomicsProof(attemptId, succeededAt, productCount, orderCount) {
+  const attemptedAt = succeededAt - 1_000;
+  return {
+    shopifyEconomicsSyncStatus: "current", shopifyEconomicsSyncAttemptId: attemptId,
+    shopifyEconomicsSyncAttemptedAt: attemptedAt,
+    shopifyEconomicsSyncOrderCutoffAt: attemptedAt - 60 * 24 * 60 * 60 * 1000,
+    shopifyEconomicsSyncSinceDays: 60, shopifyEconomicsSyncSucceededAt: succeededAt,
+    shopifyEconomicsSyncExpiresAt: succeededAt + SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS,
+    shopifyEconomicsSyncProductCount: productCount, shopifyEconomicsSyncOrderCount: orderCount,
+    shopifyEconomicsSnapshotProtocolVersion: SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
   };
 }
 
@@ -109,11 +128,10 @@ test("partial Shopify webhook updates preserve the observed current total", asyn
 test("dashboard revenue and conversion count only paid real unadjusted USD orders", async () => {
   const t = convexTest({ schema, modules });
   const snapshotAttemptId = "economics-proof";
+  const snapshotSucceededAt = Date.now();
   const siteId = await site(t, "Economics", {
     shopifyDomain: "economics.myshopify.com", shopifyAccessVerifiedAt: Date.now(),
-    shopifyEconomicsSyncStatus: "current", shopifyEconomicsSyncAttemptId: snapshotAttemptId,
-    shopifyEconomicsSyncSinceDays: 60, shopifyEconomicsSyncSucceededAt: Date.now(),
-    shopifyEconomicsSyncProductCount: 0, shopifyEconomicsSyncOrderCount: 6,
+    ...atomicEconomicsProof(snapshotAttemptId, snapshotSucceededAt, 0, 6),
   });
   const now = Date.now();
   const base = { siteId, fulfillmentStatus: "received", currencyCode: "USD", currentTotal: 40, test: false, cancelled: false, creditAdjustmentState: "none", shopifyEconomicsSnapshotAttemptId: snapshotAttemptId, createdAt: now, sample: false };
@@ -266,7 +284,7 @@ test("economics sync records complete zero-commerce success and fails closed aft
   const successful = await t.run((ctx) => ctx.db.get(siteId));
   assert.equal(successful.shopifyEconomicsSyncProductCount, 0);
   assert.equal(successful.shopifyEconomicsSyncOrderCount, 0);
-  assert.equal(shopifyEconomicsReadiness(successful, successful.shopifyEconomicsSyncSucceededAt), "current");
+  assert.equal(shopifyEconomicsReadiness(successful), "current");
 
   await service(t).mutation(api.sites.beginEconomicsSync, { siteId, attemptId: "read-orders-denied", sinceDays: 60 });
   await service(t).mutation(api.sites.markEconomicsSyncNotCurrent, { siteId, attemptId: "read-orders-denied", status: "failed" });
@@ -280,11 +298,15 @@ test("stale and incomplete economics evidence never becomes current readiness", 
   const now = 1_800_000_000_000;
   const identity = {
     shopifyDomain: "state.myshopify.com", storeCurrency: "USD", shopifyAccessVerifiedAt: now - 1,
-    shopifyEconomicsSyncAttemptId: "state-proof", shopifyEconomicsSyncSinceDays: 60,
-    shopifyEconomicsSyncProductCount: 0, shopifyEconomicsSyncOrderCount: 0,
+    ...atomicEconomicsProof("state-proof", now, 0, 0),
   };
-  assert.equal(shopifyEconomicsReadiness({ ...identity, shopifyEconomicsSyncStatus: "current", shopifyEconomicsSyncSucceededAt: now - SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS - 1 }, now), "stale");
-  assert.equal(shopifyEconomicsReadiness({ ...identity, shopifyEconomicsSyncStatus: "incomplete", shopifyEconomicsSyncSucceededAt: now - 1 }, now), "incomplete");
+  assert.equal(shopifyEconomicsReadiness(identity), "current");
+  assert.equal(shopifyEconomicsReadiness({
+    ...identity,
+    shopifyEconomicsSyncExpiredAt: identity.shopifyEconomicsSyncExpiresAt,
+    shopifyEconomicsSyncExpiredAttemptId: "state-proof",
+  }), "stale");
+  assert.equal(shopifyEconomicsReadiness({ ...identity, shopifyEconomicsSyncStatus: "incomplete" }), "incomplete");
 });
 
 test("missing read_orders fails and a 250-row hard-cap reports incomplete coverage", async () => {

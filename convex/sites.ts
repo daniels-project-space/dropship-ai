@@ -5,6 +5,13 @@ import { appendAudit } from "./audit";
 import { isMyshopifyDomain, SHOPIFY_TOKEN_KEY, vaultRefForDomain } from "../src/lib/shopifyIdentity";
 import type { MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
+import { internal } from "./_generated/api";
+import {
+  SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS,
+  SHOPIFY_ECONOMICS_DAY_MS,
+  SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+  SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS,
+} from "../src/lib/shopifySyncState";
 
 const siteStatus = v.union(
   v.literal("provisioning"),
@@ -20,8 +27,6 @@ const snapshotFulfillmentStatus = v.union(
   v.literal("received"), v.literal("shipped"),
 );
 const snapshotCreditAdjustmentState = v.union(v.literal("none"), v.literal("partial"), v.literal("full"));
-const SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS = 60;
-const DAY_MS = 24 * 60 * 60 * 1000;
 const SHOPIFY_ECONOMICS_SNAPSHOT_CAP = 250;
 const ADVANCED_ORDER = { received: 0, sent_to_cj: 1, shipped: 2, delivered: 3, error: 0 } as const;
 
@@ -166,13 +171,17 @@ export const beginEconomicsSync = mutation({
     if (!/^[A-Za-z0-9-]{1,100}$/.test(attemptId)) throw new Error("invalid Shopify sync attempt identity");
     if (!Number.isInteger(sinceDays) || sinceDays < 1 || sinceDays > 60) throw new Error("invalid Shopify sync coverage window");
     const attemptedAt = Date.now();
-    const orderCutoffAt = attemptedAt - sinceDays * DAY_MS;
+    const orderCutoffAt = attemptedAt - sinceDays * SHOPIFY_ECONOMICS_DAY_MS;
     await ctx.db.patch(siteId, {
       shopifyEconomicsSyncStatus: "pending",
       shopifyEconomicsSyncAttemptId: attemptId,
       shopifyEconomicsSyncAttemptedAt: attemptedAt,
       shopifyEconomicsSyncOrderCutoffAt: orderCutoffAt,
       shopifyEconomicsSyncSinceDays: sinceDays,
+      shopifyEconomicsSnapshotProtocolVersion: undefined,
+      shopifyEconomicsSyncExpiresAt: undefined,
+      shopifyEconomicsSyncExpiredAt: undefined,
+      shopifyEconomicsSyncExpiredAttemptId: undefined,
       shopifyEconomicsSyncInvalidatedAt: undefined,
       shopifyEconomicsSyncInvalidationReason: undefined,
     });
@@ -201,7 +210,15 @@ export const commitEconomicsSnapshot = mutation({
       fulfillmentStatus: snapshotFulfillmentStatus, createdAt: v.number(),
     })),
   },
-  handler: async (ctx, { siteId, attemptId, products, orders }) => {
+  handler: async (ctx, { siteId, attemptId, products, orders }): Promise<{
+    status: "current" | "incomplete";
+    productCount: number;
+    orderCount: number;
+    finishedAt: number;
+    expiresAt?: number;
+    protocolVersion?: number;
+    reason?: string;
+  }> => {
     await requireServiceIdentity(ctx);
     const site = await ctx.db.get(siteId);
     if (!site || site.shopifyEconomicsSyncAttemptId !== attemptId) {
@@ -228,7 +245,7 @@ export const commitEconomicsSnapshot = mutation({
     if (!Number.isFinite(attemptedAt)) throw new Error("Shopify economics sync attempt has no durable start fence");
     const cutoff = site.shopifyEconomicsSyncOrderCutoffAt;
     if (!Number.isFinite(cutoff)
-      || cutoff !== attemptedAt! - (site.shopifyEconomicsSyncSinceDays ?? 0) * DAY_MS) {
+      || cutoff !== attemptedAt! - (site.shopifyEconomicsSyncSinceDays ?? 0) * SHOPIFY_ECONOMICS_DAY_MS) {
       throw new Error("Shopify economics sync attempt has no valid durable order cutoff");
     }
 
@@ -258,7 +275,7 @@ export const commitEconomicsSnapshot = mutation({
         throw new Error("complete Shopify order snapshot contains an invalid or duplicate order identity");
       }
       if (order.currencyCode !== "USD" || !Number.isFinite(order.currentTotal) || order.currentTotal < 0
-        || !Number.isFinite(order.createdAt) || order.createdAt < cutoff! || order.createdAt > finishedAt + DAY_MS
+        || !Number.isFinite(order.createdAt) || order.createdAt < cutoff! || order.createdAt > finishedAt + SHOPIFY_ECONOMICS_DAY_MS
         || !order.financialStatus.trim()) {
         throw new Error("complete Shopify order snapshot contains invalid or out-of-window facts");
       }
@@ -371,20 +388,50 @@ export const commitEconomicsSnapshot = mutation({
 
     const productCount = products.length;
     const orderCount = orders.length;
+    const expiresAt = finishedAt + SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS;
     await ctx.db.patch(siteId, {
       shopifyEconomicsSyncStatus: "current",
       shopifyEconomicsSyncSucceededAt: finishedAt,
+      shopifyEconomicsSyncExpiresAt: expiresAt,
+      shopifyEconomicsSyncExpiredAt: undefined,
+      shopifyEconomicsSyncExpiredAttemptId: undefined,
       shopifyEconomicsSyncProductCount: productCount,
       shopifyEconomicsSyncOrderCount: orderCount,
+      shopifyEconomicsSnapshotProtocolVersion: SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
       shopifyEconomicsSyncInvalidatedAt: undefined,
       shopifyEconomicsSyncInvalidationReason: undefined,
     });
+    await ctx.scheduler.runAt(
+      expiresAt,
+      internal.shopifyEconomicsExpiry.expireEconomicsSnapshot,
+      {
+        siteId,
+        attemptId,
+        protocolVersion: SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+        succeededAt: finishedAt,
+        expiresAt,
+      },
+    );
     await appendAudit(ctx, {
       siteId,
       event: "shopify_economics_sync_current",
-      detail: { attemptId, productCount, orderCount, sinceDays: SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS },
+      detail: {
+        attemptId,
+        productCount,
+        orderCount,
+        sinceDays: SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS,
+        protocolVersion: SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+        expiresAt,
+      },
     });
-    return { finishedAt, status: "current" as const, productCount, orderCount };
+    return {
+      finishedAt,
+      expiresAt,
+      protocolVersion: SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
+      status: "current" as const,
+      productCount,
+      orderCount,
+    };
   },
 });
 

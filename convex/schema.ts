@@ -51,9 +51,14 @@ export default defineSchema({
     // Exact Convex-owned lower bound used by both the provider query and snapshot reducer.
     shopifyEconomicsSyncOrderCutoffAt: v.optional(v.number()),
     shopifyEconomicsSyncSucceededAt: v.optional(v.number()),
+    shopifyEconomicsSyncExpiresAt: v.optional(v.number()),
+    shopifyEconomicsSyncExpiredAt: v.optional(v.number()),
+    shopifyEconomicsSyncExpiredAttemptId: v.optional(v.string()),
     shopifyEconomicsSyncSinceDays: v.optional(v.number()),
     shopifyEconomicsSyncProductCount: v.optional(v.number()),
     shopifyEconomicsSyncOrderCount: v.optional(v.number()),
+    // Only the sole atomic snapshot reducer may stamp the matching protocol generation.
+    shopifyEconomicsSnapshotProtocolVersion: v.optional(v.number()),
     shopifyEconomicsSyncInvalidatedAt: v.optional(v.number()),
     shopifyEconomicsSyncInvalidationReason: v.optional(v.string()),
     customDomain: v.optional(v.string()),

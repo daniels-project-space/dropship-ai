@@ -21,6 +21,7 @@ import type * as ops from "../ops.js";
 import type * as posts from "../posts.js";
 import type * as products from "../products.js";
 import type * as seed from "../seed.js";
+import type * as shopifyEconomicsExpiry from "../shopifyEconomicsExpiry.js";
 import type * as signals from "../signals.js";
 import type * as siteSecrets from "../siteSecrets.js";
 import type * as sites from "../sites.js";
@@ -46,6 +47,7 @@ declare const fullApi: ApiFromModules<{
   posts: typeof posts;
   products: typeof products;
   seed: typeof seed;
+  shopifyEconomicsExpiry: typeof shopifyEconomicsExpiry;
   signals: typeof signals;
   siteSecrets: typeof siteSecrets;
   sites: typeof sites;
