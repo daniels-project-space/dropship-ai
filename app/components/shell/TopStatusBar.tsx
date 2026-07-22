@@ -12,11 +12,15 @@ export function TopStatusBar({
   crumbs,
   pending,
   gatePassed,
+  sampleStatus,
+  controlPlane,
   onOpenMenu,
 }: {
   crumbs: Crumb[];
   pending: number;
   gatePassed: boolean | null; // null = unknown/loading
+  sampleStatus?: { present: boolean; sampleSiteCount: number; sampleSiteNames: string[] };
+  controlPlane?: { state: "online" | "offline" | "unknown"; label: string; heartbeatAt: number | null; checkpointAt: number | null; checkpoint: string | null };
   onOpenMenu: () => void;
 }) {
   const [bellOpen, setBellOpen] = useState(false);
@@ -40,7 +44,7 @@ export function TopStatusBar({
         <div className="flex shrink-0 items-center gap-2 sm:gap-2.5">
           {/* sample-data honesty marker (auto-hides when no seeded data) */}
           <span className="hidden sm:inline-flex">
-            <SampleDataPill compact />
+            <SampleDataPill compact status={sampleStatus} />
           </span>
 
           {/* content-fit gate */}
@@ -64,9 +68,17 @@ export function TopStatusBar({
           </div>
 
           {/* brain heartbeat */}
-          <div className="flex items-center gap-2 rounded-full border border-line bg-panel/60 px-3 py-1.5">
-            <StatusDot className="bg-live" hex="#44d6a0" live size={6} />
-            <span className="label-eyebrow text-[9.5px] text-ink-dim">Brain online</span>
+          <div
+            className="flex items-center gap-2 rounded-full border border-line bg-panel/60 px-3 py-1.5"
+            title={controlPlane?.heartbeatAt ? `Last heartbeat ${new Date(controlPlane.heartbeatAt).toLocaleString()}` : "No durable brain heartbeat has been observed"}
+          >
+            <StatusDot
+              className={controlPlane?.state === "online" ? "bg-live" : controlPlane?.state === "offline" ? "bg-danger" : "bg-ink-faint"}
+              hex={controlPlane?.state === "online" ? "#44d6a0" : controlPlane?.state === "offline" ? "#ef6b73" : "#727278"}
+              live={controlPlane?.state === "online"}
+              size={6}
+            />
+            <span className="label-eyebrow text-[9.5px] text-ink-dim">{controlPlane?.label ?? "Brain unknown"}</span>
           </div>
 
           {/* alerts bell */}

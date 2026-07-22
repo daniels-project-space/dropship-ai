@@ -6,6 +6,7 @@ import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { approvalDispatchDecision } from "../src/lib/sourceSelectionState";
+import { projectActionTransition } from "./dashboardProjections";
 
 const riskTier = v.union(v.literal("auto"), v.literal("human_gated"));
 
@@ -35,6 +36,7 @@ export const propose = mutation({
       confidence: args.confidence,
       proposedAt: Date.now(),
     });
+    await projectActionTransition(ctx, null, (await ctx.db.get(actionId))!);
     await appendAudit(ctx, {
       siteId: args.siteId,
       actionId,
@@ -55,6 +57,7 @@ export const approve = mutation({
       throw new Error(`action ${actionId} is ${action.status}, not pending_approval`);
     }
     await ctx.db.patch(actionId, { status: "approved", resolvedAt: Date.now() });
+    await projectActionTransition(ctx, action, (await ctx.db.get(actionId))!);
     await appendAudit(ctx, {
       siteId: action.siteId,
       actionId,
@@ -75,6 +78,7 @@ export const reject = mutation({
       throw new Error(`action ${actionId} is ${action.status}, not pending_approval`);
     }
     await ctx.db.patch(actionId, { status: "rejected", resolvedAt: Date.now() });
+    await projectActionTransition(ctx, action, (await ctx.db.get(actionId))!);
     await appendAudit(ctx, {
       siteId: action.siteId,
       actionId,
@@ -170,6 +174,7 @@ export const markExecuted = mutation({
     if (!action) throw new Error(`action ${actionId} not found`);
     const status = failed ? ("failed" as const) : ("executed" as const);
     await ctx.db.patch(actionId, { status, resolvedAt: Date.now() });
+    await projectActionTransition(ctx, action, (await ctx.db.get(actionId))!);
     await appendAudit(ctx, {
       siteId: action.siteId,
       actionId,

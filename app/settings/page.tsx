@@ -220,9 +220,7 @@ export default function SettingsPage() {
               </div>
             </div>
             <div className="border-t border-line-soft pt-4">
-              <Badge ring="bg-live/10 text-live ring-1 ring-live/25" dot="bg-live" hex="#44d6a0" live>
-                Brain online
-              </Badge>
+              <Badge>Freshness shown in the status bar</Badge>
             </div>
           </div>
         </div>

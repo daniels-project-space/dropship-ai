@@ -8,6 +8,7 @@ import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { dispatchTriggerDecision } from "../src/lib/distributionState";
+import { projectPostTransition } from "./dashboardProjections";
 
 async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }): Promise<void> {
   if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") {
@@ -81,6 +82,7 @@ export const schedule = mutation({
       views: 0,
       engagement: 0,
     });
+    await projectPostTransition(ctx, null, (await ctx.db.get(postId))!);
     await appendAudit(ctx, {
       siteId: args.siteId,
       event: "post_scheduled",
@@ -101,6 +103,7 @@ export const markPublished = mutation({
     }
     if (!externalPostId.trim()) throw new Error("provider post id is required before marking published");
     await ctx.db.patch(postId, { status: "published", publishedAt: Date.now(), externalPostId });
+    await projectPostTransition(ctx, p, (await ctx.db.get(postId))!);
     await appendAudit(ctx, { siteId: p.siteId, event: "post_published", detail: { postId, externalPostId } });
     return postId;
   },
@@ -116,6 +119,7 @@ export const markAwaitingManualPublish = mutation({
     if (post.status === "awaiting_manual_publish") return postId;
     if (post.status !== "scheduled") throw new Error(`post ${postId} is ${post.status}, not schedulable for manual publication`);
     await ctx.db.patch(postId, { status: "awaiting_manual_publish" });
+    await projectPostTransition(ctx, post, (await ctx.db.get(postId))!);
     return postId;
   },
 });
@@ -133,6 +137,7 @@ export const recordEngagement = mutation({
       throw new Error("provider metrics must be finite non-negative observations");
     }
     await ctx.db.patch(postId, { views, engagement, metricsObservedAt: observedAt, metricsProvider: provider });
+    await projectPostTransition(ctx, p, (await ctx.db.get(postId))!);
     return postId;
   },
 });

@@ -10,6 +10,7 @@
 import { mutation } from "./authz";
 import type { MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
+import { deleteSiteProjections, projectActionTransition, projectCreativeTransition, projectPostTransition, projectProductTransition, projectSite } from "./dashboardProjections";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const dayKey = (ms: number) => new Date(ms).toISOString().slice(0, 10);
@@ -52,6 +53,7 @@ async function seedBrand(
     createdAt: now - spec.days * DAY_MS,
     sample: true,
   });
+  await projectSite(ctx, (await ctx.db.get(siteId))!);
 
   // products
   const productIds: Id<"products">[] = [];
@@ -69,6 +71,7 @@ async function seedBrand(
       createdAt: now - spec.days * DAY_MS,
       sample: true,
     });
+    await projectProductTransition(ctx, null, (await ctx.db.get(pid))!);
     productIds.push(pid);
   }
 
@@ -130,10 +133,13 @@ async function seedBrand(
       labelBurned: true,
       hook: hooks[i % hooks.length],
       status: "approved",
+      publicationAuthorized: false,
+      queueState: "publication_authorization",
       createdAt: publishedAt,
       sample: true,
     });
-    await ctx.db.insert("posts", {
+    await projectCreativeTransition(ctx, null, (await ctx.db.get(creativeId))!);
+    const postId = await ctx.db.insert("posts", {
       siteId,
       creativeId,
       platform,
@@ -144,6 +150,7 @@ async function seedBrand(
       engagement,
       sample: true,
     });
+    await projectPostTransition(ctx, null, (await ctx.db.get(postId))!);
   }
 
   // orders (revenue) spread across the recent window with growth
@@ -163,7 +170,7 @@ async function seedBrand(
 
   // a couple of pending actions (drives the approvals badge realistically)
   for (let i = 0; i < 2; i++) {
-    await ctx.db.insert("actions", {
+    const actionId = await ctx.db.insert("actions", {
       siteId,
       type: i === 0 ? "spark_ad" : "reorder_collection",
       params: { note: "sample proposed action" },
@@ -177,6 +184,7 @@ async function seedBrand(
       proposedAt: now - Math.floor(rand() * 2 * DAY_MS),
       sample: true,
     });
+    await projectActionTransition(ctx, null, (await ctx.db.get(actionId))!);
   }
 
   // one running experiment
@@ -279,6 +287,7 @@ async function clearInternal(ctx: MutationCtx) {
         deleted++;
       }
     }
+    await deleteSiteProjections(ctx, s);
     await ctx.db.delete(sid);
     deleted++;
   }

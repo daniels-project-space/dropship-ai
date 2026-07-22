@@ -32,7 +32,7 @@ type TopProduct = {
   title: string;
   siteName: string;
   views: number;
-  cvr: number;
+  cvr: number | null;
   marginPct: number | null;
   priceUsd: number;
   trend: number[];
@@ -43,18 +43,18 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
   const [tf, setTf] = useState<Timeframe>(30);
   const [pf, setPf] = useState<PlatformFilter>("all");
 
-  // primary metric series + secondary series, all scoped + windowed (re-queries on tf/pf change)
-  const revenue = useQuery(api.dashboard.timeseries, { scope, metric: "revenue", days: tf });
-  const orders = useQuery(api.dashboard.timeseries, { scope, metric: "orders", days: tf });
-  const views = useQuery(api.dashboard.timeseries, { scope, metric: "views", days: tf, platform: pf });
-  const engagement = useQuery(api.dashboard.timeseries, { scope, metric: "engagement", days: tf, platform: pf });
-  const platforms = useQuery(api.dashboard.platformBreakdown, { scope, days: tf });
-  const funnel = useQuery(api.dashboard.funnel, { scope, days: tf });
-  const products = useQuery(api.dashboard.topProducts, { scope, limit: 6 });
-  const insights = useQuery(api.insights.list, { scope, days: tf });
-  const cadence = useQuery(api.dashboard.postingCadence, { scope, days: 84 });
-  const gate = useQuery(api.dashboard.contentFitGate, scope === "all" ? {} : { siteId: scope as never });
-  const portfolio = useQuery(api.dashboard.portfolio, {});
+  const snapshot = useQuery(api.dashboard.commandCenterSnapshot, { scope, days: tf, platform: pf });
+  const data = snapshot?.projectionState === "ready" || snapshot?.projectionState === "legacy" ? snapshot : undefined;
+  const revenue = data?.revenue;
+  const orders = data?.orders;
+  const views = data?.views;
+  const engagement = data?.engagement;
+  const platforms = data?.platforms;
+  const funnel = data?.funnel;
+  const products = data?.products;
+  const insights = data?.insights;
+  const cadence = data?.cadence;
+  const gate = data?.gate;
   const recent = useQuery(
     scope === "all" ? api.audit.listRecent : api.audit.listBySite,
     scope === "all" ? { limit: 8 } : ({ siteId: scope as never, limit: 8 } as never),
@@ -75,10 +75,10 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
   const netRevenue = revenue?.total ?? 0;
   const orderCount = orders?.total ?? 0;
   const viewTotal = views?.total ?? 0;
-  const pendingTotal = portfolio?.totalPendingActions ?? 0;
+  const pendingTotal = data?.pendingTotal ?? 0;
   // contribution margin: weighted from top products (representative blended)
-  const marginVals = (products ?? []).map((p) => p.marginPct).filter((m): m is number => m != null);
-  const blendedMargin = marginVals.length ? marginVals.reduce((s, m) => s + m, 0) / marginVals.length : 0;
+  const marginVals = (products ?? []).map((p: TopProduct) => p.marginPct).filter((m: number | null): m is number => m != null);
+  const blendedMargin = marginVals.length ? marginVals.reduce((s: number, m: number) => s + m, 0) / marginVals.length : 0;
   const marginVerified = commerceVerified && marginVals.length > 0;
   const gatePassed = gate?.passed ?? false;
   const bestVideoViews = gate?.bestVideo?.views ?? 0;
@@ -128,9 +128,9 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
       header: "CVR",
       align: "right",
       sortable: true,
-      sortValue: (r) => r.cvr,
+      sortValue: (r) => r.cvr ?? 0,
       hideBelow: "sm",
-      render: (r) => <span className="num text-ink-dim">{r.cvr.toFixed(1)}%</span>,
+      render: (r) => r.cvr == null ? <span className="text-ink-faint">Unavailable</span> : <span className="num text-ink-dim">{r.cvr.toFixed(1)}%</span>,
     },
     {
       key: "margin",
@@ -323,7 +323,12 @@ export function CommandCenter({ scope = "all" }: { scope?: string }) {
         <div className="panel animate-rise flex min-h-[328px] flex-col rounded-2xl p-6" style={{ animationDelay: "200ms" }}>
           <SectionHeader eyebrow="Conversion funnel" accent="text-cyan" meta={tfLabel} />
           <div className="flex flex-1 flex-col justify-center">
-            {commerceVerified ? (
+            {funnel?.conversionAvailability.state === "unavailable" ? (
+              <div className="rounded-xl border border-pending/25 bg-pending/5 px-4 py-5 text-center">
+                <p className="font-medium text-pending">Provider conversion unavailable</p>
+                <p className="mt-1 text-[12px] leading-relaxed text-ink-dim">{funnel.conversionAvailability.reason}</p>
+              </div>
+            ) : commerceVerified ? (
               <Funnel
                 stages={funnel?.stages ?? []}
                 color={C.cyan}

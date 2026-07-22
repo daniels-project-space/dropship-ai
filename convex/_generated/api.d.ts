@@ -14,6 +14,7 @@ import type * as audit from "../audit.js";
 import type * as creatives from "../creatives.js";
 import type * as creativeGenerations from "../creativeGenerations.js";
 import type * as dashboard from "../dashboard.js";
+import type * as dashboardMigration from "../dashboardMigration.js";
 import type * as experiments from "../experiments.js";
 import type * as insights from "../insights.js";
 import type * as metrics from "../metrics.js";
@@ -41,6 +42,7 @@ declare const fullApi: ApiFromModules<{
   creatives: typeof creatives;
   creativeGenerations: typeof creativeGenerations;
   dashboard: typeof dashboard;
+  dashboardMigration: typeof dashboardMigration;
   experiments: typeof experiments;
   insights: typeof insights;
   metrics: typeof metrics;

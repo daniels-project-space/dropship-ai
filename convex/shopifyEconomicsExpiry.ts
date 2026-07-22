@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { internalMutation } from "./_generated/server";
 import { appendAudit } from "./audit";
 import { SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION } from "../src/lib/shopifySyncState";
+import { projectSite } from "./dashboardProjections";
 
 type ExpiryResult = {
   expired: boolean;
@@ -45,6 +46,7 @@ export const expireEconomicsSnapshot = internalMutation({
       shopifyEconomicsSyncExpiredAt: expiredAt,
       shopifyEconomicsSyncExpiredAttemptId: args.attemptId,
     });
+    await projectSite(ctx, (await ctx.db.get(args.siteId))!);
     await appendAudit(ctx, {
       siteId: args.siteId,
       event: "shopify_economics_sync_expired",

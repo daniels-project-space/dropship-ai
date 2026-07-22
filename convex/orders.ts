@@ -7,6 +7,7 @@ import { hasVerifiedShopifyCjLineage } from "../src/lib/orderLineageState";
 import { invalidateShopifyEconomicsForObservation } from "./shopifyEconomics";
 import { hasCurrentSandboxCjDispatchReceipt, hasValidSandboxCjApprovalBinding } from "../src/lib/sandboxCjBinding";
 import { CJ_STAGING_MAX_ATTEMPTS, cjStagingFailureTransition, cjStagingGenerationFingerprint, hasExactCjStagingGeneration, legacyCjStagingRunnableAt, type CjStagingPhase } from "../src/lib/cjStagingState";
+import { projectActionTransition, rebuildSiteCommerceProjection } from "./dashboardProjections";
 
 const fulfillmentStatus = v.union(
   v.literal("received"),
@@ -297,6 +298,7 @@ export const stageQuotedCjStagingIntent = mutation({
         // Trigger has no safe generic cancellation primitive here.  Superseding the exact
         // action fences canArm/approve and makes any old waitpoint a no-op.
         await ctx.db.patch(oldAction._id, { status: "superseded", resolvedAt: now });
+        await projectActionTransition(ctx, oldAction, (await ctx.db.get(oldAction._id))!);
         await appendAudit(ctx, { siteId: intent.siteId, actionId: oldAction._id, event: "cj_sandbox_dispatch_superseded", detail: { orderId: order._id, reason: "fresh_quote_generation" } });
       }
     }
@@ -304,6 +306,7 @@ export const stageQuotedCjStagingIntent = mutation({
     const generationFingerprint = cjStagingGenerationFingerprint({ generation, inputHash, quoteInputDigest: intent.quoteInputDigest, logisticName: input.logisticName, fromCountryCode: input.fromCountryCode, quotedPriceUsd: intent.quote.logisticPriceUsd, quotedAt: intent.quote.quotedAt });
     const approvalDispatchKey = `approval-gate:cj:${intent.siteId}:${orderNumber}:g${generation}:${generationFingerprint.slice(0, 16)}`;
     const actionId = await ctx.db.insert("actions", { siteId: intent.siteId, type: "dispatch_cj_sandbox_order", riskTier: "human_gated", status: "pending_approval", params: { orderId: order._id, orderNumber, inputHash, generation, generationFingerprint, quoteInputDigest: intent.quoteInputDigest, isSandbox: 1, payType: 3, logisticName: input.logisticName, fromCountryCode: input.fromCountryCode, logisticsQuotedAt: intent.quote.quotedAt, logisticsQuotedPriceUsd: intent.quote.logisticPriceUsd }, approvalDispatchKey, approvalDispatchStatus: "pending", rationale: "A fresh, lineage-bound CJ freight quote is ready. Exact human approval is required before sandbox-only creation.", proposedAt: now });
+    await projectActionTransition(ctx, null, (await ctx.db.get(actionId))!);
     await ctx.db.patch(order._id, { cjOrderInput: input, cjLogisticsPreflight: { logisticName: intent.quote.logisticName, fromCountryCode: lineage.fromCountryCode, quotedAt: intent.quote.quotedAt, quotedPriceUsd: intent.quote.logisticPriceUsd }, cjOrderInputHash: inputHash, cjOrderNumber: orderNumber, cjDispatchGeneration: generation, cjDispatchGenerationFingerprint: generationFingerprint, cjQuoteInputDigest: intent.quoteInputDigest, cjApprovalActionId: actionId, cjDispatchStatus: "staged", cjDispatchAttempt: 0 });
     await appendAudit(ctx, { siteId: intent.siteId, actionId, event: "cj_sandbox_dispatch_staged", detail: { orderId: order._id, inputHash, generation, quoteInputDigest: intent.quoteInputDigest, isSandbox: 1, payType: 3 } });
     await ctx.db.patch(intentId, { status: "staged", actionId, leaseExpiresAt: undefined, runnableAt: now, updatedAt: now });
@@ -495,6 +498,8 @@ async function settleExecution(ctx: any, execution: any, order: any, action: any
   if (input.phase === "sent") {
     await ctx.db.patch(order._id, { cjOrderId: input.cjOrderId, cjOrderNumber: order.cjOrderInput.orderNumber, cjDispatchStatus: "sent", fulfillmentStatus: "sent_to_cj" });
     await ctx.db.patch(action._id, { status: "executed", resolvedAt: now });
+    await projectActionTransition(ctx, action, (await ctx.db.get(action._id))!);
+    await rebuildSiteCommerceProjection(ctx, order.siteId);
   } else if (input.phase === "pre_provider_failed") {
     await ctx.db.patch(order._id, { cjDispatchStatus: "staged" });
   } else if (input.phase === "needs_attention") {

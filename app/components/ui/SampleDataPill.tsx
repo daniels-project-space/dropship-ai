@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
+import { useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 
 // Honesty marker — a small amber "SAMPLE DATA" pill shown whenever seeded demo
@@ -9,8 +9,7 @@ import { api } from "@/convex/_generated/api";
 // and analytics query. "Clear" calls
 // clearSampleData, which removes ONLY sample-flagged sites + their children.
 // Disappears automatically once real data replaces the sample set.
-export function SampleDataPill({ compact = false }: { compact?: boolean }) {
-  const status = useQuery(api.dashboard.sampleStatus, {});
+export function SampleDataPill({ compact = false, status }: { compact?: boolean; status?: { present: boolean; sampleSiteCount: number; sampleSiteNames: string[] } }) {
   const clear = useMutation(api.seed.clearSampleData);
   const [clearing, setClearing] = useState(false);
 

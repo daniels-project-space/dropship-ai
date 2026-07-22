@@ -10,6 +10,7 @@ import {
 } from "../src/lib/creativeGeneration";
 import { stableSha256 } from "../src/lib/cjOrder";
 import { appendAudit } from "./audit";
+import { projectCreativeTransition } from "./dashboardProjections";
 
 const stage = v.union(
   v.literal("image_submission"), v.literal("image_polling"), v.literal("image_result_copy"),
@@ -395,8 +396,9 @@ export const completeAssembly = mutation({
       creativeId = await ctx.db.insert("creatives", {
         siteId: row.siteId, productId: row.productId, generationVariantId: args.variantId, kind: "product_demo",
         r2Key: row.finalR2Key, aiGenerated: true, aiLabelRequired: true, labelBurned: true,
-        hook: row.hook, status: "review", revision: 1, createdAt: Date.now(),
+        hook: row.hook, status: "review", publicationAuthorized: false, queueState: "review", revision: 1, createdAt: Date.now(),
       });
+      await projectCreativeTransition(ctx, null, (await ctx.db.get(creativeId))!);
       await appendAudit(ctx, { siteId: row.siteId, event: "creative_requested", detail: { creativeId, generationVariantId: args.variantId, kind: "product_demo", aiGenerated: true, aiLabelRequired: true, labelBurned: true, status: "review" } });
     }
     const now = Date.now();

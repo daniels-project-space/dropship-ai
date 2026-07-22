@@ -7,6 +7,7 @@ import { hasVerifiedInternalShopifyDraftLineage } from "../src/lib/shopifyDraftL
 import { reuseSourceSelectionLineage, sourceSelectionDecision } from "../src/lib/sourceSelectionState";
 import { actionMatchesApprovedDraftImport, shopifyDraftTraceDetail } from "../src/lib/draftImportLineage";
 import { invalidateShopifyEconomicsForObservation } from "./shopifyEconomics";
+import { projectActionTransition, projectProductTransition } from "./dashboardProjections";
 
 const productStatus = v.union(
   v.literal("draft"),
@@ -49,6 +50,7 @@ export const upsert = mutation({
       status: status ?? "draft",
       createdAt: Date.now(),
     });
+    await projectProductTransition(ctx, null, (await ctx.db.get(productId))!);
     await appendAudit(ctx, { siteId: args.siteId, event: "product_created", detail: { productId, title: args.title } });
     return productId;
   },
@@ -132,6 +134,7 @@ export const createSourcedDraft = mutation({
     const productId = existing
       ? (await ctx.db.patch(existing._id, record), existing._id)
       : await ctx.db.insert("products", { siteId: args.siteId, ...record, createdAt: Date.now() });
+    await projectProductTransition(ctx, existing ?? null, (await ctx.db.get(productId))!);
     await appendAudit(ctx, {
       siteId: args.siteId,
       event: existing ? "product_sourced_draft_refreshed" : "product_sourced_draft_created",
@@ -315,6 +318,7 @@ export const stageSourcedDraftSelection = mutation({
       status: "draft" as const, sample: false,
     };
     const productId = existing ? (await ctx.db.patch(existing._id, record), existing._id) : await ctx.db.insert("products", { siteId: args.siteId, ...record, createdAt: Date.now() });
+    await projectProductTransition(ctx, existing ?? null, (await ctx.db.get(productId))!);
     const approvalDispatchKey = `approval-gate:${args.siteId}:${args.requestId}`;
     const actionId = await ctx.db.insert("actions", {
       siteId: args.siteId, type: "import_sourced_product", riskTier: "human_gated", status: "pending_approval",
@@ -322,6 +326,7 @@ export const stageSourcedDraftSelection = mutation({
       params: { productId, evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, title: args.title, mediaUrl: args.mediaUrl, inventoryQty: args.inventoryQty, evidenceReadAt: args.readAt, priceUsd: args.priceUsd, cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, landedCostUsd: economics.landedCostUsd, contributionMarginPct: economics.contributionMarginPct, published: false },
       rationale: "Verified CJ evidence and server-derived contribution economics cleared the sourcing policy. Human approval can create one Shopify DRAFT only.", proposedAt: Date.now(),
     });
+    await projectActionTransition(ctx, null, (await ctx.db.get(actionId))!);
     await ctx.db.insert("sourceSelections", { siteId: args.siteId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, priceUsd: args.priceUsd, evidenceId, productId, actionId, status: "pending_approval", approvalDispatchKey, approvalDispatchStatus: "pending", createdAt: Date.now() });
     await appendAudit(ctx, { siteId: args.siteId, actionId, event: "sourced_draft_import_proposed", detail: { productId, evidenceId, requestId: args.requestId, cjProductId: args.cjProductId, cjVariantId: args.cjVariantId, title: args.title, inventoryQty: args.inventoryQty, cogsUsd: economics.cogsUsd, shippingUsd: economics.shippingUsd, landedCostUsd: economics.landedCostUsd, priceUsd: args.priceUsd, contributionMarginPct: economics.contributionMarginPct, published: false } });
     return { status: "pending_approval" as const, reused: false as const, evidenceId, traceId: args.traceId, productId, actionId, approvalDispatchKey, approvalDispatchStatus: "pending" as const };
@@ -406,8 +411,10 @@ export const completeApprovedShopifyDraftImport = mutation({
       shopifyDraftImportStatus: "created", shopifyObservedAt: now,
       shopifyEconomicsSnapshotAttemptId: undefined, shopifyEconomicsExcludedAt: now,
     });
+    await projectProductTransition(ctx, product, (await ctx.db.get(args.productId))!);
     await invalidateShopifyEconomicsForObservation(ctx, args.siteId, "shopify_draft_import_observation");
     await ctx.db.patch(args.actionId, { status: "executed", resolvedAt: now });
+    await projectActionTransition(ctx, action, (await ctx.db.get(args.actionId))!);
     const traceDetail = typeof trace.detail === "object" && trace.detail !== null ? trace.detail as Record<string, unknown> : {};
     await ctx.db.patch(trace._id, { status: "succeeded", detail: { ...traceDetail, productId: args.productId, actionId: args.actionId, evidenceId: product.cjEvidenceId, shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, published: false }, finishedAt: now });
     await appendAudit(ctx, { siteId: args.siteId, actionId: args.actionId, event: "shopify_draft_imported", detail: { productId: args.productId, shopifyProductId: args.shopifyProductId, shopifyVariantId: args.shopifyVariantId, traceId: args.traceId, published: false } });
@@ -494,6 +501,7 @@ export const setStatus = mutation({
       });
     }
     await ctx.db.patch(productId, { status });
+    await projectProductTransition(ctx, product, (await ctx.db.get(productId))!);
     await appendAudit(ctx, { siteId: product.siteId, event: "product_status_changed", detail: { productId, status, activationEvidenceId: status === "active" ? product.cjEvidenceId : undefined } });
     return productId;
   },

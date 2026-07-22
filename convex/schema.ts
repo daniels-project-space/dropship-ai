@@ -206,11 +206,17 @@ export default defineSchema({
     labelBurned: v.optional(v.boolean()),
     hook: v.optional(v.string()),
     status: v.union(v.literal("generating"), v.literal("review"), v.literal("approved"), v.literal("rejected")),
+    // Transactional review/publication queue projection. Optional only while dashboard-v1 is
+    // backfilled; every supported writer maintains both fields with the creative transition.
+    publicationAuthorized: v.optional(v.boolean()),
+    queueState: v.optional(v.union(v.literal("none"), v.literal("review"), v.literal("publication_authorization"))),
     revision: v.optional(v.number()),              // immutable publication authorization fence
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]).index("by_r2_key", ["r2Key"])
-    .index("by_generation_variant", ["generationVariantId"]),
+    .index("by_generation_variant", ["generationVariantId"])
+    .index("by_queue_created_at", ["queueState", "createdAt"])
+    .index("by_site_queue_created_at", ["siteId", "queueState", "createdAt"]),
 
   // One atomically-created parent plus K immutable children exists before any Trigger handoff.
   // The parent status/counts are a transactionally maintained projection of its children.
@@ -318,6 +324,7 @@ export default defineSchema({
     metricsProvider: v.optional(v.literal("ayrshare")), // only a provider ingestion worker may set metrics
     sample: v.optional(v.boolean()),
   }).index("by_site_status", ["siteId", "status"]).index("by_site_platform", ["siteId", "platform"])
+    .index("by_site_published_at", ["siteId", "publishedAt"])
     .index("by_creative_platform", ["creativeId", "platform"]),
 
   // Created only by the separate publication-authorization action. Content approval alone has
@@ -585,6 +592,127 @@ export default defineSchema({
   }).index("by_provider_site_delivery", ["provider", "siteId", "deliveryId"])
     .index("by_provider_delivery", ["provider", "deliveryId"])
     .index("by_site_received_at", ["siteId", "receivedAt"]),
+
+  // Dashboard-v1 projections. Source rows stay authoritative; these compact rows are switched
+  // into reads only after the durable migration reaches `ready` and bounded drift verification
+  // reports no mismatches.
+  dashboardSiteSummaries: defineTable({
+    siteId: v.id("sites"),
+    dataMode: v.union(v.literal("live"), v.literal("sample")),
+    name: v.string(),
+    niche: v.string(),
+    status: v.union(v.literal("provisioning"), v.literal("active"), v.literal("paused"), v.literal("killed")),
+    distributionMode: v.union(v.literal("semi_manual"), v.literal("automated")),
+    shopifyDomain: v.optional(v.string()),
+    storeCurrency: v.optional(v.string()),
+    shopifyAccessVerifiedAt: v.optional(v.number()),
+    shopifyEconomicsSyncStatus: v.optional(v.string()),
+    shopifyEconomicsSyncAttemptId: v.optional(v.string()),
+    shopifyEconomicsSyncAttemptedAt: v.optional(v.number()),
+    shopifyEconomicsSyncOrderCutoffAt: v.optional(v.number()),
+    shopifyEconomicsSyncSucceededAt: v.optional(v.number()),
+    shopifyEconomicsSyncExpiresAt: v.optional(v.number()),
+    shopifyEconomicsSyncExpiredAt: v.optional(v.number()),
+    shopifyEconomicsSyncExpiredAttemptId: v.optional(v.string()),
+    shopifyEconomicsSyncSinceDays: v.optional(v.number()),
+    shopifyEconomicsSyncProductCount: v.optional(v.number()),
+    shopifyEconomicsSyncOrderCount: v.optional(v.number()),
+    shopifyEconomicsSnapshotProtocolVersion: v.optional(v.number()),
+    customDomain: v.optional(v.string()),
+    killDate: v.optional(v.number()),
+    productCount: v.number(),
+    activeProductCount: v.number(),
+    pendingActionCount: v.number(),
+    postCount: v.number(),
+    publishedPostCount: v.number(),
+    reviewCreativeCount: v.number(),
+    openOrderCount: v.number(),
+    orderCount: v.number(),
+    revenueUsd: v.number(),
+    topProducts: v.array(v.object({
+      productId: v.id("products"), title: v.string(), siteName: v.string(), views: v.number(),
+      cvr: v.optional(v.number()), marginPct: v.optional(v.number()), priceUsd: v.number(),
+      trend: v.array(v.number()), status: v.string(),
+    })),
+    updatedAt: v.number(),
+  }).index("by_site", ["siteId"]).index("by_mode_site", ["dataMode", "siteId"]),
+
+  dashboardPortfolioSummaries: defineTable({
+    dataMode: v.union(v.literal("live"), v.literal("sample")),
+    siteCount: v.number(),
+    pendingActionCount: v.number(),
+    productCount: v.number(),
+    activeProductCount: v.number(),
+    reviewCreativeCount: v.number(),
+    openOrderCount: v.number(),
+    orderCount: v.number(),
+    revenueUsd: v.number(),
+    commerceVerified: v.boolean(),
+    topProducts: v.array(v.object({
+      productId: v.id("products"), title: v.string(), siteName: v.string(), views: v.number(),
+      cvr: v.optional(v.number()), marginPct: v.optional(v.number()), priceUsd: v.number(),
+      trend: v.array(v.number()), status: v.string(),
+    })),
+    updatedAt: v.number(),
+  }).index("by_mode", ["dataMode"]),
+
+  dashboardDailyRollups: defineTable({
+    siteId: v.id("sites"),
+    dataMode: v.union(v.literal("live"), v.literal("sample")),
+    day: v.string(),
+    orders: v.number(), revenueUsd: v.number(), purchases: v.number(),
+    publishedPosts: v.number(), observedPosts: v.number(), views: v.number(), engagement: v.number(),
+    platforms: v.object({
+      tiktok: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+      instagram: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+      youtube: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+      facebook: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+    }),
+    bestPost: v.optional(v.object({
+      postId: v.id("posts"), creativeId: v.id("creatives"), platform: v.string(),
+      views: v.number(), engagement: v.number(), publishedAt: v.optional(v.number()), r2Key: v.optional(v.string()),
+    })),
+    updatedAt: v.number(),
+  }).index("by_site_day", ["siteId", "day"]).index("by_mode_day", ["dataMode", "day"]),
+
+  dashboardPortfolioDailyRollups: defineTable({
+    dataMode: v.union(v.literal("live"), v.literal("sample")),
+    day: v.string(),
+    orders: v.number(), revenueUsd: v.number(), purchases: v.number(),
+    publishedPosts: v.number(), observedPosts: v.number(), views: v.number(), engagement: v.number(),
+    platforms: v.object({
+      tiktok: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+      instagram: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+      youtube: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+      facebook: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
+    }),
+    bestPost: v.optional(v.object({
+      postId: v.id("posts"), siteId: v.id("sites"), siteName: v.string(), creativeId: v.id("creatives"),
+      platform: v.string(), views: v.number(), engagement: v.number(), publishedAt: v.optional(v.number()),
+      r2Key: v.optional(v.string()),
+    })),
+    updatedAt: v.number(),
+  }).index("by_mode_day", ["dataMode", "day"]),
+
+  dashboardProjectionMigrations: defineTable({
+    name: v.string(),
+    entity: v.string(),
+    phase: v.union(v.literal("backfilling"), v.literal("verifying"), v.literal("ready")),
+    cursor: v.optional(v.string()),
+    completed: v.boolean(),
+    verified: v.boolean(),
+    driftCount: v.number(),
+    processed: v.number(),
+    updatedAt: v.number(),
+  }).index("by_name_entity", ["name", "entity"]).index("by_name", ["name"]),
+
+  dashboardControlPlaneHeartbeats: defineTable({
+    component: v.string(),
+    heartbeatAt: v.number(),
+    checkpointAt: v.optional(v.number()),
+    checkpoint: v.optional(v.string()),
+    updatedAt: v.number(),
+  }).index("by_component", ["component"]),
 
   // ── experiments (CRO) ─────────────────────────────────────────────────────
   experiments: defineTable({

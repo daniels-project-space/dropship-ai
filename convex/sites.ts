@@ -12,6 +12,7 @@ import {
   SHOPIFY_ECONOMICS_SNAPSHOT_PROTOCOL_VERSION,
   SHOPIFY_ECONOMICS_SYNC_MAX_AGE_MS,
 } from "../src/lib/shopifySyncState";
+import { projectSite, rebuildSiteProductsProjection, replaceSiteCommerceProjection } from "./dashboardProjections";
 
 const siteStatus = v.union(
   v.literal("provisioning"),
@@ -61,6 +62,7 @@ export const create = mutation({
       status: status ?? "provisioning",
       createdAt: Date.now(),
     });
+    await projectSite(ctx, (await ctx.db.get(siteId))!);
     await appendAudit(ctx, { siteId, event: "site_created", detail: { name: args.name, niche: args.niche } });
     return siteId;
   },
@@ -132,6 +134,7 @@ export const connectStore = mutation({
       status: "active",
       sample: false,
     });
+    await projectSite(ctx, (await ctx.db.get(siteId))!);
     await appendAudit(ctx, { siteId, event: "shopify_store_connected", detail: { shopifyDomain, storeCurrency } });
     return siteId;
   },
@@ -157,6 +160,7 @@ export const verifyConnectedStore = mutation({
     const verifiedAt = Date.now();
     await ctx.db.patch(secretRef._id, { vaultRef: expectedRef });
     await ctx.db.patch(siteId, { storeCurrency, shopifyAccessVerifiedAt: verifiedAt });
+    await projectSite(ctx, (await ctx.db.get(siteId))!);
     await appendAudit(ctx, { siteId, event: "shopify_recurring_access_verified", detail: { shopifyDomain, storeCurrency } });
     return { verifiedAt };
   },
@@ -185,6 +189,7 @@ export const beginEconomicsSync = mutation({
       shopifyEconomicsSyncInvalidatedAt: undefined,
       shopifyEconomicsSyncInvalidationReason: undefined,
     });
+    await projectSite(ctx, (await ctx.db.get(siteId))!);
     await appendAudit(ctx, { siteId, event: "shopify_economics_sync_started", detail: { attemptId, sinceDays } });
     return { attemptedAt, orderCutoffAt };
   },
@@ -252,6 +257,7 @@ export const commitEconomicsSnapshot = mutation({
     // A diagnostic window can be read, but it can never mutate or become launch-current.
     if (site.shopifyEconomicsSyncSinceDays !== SHOPIFY_ECONOMICS_CANONICAL_SINCE_DAYS) {
       await ctx.db.patch(siteId, { shopifyEconomicsSyncStatus: "incomplete" });
+      await projectSite(ctx, (await ctx.db.get(siteId))!);
       await appendAudit(ctx, { siteId, event: "shopify_economics_sync_incomplete", detail: { attemptId, reason: "noncanonical_window", sinceDays: site.shopifyEconomicsSyncSinceDays } });
       return { status: "incomplete" as const, productCount: products.length, orderCount: orders.length, finishedAt };
     }
@@ -295,6 +301,7 @@ export const commitEconomicsSnapshot = mutation({
       const reason = existingProducts.length > SHOPIFY_ECONOMICS_SNAPSHOT_CAP
         ? "local_provider_catalogue_exceeds_cap" : "local_order_window_exceeds_cap";
       await ctx.db.patch(siteId, { shopifyEconomicsSyncStatus: "incomplete" });
+      await projectSite(ctx, (await ctx.db.get(siteId))!);
       await appendAudit(ctx, {
         siteId,
         event: "shopify_economics_sync_incomplete",
@@ -401,6 +408,11 @@ export const commitEconomicsSnapshot = mutation({
       shopifyEconomicsSyncInvalidatedAt: undefined,
       shopifyEconomicsSyncInvalidationReason: undefined,
     });
+    const projectedSite = (await ctx.db.get(siteId))!;
+    // One compact catalogue replacement plus at most one delta per day. The snapshot never
+    // emits hundreds of per-product/per-order projection writes.
+    await rebuildSiteProductsProjection(ctx, projectedSite);
+    await replaceSiteCommerceProjection(ctx, projectedSite, orders);
     await ctx.scheduler.runAt(
       expiresAt,
       internal.shopifyEconomicsExpiry.expireEconomicsSnapshot,
@@ -458,6 +470,7 @@ export const markEconomicsSyncNotCurrent = mutation({
       };
     }
     await ctx.db.patch(siteId, { shopifyEconomicsSyncStatus: status });
+    await projectSite(ctx, (await ctx.db.get(siteId))!);
     await appendAudit(ctx, { siteId, event: `shopify_economics_sync_${status}`, detail: { attemptId, ...(reason ? { reason } : {}) } });
     return { ignored: false as const, attemptMatched: true as const, status, finishedAt };
   },
@@ -481,6 +494,7 @@ export const update = mutation({
     if (!existing) throw new Error(`site ${siteId} not found`);
     const clean = Object.fromEntries(Object.entries(patch).filter(([, val]) => val !== undefined));
     await ctx.db.patch(siteId, clean);
+    await projectSite(ctx, (await ctx.db.get(siteId))!);
     await appendAudit(ctx, { siteId, event: "site_updated", detail: clean });
     return siteId;
   },

@@ -1,6 +1,7 @@
 import type { MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 import { appendAudit } from "./audit";
+import { projectCommerceInvalidated } from "./dashboardProjections";
 
 export type ShopifyEconomicsInvalidationReason =
   | "shopify_webhook_order_observation"
@@ -29,6 +30,7 @@ export async function invalidateShopifyEconomicsForObservation(
     shopifyEconomicsSyncInvalidatedAt: invalidatedAt,
     shopifyEconomicsSyncInvalidationReason: reason,
   });
+  await projectCommerceInvalidated(ctx, (await ctx.db.get(siteId))!);
   await appendAudit(ctx, {
     siteId,
     event: "shopify_economics_sync_incomplete",

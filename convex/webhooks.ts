@@ -6,6 +6,7 @@ import { appendAudit } from "./audit";
 import { webhookDeliveryDecision, cjTrackingMappingDecision, shopifyReceiptDecision, shopifyStagingIntakeDecision } from "../src/lib/webhookReceiptState";
 import { cjStagingInputDigest } from "../src/lib/cjOrder";
 import { eligibleUsdOrder } from "../src/lib/shopifyOrder";
+import { rebuildSiteCommerceProjection } from "./dashboardProjections";
 import { invalidateShopifyEconomicsForObservation } from "./shopifyEconomics";
 
 const fulfillmentStatus = v.union(
@@ -195,6 +196,7 @@ export const recordCjTracking = mutation({
       cjOrderId: args.cjOrderId ?? order.cjOrderId,
       fulfillmentStatus: args.trackingNumber ? "shipped" : order.fulfillmentStatus,
     });
+    await rebuildSiteCommerceProjection(ctx, order.siteId);
     await appendAudit(ctx, { siteId, event: "order_tracking_applied", detail: { orderId: order._id, source: "cj_webhook" } });
     await ctx.db.insert("webhookReceipts", {
       provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId,

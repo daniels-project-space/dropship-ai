@@ -1,7 +1,7 @@
 // Server-only CJ Dropshipping API v2 adapter. Product, variant, and inventory calls here are
 // read-only. The only write-capable function remains createOrder(), which deliberately uses
 // payType:3 (create-only) and is isolated in the fulfilment worker.
-import { assertCjTokenBundleWriterConfigured, getKey, replaceCjTokenBundleAtomically } from "./vault";
+import { assertCjTokenBundleWriterConfigured, getService, replaceCjTokenBundleAtomically } from "./vault";
 import { CjStagingFailureError } from "./cjStagingState";
 import { CjTokenCoordinator, type CjTokenBundle, type RotatedCjTokenPair } from "./cjTokenRotation";
 import { selectCjOpenId } from "./cjOpenId";
@@ -9,13 +9,14 @@ import { selectCjOpenId } from "./cjOpenId";
 const CJ_BASE = "https://developers.cjdropshipping.com/api2.0/v1";
 
 async function readTokenBundle(): Promise<CjTokenBundle> {
-  const [vaultOpenId, vaultAccess, vaultRefresh, vaultAccessExpiry, vaultRefreshExpiry] = await Promise.all([
-    getKey("cj", "CJ_OPEN_ID").catch(() => null),
-    getKey("cj", "CJ_ACCESS_TOKEN").catch(() => null),
-    getKey("cj", "CJ_REFRESH_TOKEN").catch(() => null),
-    getKey("cj", "CJ_ACCESS_TOKEN_EXPIRY_DATE").catch(() => null),
-    getKey("cj", "CJ_REFRESH_TOKEN_EXPIRY_DATE").catch(() => null),
-  ]);
+  // One service-level vault read is the cold/reload boundary. The coordinator still caches only
+  // in this server isolate and retains its existing single-flight refresh/atomic rotation rules.
+  const vault: Record<string, string> = await getService("cj").catch(() => ({}));
+  const vaultOpenId = vault.CJ_OPEN_ID ?? null;
+  const vaultAccess = vault.CJ_ACCESS_TOKEN ?? null;
+  const vaultRefresh = vault.CJ_REFRESH_TOKEN ?? null;
+  const vaultAccessExpiry = vault.CJ_ACCESS_TOKEN_EXPIRY_DATE ?? null;
+  const vaultRefreshExpiry = vault.CJ_REFRESH_TOKEN_EXPIRY_DATE ?? null;
   const accessToken = vaultAccess ?? process.env.CJ_ACCESS_TOKEN;
   const refreshToken = vaultRefresh ?? process.env.CJ_REFRESH_TOKEN;
   const openId = selectCjOpenId(vaultOpenId, process.env.CJ_OPEN_ID);

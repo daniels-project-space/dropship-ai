@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
+import { useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { SectionHeader } from "../../../components/ui/SectionHeader";
@@ -17,11 +17,10 @@ const LABEL = "label-eyebrow mb-2 block text-[10px]";
 // Not connected → domain + admin token form → POST /api/shopify/connect.
 // Recurring access verified → domain, current economic counts, "Sync now".
 // Legacy domain only        → visible re-verification form; never presented as connected.
-function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
-  const detail = useQuery(api.dashboard.brandDetail, { siteId: site._id as Id<"sites"> });
+function ConnectShopifyCard({ site, detail }: { site: BrandDetail["site"]; detail: BrandDetail }) {
   const recurringVerified = !!site.shopifyDomain && site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt;
   const needsReverification = !!site.shopifyDomain && !recurringVerified;
-  const economicsSync = detail?.economicsReadiness ?? "pending";
+  const economicsSync = detail.economicsReadiness;
 
   const [domain, setDomain] = useState(site.shopifyDomain ?? "");
   const [token, setToken] = useState("");
@@ -212,7 +211,7 @@ function ConnRow({ label, hint, connected }: { label: string; hint: string; conn
   );
 }
 
-export function SettingsTab({ site }: { site: Site }) {
+export function SettingsTab({ site, detail }: { site: Site; detail: BrandDetail }) {
   const update = useMutation(api.sites.update);
   const [distributionMode, setDistributionMode] = useState<Site["distributionMode"]>(site.distributionMode);
   const [minKitPriceUsd, setMinKitPriceUsd] = useState(String(site.minKitPriceUsd));
@@ -305,7 +304,7 @@ export function SettingsTab({ site }: { site: Site }) {
       {/* connected accounts */}
       <aside>
         <SectionHeader eyebrow="Connected accounts" accent="text-cyan" />
-        <ConnectShopifyCard site={site} />
+        <ConnectShopifyCard site={site} detail={detail} />
         <div className="mt-2.5 flex flex-col gap-2.5">
           <ConnRow label="CJ Dropshipping" hint="fulfillment + tracking" connected={false} />
           <ConnRow label="Ayrshare" hint="automated publishing" connected={false} />

@@ -7,6 +7,7 @@ import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
 import { stableSha256 } from "../src/lib/cjOrder";
+import { dashboardProjectionReady, projectCreativeTransition } from "./dashboardProjections";
 
 const creativeKind = v.union(
   v.literal("product_demo"),
@@ -54,9 +55,12 @@ export const requestGen = mutation({
       labelBurned,
       hook: args.hook,
       status,
+      publicationAuthorized: false,
+      queueState: status === "review" ? "review" : "none",
       revision: 1,
       createdAt: Date.now(),
     });
+    await projectCreativeTransition(ctx, null, (await ctx.db.get(creativeId))!);
     await appendAudit(ctx, {
       siteId: args.siteId,
       event: "creative_requested",
@@ -77,7 +81,8 @@ export const setAsset = mutation({
     }
     if (c.status === "approved" || c.status === "rejected") throw new Error(`creative ${creativeId} is immutable after review resolution`);
     const revision = (c.revision ?? 1) + 1;
-    await ctx.db.patch(creativeId, { r2Key, labelBurned, status: "review", revision });
+    await ctx.db.patch(creativeId, { r2Key, labelBurned, status: "review", revision, publicationAuthorized: false, queueState: "review" });
+    await projectCreativeTransition(ctx, c, (await ctx.db.get(creativeId))!);
     await appendAudit(ctx, { siteId: c.siteId, event: "creative_asset_ready", detail: { creativeId, r2Key, labelBurned } });
     return creativeId;
   },
@@ -96,7 +101,8 @@ export const approve = mutation({
     if (c.aiLabelRequired && c.labelBurned !== true) {
       throw new Error(`creative ${creativeId} requires verified burned-in AI disclosure before approval`);
     }
-    await ctx.db.patch(creativeId, { status: "approved" });
+    await ctx.db.patch(creativeId, { status: "approved", publicationAuthorized: false, queueState: "publication_authorization" });
+    await projectCreativeTransition(ctx, c, (await ctx.db.get(creativeId))!);
     await appendAudit(ctx, {
       siteId: c.siteId,
       event: "creative_approved",
@@ -141,6 +147,9 @@ export const authorizePublication = mutation({
         || existing.caption !== caption || JSON.stringify(existing.destinations) !== JSON.stringify(destinations)) {
         throw new Error("publication was already authorized for different immutable input");
       }
+      if (creative.publicationAuthorized !== true || creative.queueState !== "none") {
+        await ctx.db.patch(args.creativeId, { publicationAuthorized: true, queueState: "none" });
+      }
       return { creativeId: args.creativeId, dispatchKey, reused: true as const };
     }
     const now = Date.now();
@@ -148,6 +157,7 @@ export const authorizePublication = mutation({
       siteId: creative.siteId, creativeId: args.creativeId, creativeRevision: revision,
       caption, destinations, dispatchKey, status: "pending", createdAt: now, updatedAt: now,
     });
+    await ctx.db.patch(args.creativeId, { publicationAuthorized: true, queueState: "none" });
     await appendAudit(ctx, {
       siteId: creative.siteId,
       event: "creative_publication_authorized",
@@ -163,7 +173,8 @@ export const reject = mutation({
     const c = await ctx.db.get(creativeId);
     if (!c) throw new Error(`creative ${creativeId} not found`);
     if (c.status !== "review") throw new Error(`creative ${creativeId} is ${c.status}, not review`);
-    await ctx.db.patch(creativeId, { status: "rejected" });
+    await ctx.db.patch(creativeId, { status: "rejected", publicationAuthorized: false, queueState: "none" });
+    await projectCreativeTransition(ctx, c, (await ctx.db.get(creativeId))!);
     await appendAudit(ctx, {
       siteId: c.siteId,
       event: "creative_rejected",
@@ -181,11 +192,18 @@ export const listByStatus = query({
       ? ctx.db.query("creatives").withIndex("by_site_status", (qq) => qq.eq("siteId", siteId).eq("status", status))
       : ctx.db.query("creatives").withIndex("by_site_status", (qq) => qq.eq("siteId", siteId));
     const rows = await q.order("desc").take(limit ?? 100);
-    return Promise.all(rows.map(async (row) => ({
+    if (!(await dashboardProjectionReady(ctx))) {
+      return Promise.all(rows.map(async (row) => ({
+        ...row,
+        revision: row.revision ?? 1,
+        publicationAuthorized: !!(await ctx.db.query("distributionDispatches").withIndex("by_creative", (qq) => qq.eq("creativeId", row._id)).first()),
+      })));
+    }
+    return rows.map((row) => ({
       ...row,
       revision: row.revision ?? 1,
-      publicationAuthorized: !!(await ctx.db.query("distributionDispatches").withIndex("by_creative", (qq) => qq.eq("creativeId", row._id)).first()),
-    })));
+      publicationAuthorized: row.publicationAuthorized === true,
+    }));
   },
 });
 
@@ -194,37 +212,53 @@ export const listByStatus = query({
 export const listForReview = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
-    const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
-    const out = [];
-    for (const s of sites) {
-      const rows = await ctx.db
-        .query("creatives")
-        .withIndex("by_site_status", (q) => q.eq("siteId", s._id).eq("status", "review"))
-        .order("desc")
-        .take(limit ?? 50);
-      for (const r of rows) out.push({ ...r, siteName: s.name });
+    if (!(await dashboardProjectionReady(ctx))) {
+      const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
+      const out = [];
+      for (const site of sites) {
+        const rows = await ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "review")).order("desc").take(limit ?? 50);
+        for (const row of rows) out.push({ ...row, siteName: site.name });
+      }
+      return out.sort((a, b) => b.createdAt - a.createdAt).slice(0, limit ?? 100);
     }
-    out.sort((a, b) => b.createdAt - a.createdAt);
-    return out.slice(0, limit ?? 100);
+    const cap = Math.min(limit ?? 100, 100);
+    const rows = await ctx.db.query("creatives")
+      .withIndex("by_queue_created_at", (q) => q.eq("queueState", "review"))
+      .order("desc").take(cap * 2);
+    const siteIds = [...new Set(rows.map((row) => row.siteId))];
+    const sites = new Map((await Promise.all(siteIds.map((siteId) => ctx.db.get(siteId))))
+      .filter((site): site is NonNullable<typeof site> => !!site && site.sample !== true)
+      .map((site) => [site._id, site]));
+    return rows.filter((row) => sites.has(row.siteId)).slice(0, cap)
+      .map((row) => ({ ...row, siteName: sites.get(row.siteId)!.name }));
   },
 });
 
 export const listForPublicationAuthorization = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
-    const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
-    const out = [];
-    for (const site of sites) {
-      const rows = await ctx.db.query("creatives")
-        .withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "approved"))
-        .order("desc").take(limit ?? 50);
-      for (const row of rows) {
-        const dispatch = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", row._id)).first();
-        if (!dispatch) out.push({ ...row, revision: row.revision ?? 1, siteName: site.name });
+    if (!(await dashboardProjectionReady(ctx))) {
+      const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
+      const out = [];
+      for (const site of sites) {
+        const rows = await ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "approved")).order("desc").take(limit ?? 50);
+        for (const row of rows) {
+          const dispatch = await ctx.db.query("distributionDispatches").withIndex("by_creative", (q) => q.eq("creativeId", row._id)).first();
+          if (!dispatch) out.push({ ...row, revision: row.revision ?? 1, siteName: site.name });
+        }
       }
+      return out.sort((a, b) => b.createdAt - a.createdAt).slice(0, limit ?? 100);
     }
-    out.sort((a, b) => b.createdAt - a.createdAt);
-    return out.slice(0, limit ?? 100);
+    const cap = Math.min(limit ?? 100, 100);
+    const rows = await ctx.db.query("creatives")
+      .withIndex("by_queue_created_at", (q) => q.eq("queueState", "publication_authorization"))
+      .order("desc").take(cap * 2);
+    const siteIds = [...new Set(rows.map((row) => row.siteId))];
+    const sites = new Map((await Promise.all(siteIds.map((siteId) => ctx.db.get(siteId))))
+      .filter((site): site is NonNullable<typeof site> => !!site && site.sample !== true)
+      .map((site) => [site._id, site]));
+    return rows.filter((row) => sites.has(row.siteId)).slice(0, cap)
+      .map((row) => ({ ...row, revision: row.revision ?? 1, siteName: sites.get(row.siteId)!.name }));
   },
 });
 
