@@ -7,7 +7,7 @@ import { convexClient, api } from "@/src/lib/convexClient";
 import type { Id } from "@/convex/_generated/dataModel";
 import {
   creativeGenerationInputDigest, generationHandoffKey, normalizeCreativeGenerationInput,
-  validateCallerGenerationIdentity,
+  validateCallerGenerationIdentity, validateControlPlaneIdentity,
 } from "@/src/lib/creativeGeneration";
 import { FAL_CLIP_MODEL, FAL_IMAGE_MODEL } from "@/src/lib/gen/fal";
 import { ELEVEN_MODEL, ELEVEN_VOICE_ID } from "@/src/lib/gen/tts";
@@ -15,8 +15,26 @@ import { ELEVEN_MODEL, ELEVEN_VOICE_ID } from "@/src/lib/gen/tts";
 export const runtime = "nodejs";
 const MAX_BODY_BYTES = 16 * 1024;
 
-export async function POST(req: Request) {
-  const guard = await requireOperator(req);
+type GenerateRouteDependencies = {
+  authorize: typeof requireOperator;
+  getConvex: typeof convexClient;
+  trigger: typeof tasks.trigger;
+  triggerConfigured: () => boolean;
+};
+
+export function createGeneratePost(overrides: Partial<GenerateRouteDependencies> = {}) {
+  const dependencies: GenerateRouteDependencies = {
+    authorize: requireOperator,
+    getConvex: convexClient,
+    trigger: tasks.trigger,
+    triggerConfigured: () => !!(process.env.TRIGGER_SECRET_KEY || process.env.TRIGGER_ACCESS_TOKEN),
+    ...overrides,
+  };
+  return (req: Request) => handleGeneratePost(req, dependencies);
+}
+
+async function handleGeneratePost(req: Request, dependencies: GenerateRouteDependencies) {
+  const guard = await dependencies.authorize(req);
   if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
   const declaredLength = Number(req.headers.get("content-length") ?? "0");
   if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return NextResponse.json({ error: "request body is too large" }, { status: 413 });
@@ -41,7 +59,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "invalid generation request" }, { status: 400 });
   }
 
-  const convex = convexClient();
+  const convex = dependencies.getConvex();
   try {
     const intent: any = await convex.mutation(api.creativeGenerations.createOrReuseIntent, {
       siteId: input.siteId as Id<"sites">,
@@ -57,19 +75,27 @@ export async function POST(req: Request) {
       voiceId: ELEVEN_VOICE_ID,
     });
     const intentId = intent.intentId as Id<"creativeGenerationIntents">;
-    if (!process.env.TRIGGER_SECRET_KEY && !process.env.TRIGGER_ACCESS_TOKEN) {
+    if (!dependencies.triggerConfigured()) {
       return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "deferred", queued: false, durable: true, reused: intent.reused }, { status: 202 });
     }
     const claim: any = await convex.mutation(api.creativeGenerations.claimIntentHandoff, { intentId });
-    if (claim.state === "dispatched" || claim.state === "busy") {
-      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "queued", queued: true, durable: true, reused: true, runId: claim.triggerRunId }, { status: 202 });
+    if (claim.state === "dispatched") {
+      const runId = validateControlPlaneIdentity(claim.triggerRunId, "Trigger run ID");
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "queued", queued: true, durable: true, reused: true, runId }, { status: 202 });
+    }
+    if (claim.state === "busy") {
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "in_flight", queued: false, durable: true, reused: intent.reused }, { status: 202 });
+    }
+    if (claim.state !== "dispatch") {
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "deferred", queued: false, durable: true, reused: intent.reused }, { status: 202 });
     }
     try {
-      const handle = await tasks.trigger<typeof contentFactory>("content-factory", { intentId }, {
+      const handle = await dependencies.trigger<typeof contentFactory>("content-factory", { intentId }, {
         idempotencyKey: generationHandoffKey(intentId, claim.generation), idempotencyKeyTTL: "24w",
       });
-      await convex.mutation(api.creativeGenerations.recordIntentHandoff, { intentId, generation: claim.generation, triggerRunId: handle.id });
-      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "queued", queued: true, durable: true, reused: intent.reused, runId: handle.id }, { status: 202 });
+      const runId = validateControlPlaneIdentity(handle.id, "Trigger run ID");
+      await convex.mutation(api.creativeGenerations.recordIntentHandoff, { intentId, generation: claim.generation, triggerRunId: runId });
+      return NextResponse.json({ ok: true, intentId, requestId: identity.requestId, state: "queued", queued: true, durable: true, reused: intent.reused, runId }, { status: 202 });
     } catch {
       // Trigger may have accepted the deterministic handoff. The Convex lease remains due and
       // the recovery sweep reuses the exact idempotency key.
@@ -81,3 +107,5 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: message }, { status: conflict ? 409 : 422 });
   }
 }
+
+export const POST = createGeneratePost();

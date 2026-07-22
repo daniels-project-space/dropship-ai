@@ -17,7 +17,8 @@ import { assemble } from "../lib/assemble";
 import { distribute, reconcileAyrsharePost, type CreativeForPublish, type Platform } from "../lib/distribute";
 import { providerDeliveryDecision } from "../lib/distributionState";
 import { DeterministicObjectConflictError, getSignedUrl } from "../lib/storage";
-import { generationHandoffKey, generationStageKey, type GenerationStage } from "../lib/creativeGeneration";
+import { cancelResponseBody } from "../lib/boundedBody";
+import { generationHandoffKey, generationStageKey, validateControlPlaneIdentity, type GenerationStage } from "../lib/creativeGeneration";
 
 const configuredConcurrency = Number(process.env.CREATIVE_GENERATION_CONCURRENCY ?? "3");
 export const creativeGenerationQueue = queue({
@@ -38,8 +39,16 @@ function ttsReceipt(row: VariantRow): TtsProviderReceipt {
   return { requestId: row.ttsRequestId, voiceId: row.voiceId, model: row.ttsModel, textDigest: row.ttsTextDigest, characterCount: row.ttsCharacterCount, characterCost: row.ttsCharacterCost };
 }
 
-export async function processCreativeGenerationVariant(payload: VariantPayload, owner: string) {
-  const convex = convexClient();
+type ExecutorOverrides = {
+  convex?: ReturnType<typeof convexClient>;
+  getElevenLabsApiKey?: typeof getElevenLabsApiKey;
+  openElevenLabsTts?: typeof openElevenLabsTts;
+  cancelResponseBody?: typeof cancelResponseBody;
+};
+
+export async function processCreativeGenerationVariant(payload: VariantPayload, owner: string, overrides: ExecutorOverrides = {}) {
+  const convex = overrides.convex ?? convexClient();
+  validateControlPlaneIdentity(owner, "worker owner ID");
   const variantId = payload.variantId as Id<"creativeGenerationVariants">;
   const claimed: any = await convex.mutation(api.creativeGenerations.claimVariantStage, {
     variantId, expectedStage: payload.stage, owner, leaseMs: payload.stage === "assembly" ? 10 * 60_000 : 2 * 60_000,
@@ -89,14 +98,14 @@ export async function processCreativeGenerationVariant(payload: VariantPayload, 
     }
 
     if (payload.stage === "tts_reservation") {
-      const apiKey = await getElevenLabsApiKey();
+      const apiKey = await (overrides.getElevenLabsApiKey ?? getElevenLabsApiKey)();
       await convex.mutation(api.creativeGenerations.beginProviderSubmission, { variantId, expectedStage: "tts_reservation", leaseGeneration });
       try {
-        const opened = await openElevenLabsTts({ text: row.hook, voiceId: row.voiceId, model: row.ttsModel, apiKey });
+        const opened = await (overrides.openElevenLabsTts ?? openElevenLabsTts)({ text: row.hook, voiceId: row.voiceId, model: row.ttsModel, apiKey });
         const recorded = await convex.mutation(api.creativeGenerations.recordTtsReceipt, { variantId, leaseGeneration, ...opened.receipt });
-        // Complete the response stream after the durable header receipt. A body loss is harmless:
-        // the next invocation uses history and never creates a second billed sample.
-        await opened.response.arrayBuffer().catch(() => undefined);
+        // The header receipt is durable. Stop the unneeded audio stream without materializing it;
+        // the next stage recovers this exact billed generation from history.
+        await (overrides.cancelResponseBody ?? cancelResponseBody)(opened.response);
         return recorded;
       } catch (error) {
         if (error instanceof TtsDefinitiveSubmissionError) return fail("definitive", "tts_submission_rejected");
@@ -149,22 +158,51 @@ export const creativeGenerationStage = task({
   run: async (payload: VariantPayload, { ctx }) => processCreativeGenerationVariant(payload, ctx.run.id),
 });
 
-async function dispatchDueVariants(limit = 12) {
-  const convex = convexClient();
-  const due: Array<{ variantId: string; stage: GenerationStage; leaseGeneration: number }> = await convex.query(api.creativeGenerations.listDueVariants, { limit }) as any;
+type DispatchOverrides = {
+  convex?: ReturnType<typeof convexClient>;
+  trigger?: typeof tasks.trigger;
+  now?: number;
+};
+
+async function dispatchRows(
+  due: Array<{ variantId: string; stage: GenerationStage; leaseGeneration: number }>,
+  trigger: typeof tasks.trigger,
+) {
   for (const row of due) {
-    await tasks.trigger<typeof creativeGenerationStage>("creative-generation-stage", { variantId: row.variantId, stage: row.stage }, {
+    await trigger<typeof creativeGenerationStage>("creative-generation-stage", { variantId: row.variantId, stage: row.stage }, {
       idempotencyKey: generationStageKey(row.variantId, row.stage, row.leaseGeneration + 1), idempotencyKeyTTL: "1m",
     });
   }
   return due.length;
 }
 
+export async function dispatchDueVariants(limit = 12, overrides: DispatchOverrides = {}) {
+  const convex = overrides.convex ?? convexClient();
+  const due: Array<{ variantId: string; stage: GenerationStage; leaseGeneration: number }> = await convex.query(
+    api.creativeGenerations.listDueVariants, { limit, now: overrides.now ?? Date.now() },
+  ) as any;
+  return dispatchRows(due, overrides.trigger ?? tasks.trigger);
+}
+
+export async function dispatchDueVariantsForIntent(intentIdentity: string, overrides: DispatchOverrides = {}) {
+  const intentId = validateControlPlaneIdentity(intentIdentity, "generation intent ID") as Id<"creativeGenerationIntents">;
+  const convex = overrides.convex ?? convexClient();
+  const due: Array<{ variantId: string; stage: GenerationStage; leaseGeneration: number }> = await convex.query(
+    api.creativeGenerations.listDueVariantsForIntent, { intentId, now: overrides.now ?? Date.now() },
+  ) as any;
+  return dispatchRows(due, overrides.trigger ?? tasks.trigger);
+}
+
+export async function runContentFactory(payload: { intentId: string }, overrides: DispatchOverrides = {}) {
+  const intentId = validateControlPlaneIdentity(payload.intentId, "generation intent ID");
+  return { intentId, dispatchedVariants: await dispatchDueVariantsForIntent(intentId, overrides) };
+}
+
 // The original task ID is retained as a short, idempotent handoff for deployed callers.
 export const contentFactory = task({
   id: "content-factory",
   maxDuration: 60,
-  run: async (payload: { intentId: string }) => ({ intentId: payload.intentId, dispatchedVariants: await dispatchDueVariants() }),
+  run: async (payload: { intentId: string }) => runContentFactory(payload),
 });
 
 export const creativeGenerationRecovery = schedules.task({
@@ -172,7 +210,7 @@ export const creativeGenerationRecovery = schedules.task({
   cron: "*/1 * * * *",
   run: async () => {
     const convex = convexClient();
-    const handoffs: Array<{ intentId: string }> = await convex.query(api.creativeGenerations.listDueIntentHandoffs, { limit: 25 }) as any;
+    const handoffs: Array<{ intentId: string }> = await convex.query(api.creativeGenerations.listDueIntentHandoffs, { limit: 25, now: Date.now() }) as any;
     let recoveredHandoffs = 0;
     for (const due of handoffs) {
       const claim: any = await convex.mutation(api.creativeGenerations.claimIntentHandoff, { intentId: due.intentId as Id<"creativeGenerationIntents"> });

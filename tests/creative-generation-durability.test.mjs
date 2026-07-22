@@ -189,7 +189,8 @@ test("source contract has every durable stage, queue-only fal, bounded sweeps, a
   assert.equal(falSource.includes("https://fal.run"), false);
   assert.equal(falSource.includes("https://queue.fal.run"), true);
   assert.equal(triggerSource.includes("for (let i = 0; i < K"), false, "the sequential variant loop must stay deleted");
-  assert.match(triggerSource, /listDueVariants, \{ limit \}/);
+  assert.match(triggerSource, /listDueVariants, \{ limit, now:/);
+  assert.match(triggerSource, /listDueVariantsForIntent/);
   assert.match(triggerSource, /\{ variantId: row\.variantId, stage: row\.stage \}/);
   assert.equal(/tasks\.trigger[^\n]+(?:prompt|hook|credential|apiKey)/i.test(triggerSource), false);
   for (const required of ["requestId", "inputDigest", "normalizeCreativeGenerationInput", "claimIntentHandoff", "idempotencyKey"]) assert.equal(routeSource.includes(required), true);

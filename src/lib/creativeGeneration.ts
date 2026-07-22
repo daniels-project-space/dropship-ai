@@ -120,3 +120,9 @@ export function isProviderSubmissionStage(stage: GenerationStage): boolean {
   return stage === "image_submission" || stage === "clip_submission" || stage === "tts_reservation";
 }
 
+export function validateControlPlaneIdentity(value: unknown, name: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value)) {
+    throw new Error(`${name} must be a bounded control-plane identity`);
+  }
+  return value;
+}

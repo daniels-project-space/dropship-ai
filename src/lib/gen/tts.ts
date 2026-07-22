@@ -3,6 +3,7 @@
 import { getKey } from "../vault";
 import { putDeterministicObject, type StoredObjectReceipt } from "../storage";
 import { stableSha256 } from "../cjOrder";
+import { readResponseBodyBounded } from "../boundedBody";
 
 const ELEVEN_BASE = "https://api.elevenlabs.io/v1";
 export const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM";
@@ -102,5 +103,7 @@ export async function copyTtsHistoryAudio(args: {
   const response = await (args.fetchImpl ?? fetch)(`${ELEVEN_BASE}/history/${encodeURIComponent(args.historyItemId)}/audio`, { headers: { "xi-api-key": args.apiKey, Accept: "audio/mpeg" } });
   if (!response.ok) throw new Error(`elevenlabs_history_audio_http_${response.status}`);
   if (response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "audio/mpeg") throw new Error("elevenlabs_audio_type_invalid");
-  return (args.putObject ?? putDeterministicObject)(args.r2Key, Buffer.from(await response.arrayBuffer()), "audio/mpeg", 20 * 1024 * 1024);
+  const maxBytes = 20 * 1024 * 1024;
+  const body = await readResponseBodyBounded(response, maxBytes, "ElevenLabs history audio");
+  return (args.putObject ?? putDeterministicObject)(args.r2Key, body, "audio/mpeg", maxBytes);
 }

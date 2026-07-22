@@ -10,6 +10,7 @@ import {
 import { getSignedUrl as presign } from "@aws-sdk/s3-request-presigner";
 import { getService } from "./vault";
 import { createHash } from "node:crypto";
+import { readResponseBodyBounded } from "./boundedBody";
 
 export const BUCKET = "dropship-ai";
 
@@ -127,17 +128,32 @@ export async function putDeterministicObject(
 
 export async function getObjectBuffer(
   key: string,
-  expected?: { contentType: string; bytes: number; sha256: string },
+  expected: { contentType: string; bytes: number; sha256: string },
 ): Promise<Buffer> {
+  const cap = expected.contentType === "audio/mpeg" || expected.contentType === "image/jpeg"
+    ? 20 * 1024 * 1024
+    : expected.contentType === "video/mp4"
+      ? (key.endsWith("/clip.mp4") ? 200 * 1024 * 1024 : 300 * 1024 * 1024)
+      : 0;
+  if (!Number.isSafeInteger(expected.bytes) || expected.bytes < 1 || expected.bytes > cap
+    || !/^[a-f0-9]{64}$/.test(expected.sha256)) {
+    throw new DeterministicObjectConflictError(key);
+  }
   const c = await client();
   const result = await c.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
   if (!result.Body) throw new Error(`storage: object ${key} has no body`);
-  const body = Buffer.from(await result.Body.transformToByteArray());
-  if (expected) {
-    const digest = createHash("sha256").update(body).digest("hex");
-    if (result.ContentType !== expected.contentType || body.byteLength !== expected.bytes || digest !== expected.sha256) {
-      throw new DeterministicObjectConflictError(key);
-    }
+  const headers = new Headers();
+  if (result.ContentLength !== undefined) headers.set("content-length", String(result.ContentLength));
+  const response = new Response(result.Body.transformToWebStream(), { headers });
+  let body: Buffer;
+  try {
+    body = await readResponseBodyBounded(response, expected.bytes, `storage object ${key}`);
+  } catch {
+    throw new DeterministicObjectConflictError(key);
+  }
+  const digest = createHash("sha256").update(body).digest("hex");
+  if (result.ContentType !== expected.contentType || body.byteLength !== expected.bytes || digest !== expected.sha256) {
+    throw new DeterministicObjectConflictError(key);
   }
   return body;
 }

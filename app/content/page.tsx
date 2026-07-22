@@ -1,10 +1,11 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
-import { creativeGenerationInputDigest, normalizeCreativeGenerationInput } from "@/src/lib/creativeGeneration";
+import { normalizeCreativeGenerationInput } from "@/src/lib/creativeGeneration";
+import { confirmPendingCreativeRequest, getOrCreatePendingCreativeRequest } from "@/src/lib/creativeRequestIdentity";
 import { CreativeCard, type ReviewCreative } from "../components/CreativeCard";
 import { EmptyState } from "../components/EmptyState";
 import { StatusDot } from "../components/StatusDot";
@@ -22,7 +23,6 @@ function GenerateBar({
   const [siteId, setSiteId] = useState("");
   const [state, setState] = useState<null | "running" | "done" | "error">(null);
   const [msg, setMsg] = useState<string | null>(null);
-  const pendingRequestId = useRef<string | null>(null);
 
   async function generate() {
     if (!siteId) return;
@@ -30,16 +30,18 @@ function GenerateBar({
     setMsg(null);
     try {
       const normalized = normalizeCreativeGenerationInput({ siteId, variants: 3 });
-      const requestId = pendingRequestId.current ?? crypto.randomUUID();
-      pendingRequestId.current = requestId;
+      const pending = getOrCreatePendingCreativeRequest(sessionStorage, normalized, () => crypto.randomUUID());
       const r = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...normalized, requestId, inputDigest: creativeGenerationInputDigest(normalized) }),
+        body: JSON.stringify({ ...normalized, requestId: pending.requestId, inputDigest: pending.inputDigest }),
       });
       const d = await r.json();
       if (r.ok) {
-        pendingRequestId.current = null;
+        if (d.durable === true && typeof d.intentId === "string" && d.intentId
+          && d.requestId === pending.requestId) {
+          confirmPendingCreativeRequest(sessionStorage, pending);
+        }
         setState("done");
         setMsg(`Batch ${String(d.intentId).slice(0, 12)} ${d.state === "deferred" ? "saved · handoff deferred" : "queued"}`);
       } else {
@@ -66,7 +68,7 @@ function GenerateBar({
         <div className="relative">
           <select
             value={siteId}
-            onChange={(e) => { setSiteId(e.target.value); pendingRequestId.current = null; setState(null); setMsg(null); }}
+            onChange={(e) => { setSiteId(e.target.value); setState(null); setMsg(null); }}
             className="w-full appearance-none rounded-lg border border-line bg-panel-2 px-4 py-2.5 pr-9 text-[13px] text-ink outline-none transition focus:border-signal/50 sm:w-52"
           >
             <option value="">Select brand…</option>

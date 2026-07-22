@@ -3,6 +3,7 @@
 import { getKey } from "../vault";
 import { putDeterministicObject, type StoredObjectReceipt } from "../storage";
 import type { FalQueueState } from "../creativeGeneration";
+import { readResponseBodyBounded } from "../boundedBody";
 
 const QUEUE_BASE = "https://queue.fal.run";
 export const FAL_IMAGE_MODEL = process.env.FAL_MODEL_IMAGE ?? "fal-ai/flux/schnell";
@@ -118,10 +119,11 @@ export async function copyFalQueueResult(args: {
   const media = await (args.fetchImpl ?? fetch)(mediaUrl);
   if (!media.ok) throw new Error(`fal_media_download_http_${media.status}`);
   const expectedType = args.kind === "image" ? "image/jpeg" : "video/mp4";
+  const maxBytes = args.kind === "image" ? 20 * 1024 * 1024 : 200 * 1024 * 1024;
   const receivedType = media.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
   if (receivedType !== expectedType) throw new Error("fal_media_type_invalid");
-  const body = Buffer.from(await media.arrayBuffer());
-  return (args.putObject ?? putDeterministicObject)(args.r2Key, body, expectedType, args.kind === "image" ? 20 * 1024 * 1024 : 200 * 1024 * 1024);
+  const body = await readResponseBodyBounded(media, maxBytes, "fal media");
+  return (args.putObject ?? putDeterministicObject)(args.r2Key, body, expectedType, maxBytes);
 }
 
 export function imageQueueInput(prompt: string): Record<string, unknown> {

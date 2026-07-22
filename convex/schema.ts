@@ -297,6 +297,7 @@ export default defineSchema({
     updatedAt: v.number(),
     completedAt: v.optional(v.number()),
   }).index("by_intent_index", ["intentId", "variantIndex"])
+    .index("by_intent_due", ["intentId", "terminal", "runnableAt"])
     .index("by_due", ["terminal", "runnableAt"])
     .index("by_site_updated", ["siteId", "updatedAt"]),
 
