@@ -26,7 +26,8 @@ export const portfolio = query({
   handler: async (ctx, { dataMode }) => {
     if (await dashboardProjectionReady(ctx)) {
       const mode = dataMode ?? "live";
-      const summaries = await ctx.db.query("dashboardSiteSummaries").withIndex("by_mode_site", (q) => q.eq("dataMode", mode)).take(DASHBOARD_MAX_SITES);
+      const summaries = await ctx.db.query("dashboardSiteSummaries").withIndex("by_mode_site", (q) => q.eq("dataMode", mode)).take(DASHBOARD_MAX_SITES + 1);
+      if (summaries.length > DASHBOARD_MAX_SITES) throw new Error(`portfolio ${mode} exceeds the bounded site projection`);
       const rows = summaries.map((site) => ({
         siteId: site.siteId, name: site.name, niche: site.niche, status: site.status,
         distributionMode: site.distributionMode, shopifyDomain: site.shopifyDomain ?? null,
@@ -219,7 +220,9 @@ async function resolveSites(ctx: QueryCtx, scope: string | undefined, dataMode: 
     const s = await ctx.db.get(scope as Id<"sites">);
     return s && matchesDataMode(s, dataMode) ? [s] : [];
   }
-  return (await ctx.db.query("sites").take(200)).filter((site) => matchesDataMode(site, dataMode));
+  const sites = await ctx.db.query("sites").take(DASHBOARD_MAX_SITES + 1);
+  if (sites.length > DASHBOARD_MAX_SITES) throw new Error("site source exceeds the bounded dashboard scope");
+  return sites.filter((site) => matchesDataMode(site, dataMode));
 }
 
 // `metric` ∈ "revenue" | "orders" | "views" | "engagement". Returns a dense
@@ -561,11 +564,14 @@ async function projectedGate(ctx: QueryCtx, siteId: Id<"sites"> | undefined, mod
   let bestVideo = null;
   if (bestRow?.bestPost) {
     const best = bestRow.bestPost;
-    const site = "siteId" in best ? null : siteId ? await ctx.db.get(siteId) : null;
+    const resolvedSiteId = "siteId" in best ? best.siteId : siteId!;
+    // Names are mutable metadata. One point read keeps up to 180 retained extrema coherent
+    // without rewriting every day row when a brand is renamed.
+    const site = await ctx.db.get(resolvedSiteId);
     bestVideo = {
       postId: best.postId,
-      siteId: "siteId" in best ? best.siteId : siteId!,
-      siteName: "siteName" in best ? best.siteName : site?.name ?? "Unknown brand",
+      siteId: resolvedSiteId,
+      siteName: site?.name ?? "Unknown brand",
       platform: best.platform,
       views: best.views,
       engagement: best.engagement,
@@ -601,9 +607,25 @@ export const shellSnapshot = query({
     if (!ready) {
       // The migration contract deliberately leaves authoritative legacy reads active until the
       // final verification transaction flips `read-switch` to ready.
-      const sites = (await ctx.db.query("sites").order("desc").take(DASHBOARD_MAX_SITES)).filter((site) => matchesDataMode(site, mode));
+      const allSites = await ctx.db.query("sites").order("desc").take(DASHBOARD_MAX_SITES + 1);
+      if (allSites.length > DASHBOARD_MAX_SITES) throw new Error("site source exceeds the bounded shell scope");
+      const sites = allSites.filter((site) => matchesDataMode(site, mode));
+      let legacyBest: any = null;
+      let observedInWindow = 0;
       const rows = await Promise.all(sites.map(async (site) => {
-        const pending = await ctx.db.query("actions").withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "pending_approval")).take(500);
+        const [pending, posts] = await Promise.all([
+          ctx.db.query("actions").withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "pending_approval")).take(501),
+          ctx.db.query("posts").withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "published")).take(501),
+        ]);
+        if (pending.length > 500 || posts.length > 500) throw new Error(`site ${site._id} exceeds the bounded legacy shell source cap`);
+        for (const post of posts) {
+          if ((post.publishedAt ?? post._creationTime) < now - TRAILING_MS || !hasProviderObservedPostMetrics(post)) continue;
+          observedInWindow++;
+          if (!legacyBest || (post.views ?? 0) > legacyBest.views) {
+            const creative = await ctx.db.get(post.creativeId);
+            legacyBest = { postId: post._id, siteId: site._id, siteName: site.name, platform: post.platform, views: post.views ?? 0, engagement: post.engagement ?? 0, creativeId: post.creativeId, r2Key: creative?.r2Key ?? null, publishedAt: post.publishedAt ?? null };
+          }
+        }
         return { siteId: site._id, name: site.name, status: site.status, pendingActionCount: pending.length };
       }));
       const sampleSites = (await ctx.db.query("sites").withIndex("by_sample", (q) => q.eq("sample", true)).take(200));
@@ -611,14 +633,15 @@ export const shellSnapshot = query({
         projectionState: "legacy" as const,
         brands: rows,
         totalPendingActions: rows.reduce((sum, row) => sum + row.pendingActionCount, 0),
-        contentFit: { threshold: VIEW_THRESHOLD, trailingDays: 30, passed: false, totalPublishedInWindow: 0, bestVideo: null },
+        contentFit: { threshold: VIEW_THRESHOLD, trailingDays: 30, passed: (legacyBest?.views ?? 0) >= VIEW_THRESHOLD, totalPublishedInWindow: observedInWindow, bestVideo: legacyBest },
         sampleStatus: { present: sampleSites.length > 0, sampleSiteCount: sampleSites.length, sampleSiteNames: sampleSites.map((site) => site.name) },
         controlPlane,
       };
     }
 
-    const sites = await ctx.db.query("dashboardSiteSummaries").withIndex("by_mode_site", (q) => q.eq("dataMode", mode)).take(DASHBOARD_MAX_SITES);
-    const sampleSites = await ctx.db.query("dashboardSiteSummaries").withIndex("by_mode_site", (q) => q.eq("dataMode", "sample")).take(DASHBOARD_MAX_SITES);
+    const sites = await ctx.db.query("dashboardSiteSummaries").withIndex("by_mode_site", (q) => q.eq("dataMode", mode)).take(DASHBOARD_MAX_SITES + 1);
+    const sampleSites = await ctx.db.query("dashboardSiteSummaries").withIndex("by_mode_site", (q) => q.eq("dataMode", "sample")).take(DASHBOARD_MAX_SITES + 1);
+    if (sites.length > DASHBOARD_MAX_SITES || sampleSites.length > DASHBOARD_MAX_SITES) throw new Error("site projection exceeds the bounded shell scope");
     const gate = await projectedGate(ctx, undefined, mode, now);
     return {
       projectionState: "ready" as const,
@@ -678,12 +701,17 @@ export const commandCenterSnapshot = query({
     let rows: any[];
     let summary: any;
     let legacyBest: any = null;
+    let selectedModeMismatch = false;
     if (ready) {
+      const selected = siteId
+        ? await ctx.db.query("dashboardSiteSummaries").withIndex("by_site", (q) => q.eq("siteId", siteId)).unique() : null;
+      const selectedMatchesMode = !siteId || selected?.dataMode === mode;
+      selectedModeMismatch = !selectedMatchesMode;
       rows = siteId
-        ? await ctx.db.query("dashboardDailyRollups").withIndex("by_site_day", (q) => q.eq("siteId", siteId).gte("day", sinceDay)).take(DASHBOARD_MAX_DAYS)
+        ? selectedMatchesMode ? await ctx.db.query("dashboardDailyRollups").withIndex("by_site_day", (q) => q.eq("siteId", siteId).gte("day", sinceDay)).take(DASHBOARD_MAX_DAYS) : []
         : await ctx.db.query("dashboardPortfolioDailyRollups").withIndex("by_mode_day", (q) => q.eq("dataMode", mode).gte("day", sinceDay)).take(DASHBOARD_MAX_DAYS);
       summary = siteId
-        ? await ctx.db.query("dashboardSiteSummaries").withIndex("by_site", (q) => q.eq("siteId", siteId)).unique()
+        ? selectedMatchesMode ? selected : null
         : await ctx.db.query("dashboardPortfolioSummaries").withIndex("by_mode", (q) => q.eq("dataMode", mode)).unique();
     } else {
       // Authoritative compatibility path until the atomic read switch. It reads each bounded
@@ -753,7 +781,9 @@ export const commandCenterSnapshot = query({
       views: scopedRows.reduce((sum, row) => sum + row.platforms[key].views, 0),
       engagement: scopedRows.reduce((sum, row) => sum + row.platforms[key].engagement, 0),
     }));
-    const gate = ready ? await projectedGate(ctx, siteId, mode, now) : {
+    const gate = ready && !selectedModeMismatch ? await projectedGate(ctx, siteId, mode, now) : ready ? {
+      threshold: VIEW_THRESHOLD, trailingDays: 30, passed: false, totalPublishedInWindow: 0, bestVideo: null,
+    } : {
       threshold: VIEW_THRESHOLD, trailingDays: 30, passed: (legacyBest?.views ?? 0) >= VIEW_THRESHOLD,
       totalPublishedInWindow: rows.filter((row) => row.day >= dashboardDay(now - 29 * DAY_MS)).reduce((sum, row) => sum + row.observedPosts, 0),
       bestVideo: legacyBest,

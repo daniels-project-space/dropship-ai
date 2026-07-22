@@ -7,6 +7,7 @@
 // blanket wipe, so they can never touch a real site.
 import { mutation } from "./authz";
 import { v } from "convex/values";
+import { deleteSiteProjections, projectActionTransition, projectCreativeTransition, projectProductTransition } from "./dashboardProjections";
 
 /**
  * Cascade-delete a single site and everything scoped to it: creatives, posts, actions, auditLog,
@@ -40,6 +41,7 @@ export const deleteSiteCascade = mutation({
     await delAll(await ctx.db.query("experiments").withIndex("by_site_status", (q) => q.eq("siteId", siteId)).collect());
     await delAll(await ctx.db.query("orders").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect());
 
+    await deleteSiteProjections(ctx, site);
     await ctx.db.delete(siteId);
     removed++;
     return { deleted: true, site: site.name, rowsRemoved: removed };
@@ -53,6 +55,7 @@ export const deleteCreative = mutation({
     const c = await ctx.db.get(creativeId);
     if (!c) return { deleted: false };
     await ctx.db.delete(creativeId);
+    await projectCreativeTransition(ctx, c, null);
     return { deleted: true, r2Key: c.r2Key };
   },
 });
@@ -64,6 +67,7 @@ export const deleteAction = mutation({
     const a = await ctx.db.get(actionId);
     if (!a) return { deleted: false };
     await ctx.db.delete(actionId);
+    await projectActionTransition(ctx, a, null);
     return { deleted: true, type: a.type };
   },
 });
@@ -91,6 +95,7 @@ export const deleteProduct = mutation({
       }
     }
     await ctx.db.delete(productId);
+    await projectProductTransition(ctx, p, null);
     return { deleted: true, title: p.title, auditRemoved };
   },
 });

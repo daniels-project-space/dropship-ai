@@ -213,9 +213,13 @@ export default defineSchema({
     revision: v.optional(v.number()),              // immutable publication authorization fence
     createdAt: v.number(),
     sample: v.optional(v.boolean()),
+    // Materialized tenant mode keeps cross-site queues index-isolated. Optional only while the
+    // dashboard-v1 migration normalizes legacy rows.
+    dashboardDataMode: v.optional(v.union(v.literal("live"), v.literal("sample"))),
   }).index("by_site_status", ["siteId", "status"]).index("by_product", ["productId"]).index("by_r2_key", ["r2Key"])
     .index("by_generation_variant", ["generationVariantId"])
     .index("by_queue_created_at", ["queueState", "createdAt"])
+    .index("by_queue_created_at_mode", ["dashboardDataMode", "queueState", "createdAt"])
     .index("by_site_queue_created_at", ["siteId", "queueState", "createdAt"]),
 
   // One atomically-created parent plus K immutable children exists before any Trigger handoff.
@@ -323,8 +327,11 @@ export default defineSchema({
     metricsObservedAt: v.optional(v.number()),    // provider observation time, never a UI estimate
     metricsProvider: v.optional(v.literal("ayrshare")), // only a provider ingestion worker may set metrics
     sample: v.optional(v.boolean()),
+    // Projection-owned bucket used only for bounded winner recomputation.
+    dashboardPublishedDay: v.optional(v.string()),
   }).index("by_site_status", ["siteId", "status"]).index("by_site_platform", ["siteId", "platform"])
     .index("by_site_published_at", ["siteId", "publishedAt"])
+    .index("by_site_dashboard_day", ["siteId", "dashboardPublishedDay"])
     .index("by_creative_platform", ["creativeId", "platform"]),
 
   // Created only by the separate publication-authorization action. Content approval alone has
@@ -648,6 +655,7 @@ export default defineSchema({
     orderCount: v.number(),
     revenueUsd: v.number(),
     commerceVerified: v.boolean(),
+    commerceCurrentSiteCount: v.optional(v.number()),
     topProducts: v.array(v.object({
       productId: v.id("products"), title: v.string(), siteName: v.string(), views: v.number(),
       cvr: v.optional(v.number()), marginPct: v.optional(v.number()), priceUsd: v.number(),
@@ -661,6 +669,7 @@ export default defineSchema({
     dataMode: v.union(v.literal("live"), v.literal("sample")),
     day: v.string(),
     orders: v.number(), revenueUsd: v.number(), purchases: v.number(),
+    commerceProjected: v.optional(v.boolean()),
     publishedPosts: v.number(), observedPosts: v.number(), views: v.number(), engagement: v.number(),
     platforms: v.object({
       tiktok: v.object({ posts: v.number(), views: v.number(), engagement: v.number() }),
@@ -673,7 +682,8 @@ export default defineSchema({
       views: v.number(), engagement: v.number(), publishedAt: v.optional(v.number()), r2Key: v.optional(v.string()),
     })),
     updatedAt: v.number(),
-  }).index("by_site_day", ["siteId", "day"]).index("by_mode_day", ["dataMode", "day"]),
+  }).index("by_site_day", ["siteId", "day"]).index("by_mode_day", ["dataMode", "day"])
+    .index("by_site_commerce_day", ["siteId", "commerceProjected", "day"]),
 
   dashboardPortfolioDailyRollups: defineTable({
     dataMode: v.union(v.literal("live"), v.literal("sample")),
@@ -703,8 +713,22 @@ export default defineSchema({
     verified: v.boolean(),
     driftCount: v.number(),
     processed: v.number(),
+    driftSites: v.optional(v.array(v.id("sites"))),
+    driftDays: v.optional(v.array(v.string())),
+    verificationStage: v.optional(v.union(v.literal("sites"), v.literal("portfolio-days"))),
     updatedAt: v.number(),
   }).index("by_name_entity", ["name", "entity"]).index("by_name", ["name"]),
+
+  // Durable per-source contribution receipts are the exactly-once boundary shared by live
+  // writers, migration pages, retries and repairs. `contribution` contains compact facts only.
+  dashboardProjectionReceipts: defineTable({
+    entity: v.union(v.literal("product"), v.literal("action"), v.literal("post"), v.literal("creative")),
+    sourceId: v.string(),
+    siteId: v.id("sites"),
+    contribution: v.any(),
+    updatedAt: v.number(),
+  }).index("by_entity_source", ["entity", "sourceId"])
+    .index("by_site_entity", ["siteId", "entity"]),
 
   dashboardControlPlaneHeartbeats: defineTable({
     component: v.string(),

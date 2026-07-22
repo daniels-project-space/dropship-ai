@@ -213,7 +213,9 @@ export const listForReview = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
     if (!(await dashboardProjectionReady(ctx))) {
-      const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
+      const allSites = await ctx.db.query("sites").take(501);
+      if (allSites.length > 500) throw new Error("live review queue exceeds the bounded legacy site cap");
+      const sites = allSites.filter((site) => site.sample !== true);
       const out = [];
       for (const site of sites) {
         const rows = await ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "review")).order("desc").take(limit ?? 50);
@@ -223,8 +225,8 @@ export const listForReview = query({
     }
     const cap = Math.min(limit ?? 100, 100);
     const rows = await ctx.db.query("creatives")
-      .withIndex("by_queue_created_at", (q) => q.eq("queueState", "review"))
-      .order("desc").take(cap * 2);
+      .withIndex("by_queue_created_at_mode", (q) => q.eq("dashboardDataMode", "live").eq("queueState", "review"))
+      .order("desc").take(cap);
     const siteIds = [...new Set(rows.map((row) => row.siteId))];
     const sites = new Map((await Promise.all(siteIds.map((siteId) => ctx.db.get(siteId))))
       .filter((site): site is NonNullable<typeof site> => !!site && site.sample !== true)
@@ -238,7 +240,9 @@ export const listForPublicationAuthorization = query({
   args: { limit: v.optional(v.number()) },
   handler: async (ctx, { limit }) => {
     if (!(await dashboardProjectionReady(ctx))) {
-      const sites = (await ctx.db.query("sites").take(200)).filter((site) => site.sample !== true);
+      const allSites = await ctx.db.query("sites").take(501);
+      if (allSites.length > 500) throw new Error("live publication queue exceeds the bounded legacy site cap");
+      const sites = allSites.filter((site) => site.sample !== true);
       const out = [];
       for (const site of sites) {
         const rows = await ctx.db.query("creatives").withIndex("by_site_status", (q) => q.eq("siteId", site._id).eq("status", "approved")).order("desc").take(limit ?? 50);
@@ -251,8 +255,8 @@ export const listForPublicationAuthorization = query({
     }
     const cap = Math.min(limit ?? 100, 100);
     const rows = await ctx.db.query("creatives")
-      .withIndex("by_queue_created_at", (q) => q.eq("queueState", "publication_authorization"))
-      .order("desc").take(cap * 2);
+      .withIndex("by_queue_created_at_mode", (q) => q.eq("dashboardDataMode", "live").eq("queueState", "publication_authorization"))
+      .order("desc").take(cap);
     const siteIds = [...new Set(rows.map((row) => row.siteId))];
     const sites = new Map((await Promise.all(siteIds.map((siteId) => ctx.db.get(siteId))))
       .filter((site): site is NonNullable<typeof site> => !!site && site.sample !== true)
