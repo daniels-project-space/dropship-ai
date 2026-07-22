@@ -6,8 +6,9 @@
 //   Shopify product.status (ACTIVE|ARCHIVED|DRAFT) → products enum (active|archived|draft).
 //   Shopify displayFulfillmentStatus              → orders enum (received|shipped|...).
 import { convexClient, api } from "./convexClient";
-import { listProducts, listOrders, type ShopifyClientConfig } from "./shopify";
+import { getShop, listProducts, listOrders, type ShopifyClientConfig } from "./shopify";
 import type { Id } from "../../convex/_generated/dataModel";
+import { assertShopifyIdentity, normalizeShopifyDomain } from "./shopifyIdentity";
 
 type ProductStatus = "draft" | "active" | "archived" | "killed";
 function mapProductStatus(s: "ACTIVE" | "ARCHIVED" | "DRAFT"): ProductStatus {
@@ -33,6 +34,10 @@ export interface SyncResult {
   lastSyncedAt: number;
 }
 
+export function boundedShopifySinceDays(value: number): number {
+  return Math.min(Math.max(Math.trunc(value), 1), 60);
+}
+
 /** Run the read-only products+orders sync for a site using an already-resolved config. */
 export async function syncShopify(
   siteId: string,
@@ -41,10 +46,21 @@ export async function syncShopify(
 ): Promise<SyncResult> {
   const convex = convexClient();
   const sid = siteId as Id<"sites">;
+  const boundedSinceDays = boundedShopifySinceDays(sinceDays);
+
+  // Identity/currency verification is deliberately first. A mismatch reaches no Convex writer,
+  // while a legacy valid site gets currency + recurring-access proof before order economics.
+  const shop = await getShop(cfg);
+  assertShopifyIdentity(cfg.shop, shop.myshopifyDomain, shop.currencyCode);
+  await convex.mutation(api.sites.verifyConnectedStore, {
+    siteId: sid,
+    shopifyDomain: normalizeShopifyDomain(cfg.shop),
+    storeCurrency: shop.currencyCode,
+  });
 
   const [products, orders] = await Promise.all([
     listProducts(cfg, { limit: 250 }),
-    listOrders(cfg, { sinceDays, limit: 250 }),
+    listOrders(cfg, { sinceDays: boundedSinceDays, limit: 250 }),
   ]);
 
   if (products.length) {

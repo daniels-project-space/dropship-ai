@@ -43,6 +43,7 @@ export default defineSchema({
     status: v.union(v.literal("provisioning"), v.literal("active"), v.literal("paused"), v.literal("killed")),
     shopifyDomain: v.optional(v.string()),        // *.myshopify.com (store created manually)
     storeCurrency: v.optional(v.string()),        // ISO 4217 shop currency verified at connection
+    shopifyAccessVerifiedAt: v.optional(v.number()), // recurring vault token resolved + identity read
     customDomain: v.optional(v.string()),
     // brand/margin guardrails (enforced by the brain)
     minKitPriceUsd: v.number(),                   // §8.2 never below this (e.g. 35–55)
@@ -282,6 +283,9 @@ export default defineSchema({
   }).index("by_site", ["siteId"])
     .index("by_site_shopify_order", ["siteId", "shopifyOrderId"])
     .index("by_site_cj_order_number", ["siteId", "cjOrderNumber"])
+    // CJ supports one callback per topic. This dedicated global routing index is used only by
+    // the signed webhook path; ordinary reads remain tenant-scoped above.
+    .index("by_cj_webhook_order_number", ["cjOrderNumber"])
     .index("by_site_cj_order_id", ["siteId", "cjOrderId"])
     .index("by_site_status", ["siteId", "fulfillmentStatus"]),
 
@@ -445,7 +449,9 @@ export default defineSchema({
     outcome: v.union(v.literal("applied"), v.literal("ignored")),
     cjStagingIntentId: v.optional(v.id("cjStagingIntents")),
     receivedAt: v.number(),
-  }).index("by_provider_site_delivery", ["provider", "siteId", "deliveryId"]).index("by_site_received_at", ["siteId", "receivedAt"]),
+  }).index("by_provider_site_delivery", ["provider", "siteId", "deliveryId"])
+    .index("by_provider_delivery", ["provider", "deliveryId"])
+    .index("by_site_received_at", ["siteId", "receivedAt"]),
 
   // ── experiments (CRO) ─────────────────────────────────────────────────────
   experiments: defineTable({

@@ -1,9 +1,9 @@
-// POST /api/cj/connect — exchange an operator-supplied CJ authorization code server-side.
-// The returned credential pair is atomically persisted by the scoped control-plane writer and
-// never appears in this response, Convex, Trigger, audit data, or browser state.
+// POST /api/cj/connect — independent-account API-key setup. The API key is used only for CJ's
+// official token endpoint; the returned openId/token bundle is atomically persisted by the
+// scoped control-plane writer and never appears in browser, Convex, Trigger, audit, or log data.
 import { NextResponse } from "next/server";
 import { requireOperator } from "@/src/lib/auth/server";
-import { persistAuthorizationCodeExchange } from "@/src/lib/cj";
+import { persistIndependentAccountConnection } from "@/src/lib/cj";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,19 +11,21 @@ export const dynamic = "force-dynamic";
 export async function POST(request: Request) {
   const guard = await requireOperator(request);
   if (!guard.ok) return NextResponse.json({ error: guard.error }, { status: guard.status });
-  let body: { authorizationCode?: unknown };
+  let body: { apiKey?: unknown };
   try {
     body = await request.json();
   } catch {
     return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
   }
-  if (typeof body.authorizationCode !== "string" || !body.authorizationCode.trim()) {
-    return NextResponse.json({ error: "authorizationCode is required" }, { status: 400 });
+  if (typeof body.apiKey !== "string" || !body.apiKey.trim() || body.apiKey.length > 200) {
+    return NextResponse.json({ error: "apiKey is required and must be at most 200 characters" }, { status: 400 });
   }
   try {
-    await persistAuthorizationCodeExchange(body.authorizationCode.trim());
+    await persistIndependentAccountConnection(body.apiKey.trim());
     return NextResponse.json({ connected: true });
-  } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "CJ authorization-code exchange failed" }, { status: 502 });
+  } catch {
+    // Provider and writer errors are deliberately not reflected: either could echo identity or
+    // credential material. The operator gets a stable state and can inspect redacted telemetry.
+    return NextResponse.json({ connected: false, state: "credential_bundle_not_persisted", error: "CJ connection failed before a complete durable credential bundle was confirmed" }, { status: 502 });
   }
 }

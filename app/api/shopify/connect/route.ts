@@ -1,30 +1,17 @@
-// POST /api/shopify/connect — first-connect flow (Phase 2a, read-only).
-//  Body: { siteId, shopifyDomain, accessToken }
-//  1. Validate the token by fetching the shop (getShop throws on a bad/under-scoped token).
-//  2. Persist site.shopifyDomain + flip the site real (sites.connectStore) and register the
-//     siteSecrets vaultRef pointer ("shopify/<KEY>") so recurring syncs can find the token.
-//  3. Run an initial read-only sync (products + last-60d orders) using the request token directly.
-//  Returns { shop, productCount, orderCount, currency }.
-//
-// The access token is used from the request for THIS call only. For recurring sync the operator
-// must store the same token in the vault: service "shopify", key = derived from the domain
-// (e.g. calm-collar.myshopify.com → "CALM_COLLAR"). See vaultRefForDomain().
+// POST /api/shopify/connect — first recurring-access connection. The site is unchanged until the
+// submitted token validates the store and the deterministic vault reference resolves to the same
+// token. One Convex mutation then stores identity, USD currency, verification time, and reference.
 import { NextResponse } from "next/server";
 import { getShop } from "@/src/lib/shopify";
-import { resolveShopifyConfig, vaultRefForDomain, SHOPIFY_TOKEN_KEY } from "@/src/lib/shopifyAuth";
+import { verifyShopifyVaultToken } from "@/src/lib/shopifyAuth";
 import { syncShopify } from "@/src/lib/shopifySync";
 import { convexClient, api } from "@/src/lib/convexClient";
 import type { Id } from "@/convex/_generated/dataModel";
 import { requireOperator } from "@/src/lib/auth/server";
+import { assertShopifyIdentity, isMyshopifyDomain, normalizeShopifyDomain, vaultRefForDomain } from "@/src/lib/shopifyIdentity";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function normalizeDomain(raw: string): string {
-  let d = raw.trim().toLowerCase();
-  d = d.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
-  return d;
-}
 
 export async function POST(req: Request) {
   const guard = await requireOperator(req);
@@ -42,8 +29,8 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  const shopifyDomain = normalizeDomain(body.shopifyDomain);
-  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shopifyDomain)) {
+  const shopifyDomain = normalizeShopifyDomain(body.shopifyDomain);
+  if (!isMyshopifyDomain(shopifyDomain)) {
     return NextResponse.json(
       { error: "shopifyDomain must be a *.myshopify.com domain" },
       { status: 400 },
@@ -60,24 +47,29 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  if (shop.myshopifyDomain.toLowerCase() !== shopifyDomain) {
-    return NextResponse.json({ error: "validated Shopify store identity does not match the requested domain" }, { status: 400 });
+  try {
+    assertShopifyIdentity(shopifyDomain, shop.myshopifyDomain, shop.currencyCode);
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Shopify identity verification failed" }, { status: shop.currencyCode === "USD" ? 400 : 409 });
   }
-  if (shop.currencyCode !== "USD") {
-    return NextResponse.json({ error: `Shopify store currency ${shop.currencyCode} is unsupported; this launch requires USD until currency conversion is implemented` }, { status: 409 });
+
+  // A successful one-time provider read is not a recurring connection. Resolve the exact
+  // deterministic reference first and compare fixed-size token digests in constant time.
+  const durableToken = await verifyShopifyVaultToken(shopifyDomain, accessToken);
+  if (!durableToken) {
+    return NextResponse.json({
+      connected: false,
+      state: "vault_setup_required",
+      error: `Recurring access is not configured. Store the same token at ${vaultRefForDomain(shopifyDomain)} and retry; the site was not changed.`,
+    }, { status: 409 });
   }
 
   const convex = convexClient();
   const sid = siteId as Id<"sites">;
 
-  // 2. Persist connection state + the vaultRef pointer (NOT the token value).
+  // Identity/currency/reference are one transaction. The token value never enters Convex.
   try {
     await convex.mutation(api.sites.connectStore, { siteId: sid, shopifyDomain, storeCurrency: shop.currencyCode });
-    await convex.mutation(api.siteSecrets.upsertRef, {
-      siteId: sid,
-      key: SHOPIFY_TOKEN_KEY,
-      vaultRef: vaultRefForDomain(shopifyDomain),
-    });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "failed to persist connection" },
@@ -85,9 +77,9 @@ export async function POST(req: Request) {
     );
   }
 
-  // 3. Initial read-only sync using the request token (override — vault not required yet).
+  // Initial sync uses the already-proved vault value, not a one-time request-token bypass.
   try {
-    const cfg = await resolveShopifyConfig(siteId, accessToken);
+    const cfg = { shop: shopifyDomain, accessToken: durableToken };
     const result = await syncShopify(siteId, cfg, { sinceDays: 60 });
     return NextResponse.json({
       ok: true,
@@ -96,7 +88,7 @@ export async function POST(req: Request) {
       productCount: result.productCount,
       orderCount: result.orderCount,
       lastSyncedAt: result.lastSyncedAt,
-      vaultRef: vaultRefForDomain(shopifyDomain),
+      recurringAccess: "verified",
     });
   } catch (err) {
     // Connection persisted but sync failed — surface it so the operator can retry "Sync now".
@@ -104,6 +96,7 @@ export async function POST(req: Request) {
       {
         ok: true,
         connected: true,
+        recurringAccess: "verified",
         shop: { name: shop.name, domain: shop.myshopifyDomain },
         currency: shop.currencyCode,
         syncError: err instanceof Error ? err.message : "initial sync failed",

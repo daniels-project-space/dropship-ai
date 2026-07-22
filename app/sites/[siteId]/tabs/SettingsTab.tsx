@@ -15,10 +15,12 @@ const LABEL = "label-eyebrow mb-2 block text-[10px]";
 
 // ── Connect Shopify card ─────────────────────────────────────────────────────
 // Not connected → domain + admin token form → POST /api/shopify/connect.
-// Connected     → domain, live product/order counts, "Sync now" → POST /api/shopify/sync.
+// Recurring access verified → domain, current economic counts, "Sync now".
+// Legacy domain only        → visible re-verification form; never presented as connected.
 function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
   const detail = useQuery(api.dashboard.brandDetail, { siteId: site._id as Id<"sites"> });
-  const connected = !!site.shopifyDomain;
+  const recurringVerified = !!site.shopifyDomain && site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt;
+  const needsReverification = !!site.shopifyDomain && !recurringVerified;
 
   const [domain, setDomain] = useState(site.shopifyDomain ?? "");
   const [token, setToken] = useState("");
@@ -90,16 +92,20 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
           <Icon.store size={15} className="text-cyan" />
           <span className="text-[13px] font-medium text-ink">Shopify store</span>
         </div>
-        {connected ? (
+        {recurringVerified ? (
           <Badge ring="bg-live/10 text-live ring-1 ring-live/25" dot="bg-live" hex="#44d6a0" live>
-            Connected
+            Recurring access verified
+          </Badge>
+        ) : needsReverification ? (
+          <Badge ring="bg-pending/10 text-pending ring-1 ring-pending/30" dot="bg-pending" hex="#f0a93b">
+            Needs re-verification
           </Badge>
         ) : (
           <Badge>Not connected</Badge>
         )}
       </div>
 
-      {connected ? (
+      {recurringVerified ? (
         <div className="flex flex-col gap-3">
           <p className="font-mono text-[11px] text-ink-dim">{site.shopifyDomain}</p>
           <div className="grid grid-cols-2 gap-2">
@@ -128,11 +134,16 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
           {result?.kind === "err" && <p className="font-mono text-[10px] text-danger">{result.text}</p>}
           <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-ink-faint">
             <Icon.lock size={12} className="mt-0.5 shrink-0" />
-            Read-only — fulfillment wires up with CJ later.
+            Recurring vault access and USD store identity were verified. Sync remains read-only.
           </p>
         </div>
       ) : (
         <form onSubmit={connect} className="flex flex-col gap-3">
+          {needsReverification && (
+            <p className="rounded-lg border border-pending/25 bg-pending/5 px-3 py-2 text-[11px] leading-relaxed text-pending">
+              This legacy connection has no current recurring-access/currency proof. Re-verify it before revenue or order readiness is shown.
+            </p>
+          )}
           <div>
             <label className={LABEL}>*.myshopify.com domain</label>
             <input
@@ -154,7 +165,7 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
               autoComplete="off"
             />
             <p className="mt-1.5 font-mono text-[9.5px] text-ink-faint">
-              Needs scopes read_products, read_orders. Used once to connect; store it in the vault for recurring sync.
+              Needs read_products and read_orders. First place this same token at the displayed store&apos;s deterministic server-vault reference; a one-time token check alone does not connect the site.
             </p>
           </div>
           <button
@@ -162,11 +173,11 @@ function ConnectShopifyCard({ site }: { site: BrandDetail["site"] }) {
             disabled={busy || !domain.trim() || !token.trim()}
             className="rounded-lg bg-signal px-5 py-2.5 text-[14px] font-semibold text-void transition hover:bg-signal-deep disabled:opacity-50"
           >
-            {busy ? "Connecting…" : "Connect store"}
+            {busy ? "Verifying…" : needsReverification ? "Verify recurring access" : "Connect recurring access"}
           </button>
           {result?.kind === "ok" && (
             <p className="font-mono text-[10px] text-live">
-              {result.shopName} connected · {result.products} products · {result.orders} orders
+              {result.shopName} recurring access verified · {result.products} products · {result.orders} orders
               {result.currency ? ` · ${result.currency}` : ""}
             </p>
           )}

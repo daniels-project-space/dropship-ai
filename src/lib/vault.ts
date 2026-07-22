@@ -13,7 +13,7 @@ function vaultUrl(): string {
 
 type ListResponse = { value?: Array<{ keyName: string; value: string }> };
 type OneResponse = { value?: { value: string } | null };
-type BundleWriteResponse = { value?: { status?: "written" | "conflict" } };
+type BundleWriteResponse = { value?: { status?: "written" | "conflict"; retainedKeys?: string[] } };
 
 async function vaultQuery<T>(path: string, args: Record<string, unknown>): Promise<T> {
   const vaultToken = process.env.VAULT_ACCESS_TOKEN;
@@ -62,7 +62,7 @@ export async function requireKey(service: string, keyName: string): Promise<stri
  */
 export async function replaceCjTokenBundleAtomically(
   expectedRefreshToken: string | undefined,
-  next: { accessToken: string; refreshToken: string; accessTokenExpiryDate?: string; refreshTokenExpiryDate?: string },
+  next: { openId: string; accessToken: string; refreshToken: string; accessTokenExpiryDate?: string; refreshTokenExpiryDate?: string },
 ): Promise<"written" | "conflict"> {
   const url = process.env.VAULT_TOKEN_BUNDLE_WRITER_URL;
   const token = process.env.VAULT_TOKEN_BUNDLE_WRITER_TOKEN;
@@ -77,6 +77,7 @@ export async function replaceCjTokenBundleAtomically(
       service: "cj",
       expectedRefreshToken,
       values: {
+        CJ_OPEN_ID: next.openId,
         CJ_ACCESS_TOKEN: next.accessToken,
         CJ_REFRESH_TOKEN: next.refreshToken,
         ...(next.accessTokenExpiryDate ? { CJ_ACCESS_TOKEN_EXPIRY_DATE: next.accessTokenExpiryDate } : {}),
@@ -89,11 +90,20 @@ export async function replaceCjTokenBundleAtomically(
   if (!response.ok) throw new Error(`cj: atomic token-bundle write failed: HTTP ${response.status}`);
   const payload = await response.json().catch(() => null) as BundleWriteResponse | null;
   if (payload?.value?.status === "conflict") return "conflict";
-  if (payload?.value?.status === "written") return "written";
+  const requiredKeys = [
+    "CJ_OPEN_ID", "CJ_ACCESS_TOKEN", "CJ_REFRESH_TOKEN",
+    ...(next.accessTokenExpiryDate ? ["CJ_ACCESS_TOKEN_EXPIRY_DATE"] : []),
+    ...(next.refreshTokenExpiryDate ? ["CJ_REFRESH_TOKEN_EXPIRY_DATE"] : []),
+  ];
+  if (payload?.value?.status === "written"
+    && requiredKeys.every((key) => payload.value?.retainedKeys?.includes(key))) return "written";
+  if (payload?.value?.status === "written") {
+    throw new Error("cj: atomic token-bundle writer did not prove that the complete bundle including openId was retained");
+  }
   throw new Error("cj: atomic token-bundle writer returned an invalid response");
 }
 
-/** Check before CJ consumes an authorization code or rotates its one-time refresh token. */
+/** Check before CJ obtains or rotates a credential bundle. */
 export function assertCjTokenBundleWriterConfigured(): void {
   if (!process.env.VAULT_TOKEN_BUNDLE_WRITER_URL || !process.env.VAULT_TOKEN_BUNDLE_WRITER_TOKEN) {
     throw new Error("cj: automatic token refresh is blocked: atomic control-plane token-bundle writer is not installed/configured");

@@ -4,7 +4,7 @@ import test from "node:test";
 import { convexTest } from "convex-test";
 import schemaModule from "../convex/schema.ts";
 import apiModule from "../convex/_generated/api.js";
-import { cjOrderInputHash, cjStagingInputDigest } from "../src/lib/cjOrder.ts";
+import { cjFreightQuoteDigest, cjOrderInputHash, cjStagingInputDigest, sandboxOrderNumber } from "../src/lib/cjOrder.ts";
 import { cjStagingGenerationFingerprint } from "../src/lib/cjStagingState.ts";
 import { executeSandboxCjDispatch } from "../src/lib/sandboxCjDispatchExecutor.ts";
 
@@ -134,6 +134,27 @@ test("Convex receipt handler links order and intent atomically, including repair
   assert.equal(replay.intentId, first.intentId);
   const repaired = await t.run((ctx) => ctx.db.get(receipt._id));
   assert.equal(repaired.cjStagingIntentId, first.intentId);
+});
+
+test("CJ staging transaction rejects a global webhook-route collision before any action is created", async () => {
+  const t = convexTest({ schema, modules });
+  const now = Date.now();
+  const seeded = await t.run(async (ctx) => {
+    const siteId = await ctx.db.insert("sites", { name: "Route", niche: "test", status: "active", storeCurrency: "USD", minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual", createdAt: now });
+    const otherSiteId = await ctx.db.insert("sites", { name: "Collision", niche: "test", status: "active", storeCurrency: "USD", minKitPriceUsd: 40, minBlendedMarginPct: 70, distributionMode: "semi_manual", createdAt: now });
+    const shopifyOrderId = "gid://shopify/Order/collision-test";
+    const orderId = await ctx.db.insert("orders", { siteId, shopifyOrderId, currencyCode: "USD", currentTotal: 50, financialStatus: "PAID", test: false, cancelled: false, creditAdjustmentState: "none", fulfillmentStatus: "received", createdAt: now });
+    const route = sandboxOrderNumber(String(siteId), shopifyOrderId);
+    await ctx.db.insert("orders", { siteId: otherSiteId, shopifyOrderId: "gid://shopify/Order/other", cjOrderNumber: route, fulfillmentStatus: "received", createdAt: now });
+    const evidenceId = await ctx.db.insert("cjEvidence", { siteId, cjProductId: "cj-product", cjVariantId: "cj-variant", title: "Verified", cogsUsd: 10, shippingUsd: 5, inventoryQty: 5, fromUsWarehouse: true, fromCountryCode: "US", inventoryVerified: true, sourceUrl: "https://cjdropshipping.com/product", traceId: "trace", readAt: now });
+    await ctx.db.insert("products", { siteId, title: "Verified", shopifyProductId: lines[0].productId, shopifyVariantId: lines[0].variantId, shopifyDraftImportStatus: "created", cjProductId: "cj-product", cjVariantId: "cj-variant", cjFromCountryCode: "US", cjEvidenceId: evidenceId, cjFromUsWarehouse: true, cogsUsd: 10, shippingUsd: 5, priceUsd: 50, status: "draft", createdAt: now });
+    const quoteInputDigest = cjFreightQuoteDigest({ siteId: String(siteId), shopifyOrderId, fromCountryCode: "US", destinationCountryCode: "US", shippingZip: shipping.shippingZip, products: [{ vid: "cj-variant", quantity: 1 }], providerEndpoint: "/logistic/freightCalculate", providerVersion: "CJ API v2" });
+    const intentId = await ctx.db.insert("cjStagingIntents", { siteId, orderId, deliveryId: "route-collision", payloadHash: "hash", status: "quoted", attempt: 1, failureCount: 0, runnableAt: now, shipping, shopifyLines: lines, stagingInputDigest: cjStagingInputDigest({ shipping, shopifyLines: lines }), quoteInputDigest, quoteProvider: { endpoint: "/logistic/freightCalculate", version: "CJ API v2" }, quote: { logisticName: "USPS", logisticPriceUsd: 5, fromCountryCode: "US", quotedAt: now }, createdAt: now, updatedAt: now });
+    return { orderId, intentId };
+  });
+  await assert.rejects(() => service(t).mutation(api.orders.stageQuotedCjStagingIntent, { intentId: seeded.intentId }), /identity collision/);
+  assert.equal((await t.run((ctx) => ctx.db.get(seeded.orderId))).cjOrderNumber, undefined);
+  assert.equal((await t.run((ctx) => ctx.db.query("actions").collect())).length, 0);
 });
 
 test("Convex failure handler fences stale workers and consumes exactly five accepted failures", async () => {
@@ -480,7 +501,7 @@ test("provider intake and tracking handlers require the service identity", async
   const { orderId } = await seedApprovedDispatch(t);
   const order = await t.run((ctx) => ctx.db.get(orderId));
   await assert.rejects(() => t.mutation(api.orders.applyTracking, { siteId: order.siteId, cjOrderNumber: order.cjOrderNumber, status: "shipped" }), /UNAUTHENTICATED/);
-  await assert.rejects(() => t.mutation(api.webhooks.recordCjTracking, { siteId: order.siteId, deliveryId: "d", topic: "ORDER", payloadHash: "h", cjOrderNumber: order.cjOrderNumber }), /UNAUTHENTICATED/);
+  await assert.rejects(() => t.mutation(api.webhooks.recordCjTracking, { deliveryId: "d", topic: "ORDER", payloadHash: "h", cjOrderNumber: order.cjOrderNumber }), /UNAUTHENTICATED/);
 });
 
 test("provider intake and runtime primitives reject anonymous and operator identities", async () => {

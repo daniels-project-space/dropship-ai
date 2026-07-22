@@ -6,7 +6,7 @@ import { CjApiError, createSandboxOrder, definitiveSandboxCjWriteRejection, getS
 import { assertLiveEffectsEnabled, sandboxShopAllowed } from "../src/lib/effects.ts";
 import { cjOrderInputHash, normalizeCjOrderInput, sandboxDispatchDecision, sandboxOrderNumber } from "../src/lib/cjOrder.ts";
 import { verifyShopifyHmac } from "../app/api/webhooks/shopify/route.ts";
-import { verifyCjHmac } from "../app/api/webhooks/cj/route.ts";
+import { verifyCjWebhookSignature } from "../src/lib/cjWebhook.ts";
 
 test("sandbox checkout creates only an explicitly zero-dollar draft and never sends or completes it", async () => {
   const originalFetch = globalThis.fetch;
@@ -149,9 +149,10 @@ test("provider writes fail closed unless each sandbox/live gate is explicitly co
 test("webhook signatures are verified over the raw body and reject modified payloads", () => {
   const body = Buffer.from(JSON.stringify({ id: 1, total_price: "0.00" }));
   const shopify = crypto.createHmac("sha256", "secret").update(body).digest("base64");
-  const cj = crypto.createHmac("sha256", "secret").update(body).digest("hex");
+  const cj = crypto.createHmac("sha256", "123456789").update(body).digest("base64");
   assert.equal(verifyShopifyHmac("secret", body, shopify), true);
-  assert.equal(verifyCjHmac("secret", body, cj), true);
+  assert.equal(verifyCjWebhookSignature("123456789", body, cj), true);
   assert.equal(verifyShopifyHmac("secret", Buffer.from("{}"), shopify), false);
-  assert.equal(verifyCjHmac("secret", Buffer.from("{}"), cj), false);
+  assert.equal(verifyCjWebhookSignature("123456789", Buffer.from("{}"), cj), false);
+  assert.equal(verifyCjWebhookSignature("123456789", body, crypto.createHmac("sha256", "123456789").update(body).digest("hex")), false);
 });

@@ -134,20 +134,33 @@ export const recordShopifyOrder = mutation({
 
 export const recordCjTracking = mutation({
   args: {
-    siteId: v.id("sites"), deliveryId: v.string(), topic: v.string(), payloadHash: v.string(),
+    deliveryId: v.string(), topic: v.string(), payloadHash: v.string(),
     cjOrderNumber: v.string(), trackingNumber: v.optional(v.string()), trackingUrl: v.optional(v.string()), cjOrderId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     await requireServiceIdentity(ctx);
-    const prior = await ctx.db.query("webhookReceipts")
-      .withIndex("by_provider_site_delivery", (q) => q.eq("provider", "cj").eq("siteId", args.siteId).eq("deliveryId", args.deliveryId)).first();
-    if (webhookDeliveryDecision(prior) === "duplicate") return { duplicate: true, outcome: prior!.outcome };
+    if (!/^dsa-sb-[a-f0-9]{32}$/.test(args.cjOrderNumber)) {
+      return { duplicate: false, outcome: "ignored" as const, reason: "unknown_route" as const };
+    }
+    const routes = await ctx.db.query("orders")
+      .withIndex("by_cj_webhook_order_number", (q) => q.eq("cjOrderNumber", args.cjOrderNumber)).take(2);
+    if (routes.length !== 1) {
+      return { duplicate: false, outcome: "ignored" as const, reason: routes.length ? "ambiguous_route" as const : "unknown_route" as const };
+    }
+    const order = routes[0];
+    const siteId = order.siteId;
+    const receipts = await ctx.db.query("webhookReceipts")
+      .withIndex("by_provider_delivery", (q) => q.eq("provider", "cj").eq("deliveryId", args.deliveryId)).take(2);
+    if (receipts.length > 1) return { duplicate: false, outcome: "ignored" as const, reason: "ambiguous_delivery" as const };
+    const prior = receipts[0];
+    if (webhookDeliveryDecision(prior) === "duplicate") {
+      if (prior!.payloadHash !== args.payloadHash || prior!.topic !== args.topic) throw new Error("CJ messageId was replayed with changed content");
+      return { duplicate: true, outcome: prior!.outcome };
+    }
 
-    const order = await ctx.db.query("orders")
-      .withIndex("by_site_cj_order_number", (q) => q.eq("siteId", args.siteId).eq("cjOrderNumber", args.cjOrderNumber)).first();
-    if (cjTrackingMappingDecision({ order, siteId: args.siteId, incomingCjOrderId: args.cjOrderId }) === "ignore") {
+    if (cjTrackingMappingDecision({ order, siteId, incomingCjOrderId: args.cjOrderId }) === "ignore") {
       await ctx.db.insert("webhookReceipts", {
-        provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
+        provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId,
         payloadHash: args.payloadHash, outcome: "ignored", receivedAt: Date.now(),
       });
       return { duplicate: false, outcome: "ignored" as const };
@@ -161,9 +174,9 @@ export const recordCjTracking = mutation({
       cjOrderId: args.cjOrderId ?? order.cjOrderId,
       fulfillmentStatus: args.trackingNumber ? "shipped" : order.fulfillmentStatus,
     });
-    await appendAudit(ctx, { siteId: args.siteId, event: "order_tracking_applied", detail: { orderId: order._id, source: "cj_webhook" } });
+    await appendAudit(ctx, { siteId, event: "order_tracking_applied", detail: { orderId: order._id, source: "cj_webhook" } });
     await ctx.db.insert("webhookReceipts", {
-      provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId: args.siteId,
+      provider: "cj", deliveryId: args.deliveryId, topic: args.topic, siteId,
       payloadHash: args.payloadHash, outcome: "applied", receivedAt: Date.now(),
     });
     return { duplicate: false, outcome: "applied" as const };

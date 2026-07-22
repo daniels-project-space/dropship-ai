@@ -3,9 +3,7 @@
 // `isSandbox: 1` boundary.
 import { task, tasks, schedules, logger } from "@trigger.dev/sdk/v3";
 import { convexClient, api } from "../lib/convexClient";
-import { createSandboxOrder, definitiveSandboxCjWriteRejection, getSandboxOrderByOrderNumber, parseOrderWebhook } from "../lib/cj";
-import { fulfillmentTrackingInfoUpdate, type ShopifyClientConfig } from "../lib/shopify";
-import { assertLiveEffectsEnabled, type EffectMode } from "../lib/effects";
+import { createSandboxOrder, definitiveSandboxCjWriteRejection, getSandboxOrderByOrderNumber } from "../lib/cj";
 import { executeSandboxCjDispatch } from "../lib/sandboxCjDispatchExecutor";
 import { createHmac } from "node:crypto";
 import type { Id } from "../../convex/_generated/dataModel";
@@ -87,27 +85,3 @@ export const cjDispatchReconciliationSweep = schedules.task({
     return { due: due.length, scheduled };
   },
 });
-
-export interface CjWebhookHandlerArgs {
-  siteId: string;
-  payload: unknown;
-  shopify?: { cfg: ShopifyClientConfig; fulfillmentId: string };
-  mode?: EffectMode;
-}
-
-/** Local tracking is idempotent; forwarding remains separately live-effects-gated. */
-export async function handleCjTrackingWebhook(args: CjWebhookHandlerArgs) {
-  const convex = convexClient();
-  const tracking = parseOrderWebhook(args.payload);
-  if (!tracking.orderNumber) throw new Error("cj webhook: missing orderNumber — cannot map to a Shopify order");
-  await convex.mutation(api.orders.applyTracking, {
-    siteId: args.siteId as Id<"sites">, cjOrderNumber: tracking.orderNumber, trackingNumber: tracking.trackNumber, trackingUrl: tracking.trackingUrl,
-    cjOrderId: tracking.cjOrderId, status: "shipped",
-  });
-  if (args.shopify && tracking.trackNumber) {
-    assertLiveEffectsEnabled(args.mode ?? "sandbox");
-    await fulfillmentTrackingInfoUpdate(args.shopify.cfg, args.shopify.fulfillmentId, { number: tracking.trackNumber, url: tracking.trackingUrl, company: tracking.logisticName }, false);
-  }
-  // Tracking values remain in private Convex order state; Trigger results are not a PII channel.
-  return { applied: true, orderNumber: tracking.orderNumber };
-}

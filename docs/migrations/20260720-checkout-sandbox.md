@@ -30,7 +30,7 @@ CJ request was contacted or created by this checkout.
 
 1. Use a Shopify development store only, with `write_draft_orders` (and read scopes used by the
    existing connection flow). Add the sandbox flags and shop allowlist only for that environment.
-2. Set `SHOPIFY_WEBHOOK_SECRET` and `CJ_WEBHOOK_SECRET`; register HTTPS subscriptions outside this
+2. Set `SHOPIFY_WEBHOOK_SECRET`; atomically retain CJ `CJ_OPEN_ID` with its token bundle and register the single global CJ HTTPS callback outside this
    checkout after validating endpoint ownership. Do not enable live effects for that test.
 3. A live fulfillment or Shopify tracking write remains blocked until Daniel explicitly elects to
    set the dual-control live flags in Vercel/Trigger. That decision can create external effects.

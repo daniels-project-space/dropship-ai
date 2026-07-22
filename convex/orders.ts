@@ -309,6 +309,14 @@ export const stageQuotedCjStagingIntent = mutation({
     const digest = cjFreightQuoteDigest({ siteId: String(intent.siteId), shopifyOrderId: order.shopifyOrderId, fromCountryCode: lineage.fromCountryCode, destinationCountryCode: intent.shipping.shippingCountryCode, shippingZip: intent.shipping.shippingZip, products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })), providerEndpoint: intent.quoteProvider.endpoint, providerVersion: intent.quoteProvider.version });
     if (digest !== intent.quoteInputDigest || intent.quote.fromCountryCode !== lineage.fromCountryCode) return needsAttention(ctx, intent, "invalid_verified_lineage");
     const orderNumber = sandboxOrderNumber(String(intent.siteId), order.shopifyOrderId);
+    const routeOwners = await ctx.db.query("orders")
+      .withIndex("by_cj_webhook_order_number", (q: any) => q.eq("cjOrderNumber", orderNumber))
+      .take(2);
+    if (routeOwners.some((owner: any) => owner._id !== order._id)) {
+      // The indexed range read and later patch share this Convex transaction. A concurrent
+      // staging attempt for the same identity therefore conflicts instead of committing twice.
+      throw new Error("CJ webhook order identity collision; staging was rejected");
+    }
     const input = normalizeCjOrderInput({ orderNumber, ...intent.shipping, logisticName: intent.quote.logisticName, fromCountryCode: lineage.fromCountryCode, products: lineage.lines.map((line) => ({ vid: line.cjVariantId, quantity: line.quantity })) }, orderNumber);
     const inputHash = cjOrderInputHash(input);
     // A provider write makes local lineage immutable. Do not replace a reserved, ambiguous, or

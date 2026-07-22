@@ -1,6 +1,6 @@
-// Shopify Admin GraphQL client (API 2026-01). Thin typed wrapper — calls are stubbed/minimal
-// but compile-clean. Token: vault per-site "SHOPIFY_ADMIN_TOKEN" or process.env fallback.
-// NOTE: as of 2026-06-14 no "shopify" vault service exists — pass the token explicitly or set env.
+// Shopify Admin GraphQL client pinned to stable API 2026-01. Shopify supports this version until
+// 2027-01-16; retaining the fixture-proven contract is safer than an unverified quarterly bump.
+// Recurring tokens resolve only through each site's server-side vault reference.
 import { assertLiveEffectsEnabled, sandboxShopAllowed } from "./effects";
 const API_VERSION = "2026-01";
 

@@ -34,7 +34,7 @@ function shopifyDelivery(siteId, deliveryId, overrides = {}) {
   };
 }
 
-test("Shopify and CJ provider identities collide safely across tenants", async () => {
+test("Shopify identities remain tenant-scoped while ambiguous global CJ routes mutate neither tenant", async () => {
   const t = convexTest({ schema, modules });
   const siteA = await site(t, "A");
   const siteB = await site(t, "B");
@@ -46,22 +46,46 @@ test("Shopify and CJ provider identities collide safely across tenants", async (
   assert.equal(orderA.currentTotal, 50);
   assert.equal(orderB.currentTotal, 80);
 
+  const shared = `dsa-sb-${"a".repeat(32)}`;
   await t.run(async (ctx) => {
-    await ctx.db.patch(orderA._id, { cjOrderNumber: "cj-number-shared", cjOrderId: "cj-id-shared" });
-    await ctx.db.patch(orderB._id, { cjOrderNumber: "cj-number-shared", cjOrderId: "cj-id-shared" });
+    await ctx.db.patch(orderA._id, { cjOrderNumber: shared, cjOrderId: "cj-id-shared" });
+    await ctx.db.patch(orderB._id, { cjOrderNumber: shared, cjOrderId: "cj-id-shared" });
   });
-  await service(t).mutation(api.webhooks.recordCjTracking, {
-    siteId: siteB, deliveryId: "cj-b", topic: "ORDER", payloadHash: "cj-hash-b",
-    cjOrderNumber: "cj-number-shared", cjOrderId: "cj-id-shared", trackingNumber: "TRACK-B",
+  const ambiguous = await service(t).mutation(api.webhooks.recordCjTracking, {
+    deliveryId: "cj-b", topic: "ORDER", payloadHash: "cj-hash-b",
+    cjOrderNumber: shared, cjOrderId: "cj-id-shared", trackingNumber: "TRACK-B",
   });
+  assert.equal(ambiguous.reason, "ambiguous_route");
   assert.equal((await t.run((ctx) => ctx.db.get(orderA._id))).trackingNumber, undefined);
-  assert.equal((await t.run((ctx) => ctx.db.get(orderB._id))).trackingNumber, "TRACK-B");
-  assert.equal((await service(t).query(api.orders.getByCjOrderNumber, { siteId: siteA, cjOrderNumber: "cj-number-shared" }))._id, orderA._id);
-  assert.equal((await service(t).query(api.orders.getByCjOrderNumber, { siteId: siteB, cjOrderNumber: "cj-number-shared" }))._id, orderB._id);
+  assert.equal((await t.run((ctx) => ctx.db.get(orderB._id))).trackingNumber, undefined);
+  assert.equal((await service(t).query(api.orders.getByCjOrderNumber, { siteId: siteA, cjOrderNumber: shared }))._id, orderA._id);
+  assert.equal((await service(t).query(api.orders.getByCjOrderNumber, { siteId: siteB, cjOrderNumber: shared }))._id, orderB._id);
   const byCjIdA = await t.run((ctx) => ctx.db.query("orders").withIndex("by_site_cj_order_id", (q) => q.eq("siteId", siteA).eq("cjOrderId", "cj-id-shared")).first());
   const byCjIdB = await t.run((ctx) => ctx.db.query("orders").withIndex("by_site_cj_order_id", (q) => q.eq("siteId", siteB).eq("cjOrderId", "cj-id-shared")).first());
   assert.equal(byCjIdA._id, orderA._id);
   assert.equal(byCjIdB._id, orderB._id);
+});
+
+test("one global CJ route applies once by messageId and rejects cross-tenant identity changes", async () => {
+  const t = convexTest({ schema, modules });
+  const siteA = await site(t, "CJ-A");
+  const siteB = await site(t, "CJ-B");
+  await service(t).mutation(api.webhooks.recordShopifyOrder, shopifyDelivery(siteA, "cj-a-order"));
+  await service(t).mutation(api.webhooks.recordShopifyOrder, shopifyDelivery(siteB, "cj-b-order", { shopifyOrderId: "gid://shopify/Order/b" }));
+  const orderA = await service(t).query(api.orders.getByShopifyOrder, { siteId: siteA, shopifyOrderId: "gid://shopify/Order/shared" });
+  const orderB = await service(t).query(api.orders.getByShopifyOrder, { siteId: siteB, shopifyOrderId: "gid://shopify/Order/b" });
+  const route = `dsa-sb-${"b".repeat(32)}`;
+  await t.run(async (ctx) => {
+    await ctx.db.patch(orderA._id, { cjOrderNumber: route, cjOrderId: "cj-a" });
+    await ctx.db.patch(orderB._id, { cjOrderNumber: `dsa-sb-${"c".repeat(32)}`, cjOrderId: "cj-b" });
+  });
+  const input = { deliveryId: "7cceede817dc47ed9748328b64353c5c", topic: "ORDER", payloadHash: "official-order-hash", cjOrderNumber: route, cjOrderId: "cj-a", trackingNumber: "TRACK-A" };
+  const first = await service(t).mutation(api.webhooks.recordCjTracking, input);
+  const duplicate = await service(t).mutation(api.webhooks.recordCjTracking, input);
+  assert.deepEqual([first.duplicate, duplicate.duplicate], [false, true]);
+  assert.equal((await t.run((ctx) => ctx.db.get(orderA._id))).trackingNumber, "TRACK-A");
+  assert.equal((await t.run((ctx) => ctx.db.get(orderB._id))).trackingNumber, undefined);
+  await assert.rejects(() => service(t).mutation(api.webhooks.recordCjTracking, { ...input, payloadHash: "changed" }), /changed content/);
 });
 
 test("partial Shopify webhook updates preserve the observed current total", async () => {
@@ -127,6 +151,49 @@ test("non-USD stores fail the explicit connection precondition", async () => {
   const t = convexTest({ schema, modules });
   const siteId = await site(t, "CAD", { status: "provisioning", storeCurrency: undefined });
   await assert.rejects(() => service(t).mutation(api.sites.connectStore, { siteId, shopifyDomain: "cad.myshopify.com", storeCurrency: "CAD" }), /require a USD store/);
+});
+
+test("first Shopify connection atomically writes recurring reference, identity and currency", async () => {
+  const t = convexTest({ schema, modules });
+  const siteId = await site(t, "Atomic", { status: "provisioning", storeCurrency: undefined });
+  await assert.rejects(() => t.withIdentity({ subject: "dropship-ai:operator" }).mutation(api.sites.connectStore, { siteId, shopifyDomain: "atomic.myshopify.com", storeCurrency: "USD" }), /service runtime/);
+  await service(t).mutation(api.sites.connectStore, { siteId, shopifyDomain: "atomic.myshopify.com", storeCurrency: "USD" });
+  const stored = await t.run((ctx) => ctx.db.get(siteId));
+  const refs = await t.run((ctx) => ctx.db.query("siteSecrets").withIndex("by_site", (q) => q.eq("siteId", siteId)).collect());
+  assert.equal(stored.shopifyDomain, "atomic.myshopify.com");
+  assert.equal(stored.storeCurrency, "USD");
+  assert.equal(typeof stored.shopifyAccessVerifiedAt, "number");
+  assert.deepEqual(refs.map(({ key, vaultRef }) => ({ key, vaultRef })), [{ key: "SHOPIFY_ADMIN_TOKEN", vaultRef: "shopify/ATOMIC" }]);
+});
+
+test("bounded connected-site verification backfills legacy currency before current order economics", async () => {
+  const t = convexTest({ schema, modules });
+  const siteId = await site(t, "Legacy", { shopifyDomain: "legacy.myshopify.com", storeCurrency: undefined, shopifyAccessVerifiedAt: undefined });
+  await t.run((ctx) => ctx.db.insert("siteSecrets", { siteId, key: "SHOPIFY_ADMIN_TOKEN", vaultRef: "shopify/LEGACY" }));
+  await service(t).mutation(api.sites.verifyConnectedStore, { siteId, shopifyDomain: "legacy.myshopify.com", storeCurrency: "USD" });
+  await service(t).mutation(api.orders.upsertFromShopify, { siteId, orders: [{ shopifyOrderId: "gid://shopify/Order/legacy", currencyCode: "USD", currentTotal: 64.5, financialStatus: "PAID", test: false, cancelled: false, creditAdjustmentState: "none", fulfillmentStatus: "received", createdAt: 1 }] });
+  const stored = await t.run((ctx) => ctx.db.get(siteId));
+  const order = await service(t).query(api.orders.getByShopifyOrder, { siteId, shopifyOrderId: "gid://shopify/Order/legacy" });
+  assert.equal(stored.storeCurrency, "USD");
+  assert.equal(typeof stored.shopifyAccessVerifiedAt, "number");
+  assert.equal(order.currentTotal, 64.5);
+  assert.equal(eligibleUsdOrder(order, stored.storeCurrency), true);
+});
+
+test("Shopify domain or currency mismatch changes no legacy connection state", async () => {
+  for (const args of [
+    { shopifyDomain: "other.myshopify.com", storeCurrency: "USD" },
+    { shopifyDomain: "legacy.myshopify.com", storeCurrency: "CAD" },
+  ]) {
+    const t = convexTest({ schema, modules });
+    const siteId = await site(t, "Mismatch", { shopifyDomain: "legacy.myshopify.com", storeCurrency: undefined, shopifyAccessVerifiedAt: undefined });
+    await t.run((ctx) => ctx.db.insert("siteSecrets", { siteId, key: "SHOPIFY_ADMIN_TOKEN", vaultRef: "shopify/LEGACY" }));
+    await assert.rejects(() => service(t).mutation(api.sites.verifyConnectedStore, { siteId, ...args }));
+    const stored = await t.run((ctx) => ctx.db.get(siteId));
+    assert.equal(stored.shopifyDomain, "legacy.myshopify.com");
+    assert.equal(stored.storeCurrency, undefined);
+    assert.equal(stored.shopifyAccessVerifiedAt, undefined);
+  }
 });
 
 test("Shopify sync reads current money, currency, payment, test, cancellation and credit facts", async () => {

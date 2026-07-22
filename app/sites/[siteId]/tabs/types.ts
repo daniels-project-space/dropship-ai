@@ -9,6 +9,8 @@ export type BrandDetail = {
     niche: string;
     status: SiteStatus;
     shopifyDomain?: string;
+    storeCurrency?: string;
+    shopifyAccessVerifiedAt?: number;
     customDomain?: string;
     minKitPriceUsd: number;
     minBlendedMarginPct: number;
@@ -16,6 +18,7 @@ export type BrandDetail = {
     killDate?: number;
     createdAt: number;
   };
+  economicsReadiness: "not_connected" | "needs_reverification" | "verified_usd";
   productCount: number;
   activeProductCount: number;
   pendingActionCount: number;

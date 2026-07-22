@@ -11,6 +11,7 @@ export type PortfolioSite = {
   status: SiteStatus;
   distributionMode: "semi_manual" | "automated";
   shopifyDomain: string | null;
+  shopifyNeedsReverification: boolean;
   customDomain: string | null;
   killDate: number | null;
   pendingActionCount: number;
@@ -92,6 +93,12 @@ export function SiteCard({ site, index = 0 }: { site: PortfolioSite; index?: num
           {site.distributionMode === "automated" ? "automated" : "semi-manual"}
         </span>
       </div>
+
+      {site.shopifyNeedsReverification && (
+        <p className="mt-3 rounded-lg border border-pending/25 bg-pending/5 px-3 py-2 text-[11px] text-pending">
+          Shopify needs re-verification; order and revenue readiness is withheld.
+        </p>
+      )}
 
       <div className="mt-6 grid grid-cols-3 gap-4 border-t border-line-soft pt-5">
         <Metric

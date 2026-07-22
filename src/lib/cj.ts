@@ -3,12 +3,13 @@
 // payType:3 (create-only) and is isolated in the fulfilment worker.
 import { assertCjTokenBundleWriterConfigured, getKey, replaceCjTokenBundleAtomically } from "./vault";
 import { CjStagingFailureError } from "./cjStagingState";
-import { CjTokenCoordinator, type CjTokenBundle } from "./cjTokenRotation";
+import { CjTokenCoordinator, type CjTokenBundle, type RotatedCjTokenPair } from "./cjTokenRotation";
 
 const CJ_BASE = "https://developers.cjdropshipping.com/api2.0/v1";
 
 async function readTokenBundle(): Promise<CjTokenBundle> {
-  const [vaultAccess, vaultRefresh, vaultAccessExpiry, vaultRefreshExpiry] = await Promise.all([
+  const [vaultOpenId, vaultAccess, vaultRefresh, vaultAccessExpiry, vaultRefreshExpiry] = await Promise.all([
+    getKey("cj", "CJ_OPEN_ID").catch(() => null),
     getKey("cj", "CJ_ACCESS_TOKEN").catch(() => null),
     getKey("cj", "CJ_REFRESH_TOKEN").catch(() => null),
     getKey("cj", "CJ_ACCESS_TOKEN_EXPIRY_DATE").catch(() => null),
@@ -16,8 +17,11 @@ async function readTokenBundle(): Promise<CjTokenBundle> {
   ]);
   const accessToken = vaultAccess ?? process.env.CJ_ACCESS_TOKEN;
   const refreshToken = vaultRefresh ?? process.env.CJ_REFRESH_TOKEN;
+  const openId = vaultOpenId ?? process.env.CJ_OPEN_ID;
   if (!accessToken) throw new Error("cj: no access token — add CJ_ACCESS_TOKEN to the server vault/control plane");
+  if (!openId) throw new Error("cj: no openId — reconnect the independent account so CJ_OPEN_ID is retained atomically");
   return {
+    openId,
     accessToken,
     ...(refreshToken ? { refreshToken } : {}),
     ...(vaultAccessExpiry ?? process.env.CJ_ACCESS_TOKEN_EXPIRY_DATE ? { accessTokenExpiryDate: vaultAccessExpiry ?? process.env.CJ_ACCESS_TOKEN_EXPIRY_DATE } : {}),
@@ -32,7 +36,7 @@ function cjTokens(): CjTokenCoordinator {
     tokenCoordinator = new CjTokenCoordinator(
       { read: readTokenBundle, replace: replaceCjTokenBundleAtomically },
       refreshAccessToken,
-      exchangeAuthorizationCode,
+      getIndependentAccountTokenBundle,
     );
   }
   return tokenCoordinator;
@@ -124,7 +128,12 @@ async function cjFetchWithToken<T>(
   return json.data as T;
 }
 
-export interface CjAccessTokens {
+export interface CjAccessTokens extends RotatedCjTokenPair {
+  openId: string;
+}
+
+type CjTokenResponseData = {
+  openId?: unknown;
   accessToken: string;
   accessTokenExpiryDate?: string;
   refreshToken: string;
@@ -132,8 +141,8 @@ export interface CjAccessTokens {
   createDate?: string;
 }
 
-/** Exchange a CJ refresh token. Callers must persist tokens only in the server-side vault. */
-export async function refreshAccessToken(refreshToken: string): Promise<CjAccessTokens> {
+/** Exchange a CJ refresh token. CJ omits openId; the coordinator retains the durable value. */
+export async function refreshAccessToken(refreshToken: string): Promise<RotatedCjTokenPair> {
   if (!refreshToken) throw new Error("cj: refreshToken is required");
   // This endpoint authenticates with the refresh token in the body, not CJ-Access-Token.
   const res = await fetch(`${CJ_BASE}/authentication/refreshAccessToken`, {
@@ -142,27 +151,54 @@ export async function refreshAccessToken(refreshToken: string): Promise<CjAccess
     body: JSON.stringify({ refreshToken }),
     cache: "no-store",
   });
-  const json = (await res.json()) as { result?: boolean; success?: boolean; message?: string; data?: CjAccessTokens };
+  const json = (await res.json()) as { result?: boolean; success?: boolean; message?: string; data?: RotatedCjTokenPair };
   if (!res.ok || json.result === false || json.success === false || !json.data?.accessToken || !json.data.refreshToken) {
-    throw new Error(`cj /authentication/refreshAccessToken failed: HTTP ${res.status} ${json.message ?? "invalid response"}`);
+    throw new Error(`cj /authentication/refreshAccessToken failed: HTTP ${res.status} invalid response`);
   }
   return json.data;
 }
 
-/** Exchange a CJ authorization code; persistence is handled by the atomic bundle coordinator. */
-export async function exchangeAuthorizationCode(authorizationCode: string): Promise<CjAccessTokens> {
-  if (!authorizationCode.trim()) throw new Error("cj: authorizationCode is required");
+function exactOpenId(raw: string, parsed: CjTokenResponseData): string | null {
+  const matches = [...raw.matchAll(/"openId"\s*:\s*(?:"([0-9]{1,20})"|([0-9]{1,20}))/g)];
+  if (matches.length !== 1 || (typeof parsed.openId !== "number" && typeof parsed.openId !== "string")) return null;
+  return matches[0][1] ?? matches[0][2] ?? null;
+}
+
+/** Parse the official independent-account response while preserving a potentially 20-digit Long. */
+export function parseIndependentAccountTokenResponse(raw: string, status: number): CjAccessTokens {
+  let json: { result?: boolean; success?: boolean; data?: CjTokenResponseData };
+  try {
+    json = JSON.parse(raw) as typeof json;
+  } catch {
+    throw new Error(`cj /authentication/getAccessToken failed: HTTP ${status} invalid response`);
+  }
+  const data = json.data;
+  const openId = data ? exactOpenId(raw, data) : null;
+  if (status < 200 || status >= 300 || json.result !== true || json.success !== true || !data
+    || !openId || typeof data.accessToken !== "string" || !data.accessToken
+    || typeof data.refreshToken !== "string" || !data.refreshToken) {
+    throw new Error(`cj /authentication/getAccessToken failed: HTTP ${status} invalid response`);
+  }
+  return {
+    openId,
+    accessToken: data.accessToken,
+    refreshToken: data.refreshToken,
+    ...(typeof data.accessTokenExpiryDate === "string" ? { accessTokenExpiryDate: data.accessTokenExpiryDate } : {}),
+    ...(typeof data.refreshTokenExpiryDate === "string" ? { refreshTokenExpiryDate: data.refreshTokenExpiryDate } : {}),
+    ...(typeof data.createDate === "string" ? { createDate: data.createDate } : {}),
+  };
+}
+
+/** Independent-account API-key flow from CJ's official authentication contract. */
+export async function getIndependentAccountTokenBundle(apiKey: string): Promise<CjAccessTokens> {
+  if (!apiKey.trim() || apiKey.length > 200) throw new Error("cj: apiKey is required and must be at most 200 characters");
   const res = await fetch(`${CJ_BASE}/authentication/getAccessToken`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ authorizationCode }),
+    body: JSON.stringify({ apiKey }),
     cache: "no-store",
   });
-  const json = (await res.json()) as { result?: boolean; success?: boolean; message?: string; data?: CjAccessTokens };
-  if (!res.ok || json.result === false || json.success === false || !json.data?.accessToken || !json.data.refreshToken) {
-    throw new Error(`cj /authentication/getAccessToken failed: HTTP ${res.status} ${json.message ?? "invalid response"}`);
-  }
-  return json.data;
+  return parseIndependentAccountTokenResponse(await res.text(), res.status);
 }
 
 /**
@@ -174,10 +210,10 @@ export async function refreshCurrentAccessToken(): Promise<string> {
   return cjTokens().refreshAccessToken();
 }
 
-/** Operator-controlled initial CJ connection. It never returns either credential to the browser. */
-export async function persistAuthorizationCodeExchange(authorizationCode: string): Promise<string> {
+/** Operator-controlled initial CJ connection. It never returns any account identity or credential. */
+export async function persistIndependentAccountConnection(apiKey: string): Promise<void> {
   assertCjTokenBundleWriterConfigured();
-  return cjTokens().exchangeAuthorizationCode(authorizationCode);
+  await cjTokens().connectApiKey(apiKey);
 }
 
 export interface CjOrderLine {
@@ -363,29 +399,4 @@ export async function getInventoryByProduct(productId: string, token?: string): 
 export async function getInventoryByVariant(variantId: string, token?: string): Promise<unknown> {
   if (!variantId) throw new Error("cj: variantId is required");
   return cjFetch<unknown>("/product/stock/queryByVid", { method: "GET", token, query: { vid: variantId } });
-}
-
-export interface ParsedTracking {
-  cjOrderId?: string;
-  orderNumber?: string;
-  trackNumber?: string;
-  trackingUrl?: string;
-  logisticName?: string;
-  status?: string;
-}
-
-/** Extract tracking fields from a CJ ORDER webhook payload (shape-tolerant). */
-export function parseOrderWebhook(payload: unknown): ParsedTracking {
-  const p = (payload ?? {}) as Record<string, unknown>;
-  const d = (typeof p.data === "object" && p.data ? p.data : p) as Record<string, unknown>;
-  const str = (k: string): string | undefined => (typeof d[k] === "string" ? d[k] as string : undefined);
-  const trackNumber = str("trackNumber") ?? str("trackingNumber");
-  return {
-    cjOrderId: str("orderId") ?? str("cjOrderId"),
-    orderNumber: str("orderNumber"),
-    trackNumber,
-    trackingUrl: str("trackingUrl") ?? (trackNumber ? `https://t.17track.net/en#nums=${trackNumber}` : undefined),
-    logisticName: str("logisticName"),
-    status: str("orderStatus") ?? str("status"),
-  };
 }

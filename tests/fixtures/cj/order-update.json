@@ -1,0 +1,29 @@
+{
+  "messageId": "7cceede817dc47ed9748328b64353c5c",
+  "type": "ORDER",
+  "messageType": "UPDATE",
+  "params": {
+    "orderNumber": "api_52f268d40b8d460e82c0683955e63cc9",
+    "cjOrderId": "210823100016290555",
+    "orderStatus": "CREATED",
+    "logisticName": "CJPacket Ordinary",
+    "trackNumber": null,
+    "createDate": "2021-08-23 11:31:45",
+    "updateDate": "2021-08-23 11:31:45",
+    "payDate": null,
+    "deliveryDate": null,
+    "completeDate": null,
+    "privateOutboundOrder": false,
+    "orderItems": [
+      {
+        "vid": "1392053744945991680",
+        "quantity": 1,
+        "sellPrice": 0.57,
+        "lineItemId": "2505170958390976500",
+        "storeLineItemId": "16045188153625",
+        "productionOrderStatus": 1,
+        "abnormalType": [6, 9]
+      }
+    ]
+  }
+}

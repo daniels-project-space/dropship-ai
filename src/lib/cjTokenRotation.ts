@@ -1,4 +1,5 @@
 export interface CjTokenBundle {
+  openId: string;
   accessToken: string;
   refreshToken?: string;
   accessTokenExpiryDate?: string;
@@ -8,6 +9,8 @@ export interface CjTokenBundle {
 export interface RotatedCjTokenBundle extends CjTokenBundle {
   refreshToken: string;
 }
+
+export interface RotatedCjTokenPair extends Omit<RotatedCjTokenBundle, "openId"> {}
 
 /**
  * The control plane owns the durable compare-and-swap. A conflict means another instance
@@ -19,7 +22,8 @@ export interface CjTokenBundleStore {
 }
 
 function assertBundle(bundle: CjTokenBundle): CjTokenBundle {
-  if (!bundle || typeof bundle.accessToken !== "string" || !bundle.accessToken.trim()
+  if (!bundle || typeof bundle.openId !== "string" || !/^[0-9]{1,20}$/.test(bundle.openId)
+    || typeof bundle.accessToken !== "string" || !bundle.accessToken.trim()
     || (bundle.refreshToken !== undefined && (typeof bundle.refreshToken !== "string" || !bundle.refreshToken.trim()))
     || (bundle.accessTokenExpiryDate !== undefined && typeof bundle.accessTokenExpiryDate !== "string")
     || (bundle.refreshTokenExpiryDate !== undefined && typeof bundle.refreshTokenExpiryDate !== "string")) {
@@ -29,7 +33,7 @@ function assertBundle(bundle: CjTokenBundle): CjTokenBundle {
 }
 
 function sameBundle(a: CjTokenBundle, b: CjTokenBundle): boolean {
-  return a.accessToken === b.accessToken && a.refreshToken === b.refreshToken
+  return a.openId === b.openId && a.accessToken === b.accessToken && a.refreshToken === b.refreshToken
     && a.accessTokenExpiryDate === b.accessTokenExpiryDate && a.refreshTokenExpiryDate === b.refreshTokenExpiryDate;
 }
 
@@ -39,8 +43,8 @@ export class CjTokenCoordinator {
 
   constructor(
     private readonly store: CjTokenBundleStore,
-    private readonly refresh: (refreshToken: string) => Promise<RotatedCjTokenBundle>,
-    private readonly exchangeCode: (authorizationCode: string) => Promise<RotatedCjTokenBundle>,
+    private readonly refresh: (refreshToken: string) => Promise<RotatedCjTokenPair>,
+    private readonly connect: (apiKey: string) => Promise<RotatedCjTokenBundle>,
   ) {}
 
   async getAccessToken(): Promise<string> {
@@ -62,7 +66,10 @@ export class CjTokenCoordinator {
       }
       const current = cached ?? durable;
       if (!current.refreshToken) throw new Error("cj: no refresh token — add CJ_REFRESH_TOKEN to the server vault/control plane");
-      const next = await this.refresh(current.refreshToken);
+      const rotated = await this.refresh(current.refreshToken);
+      // CJ's refresh response intentionally omits openId. It is part of the atomic bundle and
+      // must be copied only from the durable bundle that authorized this rotation.
+      const next: RotatedCjTokenBundle = { ...rotated, openId: current.openId };
       const result = await this.store.replace(current.refreshToken, next);
       if (result === "written") {
         this.active = next;
@@ -80,14 +87,13 @@ export class CjTokenCoordinator {
     }
   }
 
-  /** Initial authorization-code setup uses the same atomic bundle boundary as a refresh. */
-  async exchangeAuthorizationCode(authorizationCode: string): Promise<string> {
-    if (!authorizationCode.trim()) throw new Error("cj: authorizationCode is required");
+  /** Initial independent-account setup uses CJ's API key and one complete atomic bundle write. */
+  async connectApiKey(apiKey: string): Promise<void> {
+    if (!apiKey.trim()) throw new Error("cj: apiKey is required");
     const current = this.active ?? await this.store.read().catch(() => null);
-    const next = await this.exchangeCode(authorizationCode);
+    const next = assertBundle(await this.connect(apiKey)) as RotatedCjTokenBundle;
     const result = await this.store.replace(current?.refreshToken, next);
-    if (result !== "written") throw new Error("cj: authorization-code bundle write conflicted; reload the durable credential state before retrying");
+    if (result !== "written") throw new Error("cj: API-key bundle write conflicted; reload the durable credential state before retrying");
     this.active = next;
-    return next.accessToken;
   }
 }

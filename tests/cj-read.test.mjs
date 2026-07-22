@@ -45,9 +45,11 @@ test("an expired server-held CJ token fails closed before rotating without an at
   const originalFetch = globalThis.fetch;
   const originalAccess = process.env.CJ_ACCESS_TOKEN;
   const originalRefresh = process.env.CJ_REFRESH_TOKEN;
+  const originalOpenId = process.env.CJ_OPEN_ID;
   const calls = [];
   process.env.CJ_ACCESS_TOKEN = "expired-access";
   process.env.CJ_REFRESH_TOKEN = "rotation-refresh";
+  process.env.CJ_OPEN_ID = "123456789";
   globalThis.fetch = async (url, options) => {
     calls.push({ url: String(url), options });
     if (String(url).includes("refreshAccessToken")) {
@@ -70,6 +72,8 @@ test("an expired server-held CJ token fails closed before rotating without an at
     else process.env.CJ_ACCESS_TOKEN = originalAccess;
     if (originalRefresh === undefined) delete process.env.CJ_REFRESH_TOKEN;
     else process.env.CJ_REFRESH_TOKEN = originalRefresh;
+    if (originalOpenId === undefined) delete process.env.CJ_OPEN_ID;
+    else process.env.CJ_OPEN_ID = originalOpenId;
   }
 });
 

@@ -28,8 +28,8 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, ...result });
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "sync failed" },
-      { status: 400 },
+      { ok: false, state: "needs_reverification", error: err instanceof Error ? err.message : "sync failed" },
+      { status: 409 },
     );
   }
 }

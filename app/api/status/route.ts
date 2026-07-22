@@ -4,6 +4,9 @@ import { NextResponse } from "next/server";
 import { getKey, getService } from "@/src/lib/vault";
 import { requireOperator } from "@/src/lib/auth/server";
 import { convexClient, api } from "@/src/lib/convexClient";
+import { getShop } from "@/src/lib/shopify";
+import { assertShopifyIdentity, SHOPIFY_TOKEN_KEY, vaultRefForDomain } from "@/src/lib/shopifyIdentity";
+import type { Id } from "@/convex/_generated/dataModel";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -62,9 +65,49 @@ export async function GET(request: Request) {
   }
 
   const cjKeys = await vaultKeyNames("cj");
-  checks.push({ id: "cj", group: "Commerce", label: "CJ supplier", state: cjKeys.includes("CJ_ACCESS_TOKEN") ? "configured" : "blocked", detail: cjKeys.includes("CJ_ACCESS_TOKEN") ? "Credential bundle is configured; no supplier write or token rotation was attempted" : "CJ access token is missing", next: cjKeys.includes("CJ_ACCESS_TOKEN") ? "Validate read-only catalogue/freight access in the separate provider phase." : "Configure the scoped CJ credential bundle." });
-  const shopKeys = await vaultKeyNames("shopify");
-  checks.push({ id: "shopify", group: "Commerce", label: "Shopify storefront", state: shopKeys.length ? "configured" : "blocked", detail: shopKeys.length ? "At least one store credential reference is configured; store reads are not globally proven" : "No Shopify store token is configured", next: shopKeys.length ? "Use each site's read-only sync to verify its USD store identity." : "Connect a USD Shopify store through the operator flow." });
+  const cjBundle = ["CJ_OPEN_ID", "CJ_ACCESS_TOKEN", "CJ_REFRESH_TOKEN"].every((key) => cjKeys.includes(key));
+  const cjWriterConfigured = Boolean(process.env.VAULT_TOKEN_BUNDLE_WRITER_URL && process.env.VAULT_TOKEN_BUNDLE_WRITER_TOKEN);
+  checks.push({
+    id: "cj", group: "Commerce", label: "CJ supplier",
+    state: cjBundle && cjWriterConfigured ? "configured" : "blocked",
+    detail: cjBundle
+      ? cjWriterConfigured ? "Complete openId/token bundle and scoped atomic writer inputs are configured; no rotation or supplier write was attempted" : "Complete openId/token bundle exists, but atomic rotation/connect writer capability is unavailable"
+      : "CJ openId/access/refresh bundle is incomplete",
+    next: cjBundle && cjWriterConfigured ? "Validate read-only catalogue/freight access in the separate provider phase." : "Install the scoped writer that acknowledges complete bundle retention, then reconnect the independent account.",
+  });
+
+  try {
+    const convex = convexClient();
+    const sites = (await convex.query(api.sites.list, {})).filter((site) => site.sample !== true && !!site.shopifyDomain);
+    if (!sites.length) {
+      checks.push({ id: "shopify", group: "Commerce", label: "Shopify recurring access", state: "blocked", detail: "No real site has a Shopify domain", next: "Connect a USD Shopify store after configuring its deterministic vault entry." });
+    } else {
+      const results = await Promise.all(sites.map(async (site) => {
+        if (!site.shopifyDomain || site.storeCurrency !== "USD" || !site.shopifyAccessVerifiedAt) return "legacy" as const;
+        const vaultRef = await convex.query(api.siteSecrets.getRef, { siteId: site._id as Id<"sites">, key: SHOPIFY_TOKEN_KEY });
+        if (vaultRef !== vaultRefForDomain(site.shopifyDomain)) return "missing" as const;
+        const [service, keyName] = vaultRef.split("/");
+        const token = service && keyName ? await vaultGetValue(service, keyName) : null;
+        if (!token) return "missing" as const;
+        try {
+          const shop = await getShop({ shop: site.shopifyDomain, accessToken: token });
+          assertShopifyIdentity(site.shopifyDomain, shop.myshopifyDomain, shop.currencyCode);
+          return "verified" as const;
+        } catch {
+          return "failed" as const;
+        }
+      }));
+      const verified = results.filter((result) => result === "verified").length;
+      const legacy = results.filter((result) => result === "legacy").length;
+      const missing = results.filter((result) => result === "missing").length;
+      const failed = results.filter((result) => result === "failed").length;
+      checks.push(verified === results.length
+        ? { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: "verified", detail: `${verified} site(s) resolved recurring vault access and returned the expected USD myshopify identity`, next: "Re-run readiness after any token, domain, or store-currency change." }
+        : { id: "shopify", group: "Commerce", label: "Shopify recurring access", state: missing ? "blocked" : "unverified", detail: `${verified} verified; ${legacy} need re-verification; ${missing} missing recurring vault access; ${failed} failed current identity reads`, next: "Re-verify each affected site. A one-time operator token check is never counted as recurring access." });
+    }
+  } catch {
+    checks.push({ id: "shopify", group: "Commerce", label: "Shopify recurring access", state: "unverified", detail: "Per-site recurring access could not be read and proven", next: "Restore the authenticated Convex/vault read path and re-run readiness." });
+  }
 
   const counts = { verified: 0, configured: 0, unverified: 0, blocked: 0 };
   for (const check of checks) counts[check.state]++;

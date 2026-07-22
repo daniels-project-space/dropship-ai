@@ -2,6 +2,7 @@
 import { query, mutation } from "./authz";
 import { v } from "convex/values";
 import { appendAudit } from "./audit";
+import { isMyshopifyDomain, SHOPIFY_TOKEN_KEY, vaultRefForDomain } from "../src/lib/shopifyIdentity";
 
 const siteStatus = v.union(
   v.literal("provisioning"),
@@ -9,6 +10,10 @@ const siteStatus = v.union(
   v.literal("paused"),
   v.literal("killed"),
 );
+
+async function requireServiceIdentity(ctx: { auth: { getUserIdentity: () => Promise<{ subject?: string } | null> } }) {
+  if ((await ctx.auth.getUserIdentity())?.subject !== "dropship-ai:service") throw new Error("UNAUTHENTICATED: Shopify connection verification requires the service runtime");
+}
 
 export const create = mutation({
   args: {
@@ -71,20 +76,51 @@ export const getByDomain = query({
 export const connectStore = mutation({
   args: { siteId: v.id("sites"), shopifyDomain: v.string(), storeCurrency: v.string() },
   handler: async (ctx, { siteId, shopifyDomain, storeCurrency }) => {
+    await requireServiceIdentity(ctx);
     const existing = await ctx.db.get(siteId);
     if (!existing) throw new Error(`site ${siteId} not found`);
     if (existing.sample === true) throw new Error("sample site cannot become live; clear sample data and create a real site first");
+    if (!isMyshopifyDomain(shopifyDomain)) throw new Error("Shopify domain must be a canonical myshopify.com domain");
     if (storeCurrency !== "USD") throw new Error(`unsupported Shopify store currency ${storeCurrency}; launch analytics require a USD store until conversion is implemented`);
     const domainOwners = await ctx.db.query("sites").withIndex("by_shopify_domain", (q) => q.eq("shopifyDomain", shopifyDomain)).take(2);
     if (domainOwners.some((site) => site._id !== siteId && site.sample !== true)) throw new Error("Shopify domain is already connected to another site");
+    const vaultRef = vaultRefForDomain(shopifyDomain);
+    const secretRef = await ctx.db.query("siteSecrets")
+      .withIndex("by_site_key", (q) => q.eq("siteId", siteId).eq("key", SHOPIFY_TOKEN_KEY)).first();
+    if (secretRef) await ctx.db.patch(secretRef._id, { vaultRef });
+    else await ctx.db.insert("siteSecrets", { siteId, key: SHOPIFY_TOKEN_KEY, vaultRef });
+    const verifiedAt = Date.now();
     await ctx.db.patch(siteId, {
       shopifyDomain,
       storeCurrency,
+      shopifyAccessVerifiedAt: verifiedAt,
       status: "active",
       sample: false,
     });
     await appendAudit(ctx, { siteId, event: "shopify_store_connected", detail: { shopifyDomain, storeCurrency } });
     return siteId;
+  },
+});
+
+// A recurring sync re-reads Shopify first. This mutation atomically backfills the verified USD
+// identity and re-persists the existing deterministic vault reference before economic facts move.
+export const verifyConnectedStore = mutation({
+  args: { siteId: v.id("sites"), shopifyDomain: v.string(), storeCurrency: v.string() },
+  handler: async (ctx, { siteId, shopifyDomain, storeCurrency }) => {
+    await requireServiceIdentity(ctx);
+    if (!isMyshopifyDomain(shopifyDomain)) throw new Error("Shopify domain must be a canonical myshopify.com domain");
+    const site = await ctx.db.get(siteId);
+    if (!site || site.shopifyDomain !== shopifyDomain) throw new Error("connected Shopify domain changed during verification");
+    if (storeCurrency !== "USD") throw new Error(`unsupported Shopify store currency ${storeCurrency}; launch analytics require a USD store until conversion is implemented`);
+    const expectedRef = vaultRefForDomain(shopifyDomain);
+    const secretRef = await ctx.db.query("siteSecrets")
+      .withIndex("by_site_key", (q) => q.eq("siteId", siteId).eq("key", SHOPIFY_TOKEN_KEY)).first();
+    if (!secretRef || secretRef.vaultRef !== expectedRef) throw new Error("Shopify recurring vault reference requires re-verification");
+    const verifiedAt = Date.now();
+    await ctx.db.patch(secretRef._id, { vaultRef: expectedRef });
+    await ctx.db.patch(siteId, { storeCurrency, shopifyAccessVerifiedAt: verifiedAt });
+    await appendAudit(ctx, { siteId, event: "shopify_recurring_access_verified", detail: { shopifyDomain, storeCurrency } });
+    return { verifiedAt };
   },
 });
 

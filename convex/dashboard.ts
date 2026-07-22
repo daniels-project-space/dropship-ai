@@ -38,6 +38,7 @@ export const portfolio = query({
           status: site.status,
           distributionMode: site.distributionMode,
           shopifyDomain: site.shopifyDomain ?? null,
+          shopifyNeedsReverification: !!site.shopifyDomain && (site.storeCurrency !== "USD" || !site.shopifyAccessVerifiedAt),
           customDomain: site.customDomain ?? null,
           killDate: site.killDate ?? null,
           pendingActionCount: pendingActions.length,
@@ -143,6 +144,9 @@ export const siteSummary = query({
 
     return {
       site,
+      economicsReadiness: !site.shopifyDomain ? "not_connected" as const
+        : site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt ? "verified_usd" as const
+          : "needs_reverification" as const,
       pendingActionCount: pending.length,
       activeProductCount: activeProducts.length,
     };
@@ -443,6 +447,9 @@ export const brandDetail = query({
 
     return {
       site,
+      economicsReadiness: !site.shopifyDomain ? "not_connected" as const
+        : site.storeCurrency === "USD" && !!site.shopifyAccessVerifiedAt ? "verified_usd" as const
+          : "needs_reverification" as const,
       productCount: allProducts.length,
       activeProductCount: activeProducts.length,
       pendingActionCount: pendingActions.length,
